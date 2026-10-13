@@ -1,0 +1,20 @@
+[package]
+name = "xbro-paint"
+description = "Display list construction and CPU rasterisation for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xbro-dom.workspace = true
+xbro-css.workspace = true
+xbro-style.workspace = true
+xbro-text.workspace = true
+xbro-layout.workspace = true
+tiny-skia.workspace = true
+image.workspace = true
+resvg.workspace = true
+
+[dev-dependencies]
+xbro-html.workspace = true

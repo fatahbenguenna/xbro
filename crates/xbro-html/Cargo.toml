@@ -1,0 +1,11 @@
+[package]
+name = "xbro-html"
+description = "HTML tokenizer and tree builder for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xbro-dom.workspace = true
+encoding_rs.workspace = true

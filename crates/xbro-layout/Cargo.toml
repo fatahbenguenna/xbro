@@ -1,0 +1,16 @@
+[package]
+name = "xbro-layout"
+description = "Box tree construction and layout (block, inline, float, positioned, flex, table) for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xbro-dom.workspace = true
+xbro-css.workspace = true
+xbro-style.workspace = true
+xbro-text.workspace = true
+
+[dev-dependencies]
+xbro-html.workspace = true

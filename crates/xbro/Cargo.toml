@@ -1,0 +1,22 @@
+[package]
+name = "xbro"
+description = "xbro, a small web browser written from scratch in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xbro"
+path = "src/main.rs"
+
+[dependencies]
+xbro-engine.workspace = true
+xbro-net.workspace = true
+xbro-paint.workspace = true
+xbro-text.workspace = true
+tiny-skia.workspace = true
+url.workspace = true
+winit.workspace = true
+softbuffer.workspace = true
+arboard.workspace = true

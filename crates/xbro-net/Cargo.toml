@@ -1,0 +1,12 @@
+[package]
+name = "xbro-net"
+description = "Resource loading (http, https, file, data, about) for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ureq.workspace = true
+url.workspace = true
+encoding_rs.workspace = true

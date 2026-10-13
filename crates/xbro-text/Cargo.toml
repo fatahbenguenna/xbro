@@ -1,0 +1,11 @@
+[package]
+name = "xbro-text"
+description = "Font discovery, text shaping/measurement and glyph rasterisation for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ab_glyph.workspace = true
+fontdb.workspace = true

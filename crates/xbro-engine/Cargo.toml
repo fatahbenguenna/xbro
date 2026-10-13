@@ -1,0 +1,19 @@
+[package]
+name = "xbro-engine"
+description = "Page loading pipeline (fetch, parse, style, layout, paint) and page interaction for the xbro browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xbro-dom.workspace = true
+xbro-html.workspace = true
+xbro-css.workspace = true
+xbro-style.workspace = true
+xbro-text.workspace = true
+xbro-net.workspace = true
+xbro-layout.workspace = true
+xbro-paint.workspace = true
+tiny-skia.workspace = true
+url.workspace = true

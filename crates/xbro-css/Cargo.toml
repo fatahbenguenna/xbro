@@ -1,0 +1,9 @@
+[package]
+name = "xbro-css"
+description = "CSS tokenizer, parser, selectors, media queries and value helpers for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

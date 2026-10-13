@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/xbro"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fatahbenguenna/xbro"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+xbro-dom = { path = "crates/xbro-dom" }
+xbro-html = { path = "crates/xbro-html" }
+xbro-css = { path = "crates/xbro-css" }
+xbro-style = { path = "crates/xbro-style" }
+xbro-text = { path = "crates/xbro-text" }
+xbro-net = { path = "crates/xbro-net" }
+xbro-layout = { path = "crates/xbro-layout" }
+xbro-paint = { path = "crates/xbro-paint" }
+xbro-engine = { path = "crates/xbro-engine" }
+
+# External crates
+ab_glyph = "0.2.32"
+arboard = { version = "3.6", default-features = false }
+encoding_rs = "0.8.42"
+fontdb = "0.24"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+resvg = { version = "0.48", default-features = false }
+softbuffer = "0.4.8"
+tiny-skia = "0.11.4"
+ureq = { version = "3.4", features = ["cookies", "brotli"] }
+url = "2.5.8"
+winit = "0.30.13"
+
+[profile.dev]
+opt-level = 1
+
+# Dependencies (image decoding, rasterisation, TLS) are slow without optimisation.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

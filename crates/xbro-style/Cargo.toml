@@ -1,0 +1,14 @@
+[package]
+name = "xbro-style"
+description = "Selector matching, cascade and computed styles for the xbro browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xbro-dom.workspace = true
+xbro-css.workspace = true
+
+[dev-dependencies]
+xbro-html.workspace = true
