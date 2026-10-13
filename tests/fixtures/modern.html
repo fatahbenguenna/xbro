@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferris Cloud — Modern layout test</title>
+<style>
+  :root {
+    --brand: #e8590c;
+    --brand-dark: #a63c06;
+    --text: #1f2933;
+    --muted: #616e7c;
+    --radius: 12px;
+    --gap: clamp(12px, 2vw, 24px);
+    --shadow-border: 1px solid #e4e7eb;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); line-height: 1.5; background: #f5f7fa; }
+  .container { width: min(1100px, 100% - 32px); margin-inline: auto; }
+  header.site { position: sticky; top: 0; background: #fff; border-bottom: var(--shadow-border); z-index: 10; }
+  header.site .container { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 1.25rem; color: var(--text); text-decoration: none; }
+  .logo-mark { width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, var(--brand), var(--brand-dark)); }
+  nav ul { display: flex; gap: 24px; list-style: none; margin: 0; padding: 0; }
+  nav a { color: var(--muted); text-decoration: none; font-weight: 500; }
+  nav a.active { color: var(--brand); }
+  .btn { display: inline-block; padding: 10px 18px; border-radius: 999px; background: var(--brand); color: #fff; text-decoration: none; font-weight: 600; border: 0; }
+  .btn.secondary { background: transparent; color: var(--brand); border: 2px solid var(--brand); }
+  .hero { padding: 72px 0 56px; background: linear-gradient(180deg, #fff4e6 0%, #f5f7fa 100%); text-align: center; }
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.1; margin: 0 0 16px; letter-spacing: -0.02em; }
+  .hero p { font-size: 1.125rem; color: var(--muted); max-width: 640px; margin: 0 auto 28px; }
+  .hero .actions { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; }
+  .badge { display: inline-block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; background: #ffe8cc; color: var(--brand-dark); padding: 4px 10px; border-radius: 999px; margin-bottom: 16px; }
+  .features { display: flex; flex-wrap: wrap; gap: var(--gap); padding: 48px 0; }
+  .card { flex: 1 1 280px; background: #fff; border: var(--shadow-border); border-radius: var(--radius); padding: 24px; position: relative; overflow: hidden; }
+  .card h3 { margin: 12px 0 8px; font-size: 1.125rem; }
+  .card p { margin: 0; color: var(--muted); }
+  .card .icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; }
+  .card:nth-child(1) .icon { background: #1c7ed6; }
+  .card:nth-child(2) .icon { background: #2b8a3e; }
+  .card:nth-child(3) .icon { background: #ae3ec9; }
+  .card .ribbon { position: absolute; top: 14px; right: -34px; transform: rotate(45deg); background: var(--brand); color: white; font-size: 11px; padding: 2px 40px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding-bottom: 48px; }
+  .grid > div { background: #fff; border-radius: 8px; border: var(--shadow-border); padding: 16px; text-align: center; }
+  .grid strong { display: block; font-size: 2rem; color: var(--brand); }
+  .pricing { display: flex; gap: 0; align-items: stretch; border: var(--shadow-border); border-radius: var(--radius); overflow: hidden; background: #fff; margin-bottom: 48px; }
+  .plan { flex: 1; padding: 24px; border-right: var(--shadow-border); display: flex; flex-direction: column; }
+  .plan:last-child { border-right: none; }
+  .plan .price { font-size: 2.25rem; font-weight: 800; }
+  .plan .price small { font-size: 1rem; font-weight: 400; color: var(--muted); }
+  .plan ul { padding-left: 1.2em; flex-grow: 1; }
+  .plan.featured { background: #fff9f2; }
+  .plan .btn { align-self: flex-start; }
+  footer { background: #1f2933; color: #cbd2d9; padding: 32px 0; font-size: 0.875rem; }
+  footer .container { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
+  footer a { color: #fff; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  @media (max-width: 700px) {
+    nav ul { display: none; }
+    .grid { grid-template-columns: 1fr; }
+    .pricing { flex-direction: column; }
+    .plan { border-right: none; border-bottom: var(--shadow-border); }
+  }
+  @supports (display: grid) { .supports-note::after { content: " (grid supported)"; color: var(--muted); } }
+  @supports not (display: grid) { .supports-note { display: none; } }
+</style>
+</head>
+<body>
+<header class="site">
+  <div class="container">
+    <a class="logo" href="/"><span class="logo-mark"></span>Ferris Cloud</a>
+    <nav aria-label="Main"><ul>
+      <li><a class="active" href="#features">Features</a></li>
+      <li><a href="#stats">Stats</a></li>
+      <li><a href="#pricing">Pricing</a></li>
+      <li><a href="#docs">Docs</a></li>
+    </ul></nav>
+    <a class="btn" href="#signup">Sign up</a>
+  </div>
+</header>
+<main>
+  <section class="hero">
+    <div class="container">
+      <span class="badge">New · v2.0</span>
+      <h1>Deploy Rust services<br>in seconds</h1>
+      <p>Ferris Cloud builds, ships and scales your Rust applications with zero configuration. Fearless concurrency, now in production.</p>
+      <div class="actions">
+        <a class="btn" href="#start">Get started free</a>
+        <a class="btn secondary" href="#demo">Watch the demo</a>
+      </div>
+    </div>
+  </section>
+  <div class="container">
+    <section id="features" class="features">
+      <article class="card"><div class="icon">⚡</div><h3>Blazing fast</h3><p>Cold starts under 10&nbsp;ms thanks to ahead-of-time compiled binaries and a tiny runtime.</p></article>
+      <article class="card"><div class="icon">✓</div><h3>Memory safe</h3><p>No segfaults, no data races. The borrow checker has your back in every deployment.</p><span class="ribbon">Popular</span></article>
+      <article class="card"><div class="icon">∞</div><h3>Scales forever</h3><p>Horizontal autoscaling with per-request billing. Pay only for what you use.</p></article>
+    </section>
+    <h2 class="supports-note">By the numbers</h2>
+    <section id="stats" class="grid">
+      <div><strong>99.99%</strong>uptime</div>
+      <div><strong>12&nbsp;ms</strong>p50 latency</div>
+      <div><strong>40k</strong>developers</div>
+      <div><strong>150+</strong>regions</div>
+      <div><strong>0</strong>segfaults</div>
+      <div><strong>24/7</strong>support</div>
+    </section>
+    <section id="pricing" class="pricing">
+      <div class="plan"><h3>Hobby</h3><div class="price">$0 <small>/month</small></div><ul><li>1 project</li><li>Community support</li></ul><a class="btn secondary" href="#">Choose</a></div>
+      <div class="plan featured"><h3>Pro</h3><div class="price">$19 <small>/month</small></div><ul><li>Unlimited projects</li><li>Custom domains</li><li>Email support</li></ul><a class="btn" href="#">Choose</a></div>
+      <div class="plan"><h3>Enterprise</h3><div class="price">Custom</div><ul><li>SLA</li><li>SSO &amp; audit logs</li><li>Dedicated engineer</li><li>On-prem</li></ul><a class="btn secondary" href="#">Contact</a></div>
+    </section>
+  </div>
+</main>
+<footer>
+  <div class="container">
+    <span>© 2026 Ferris Cloud. Made with 🦀.</span>
+    <span><a href="#">Privacy</a> · <a href="#">Terms</a> · <a href="#">Status</a></span>
+  </div>
+</footer>
+<span class="visually-hidden">Hidden helper text</span>
+</body>
+</html>

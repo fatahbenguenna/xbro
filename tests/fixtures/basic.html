@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Basic document &mdash; xbro</title>
+</head>
+<body>
+<h1>Le navigateur xbro</h1>
+<p>Ceci est un <em>paragraphe</em> avec du texte <strong>gras</strong>, du <code>code</code>,
+un <a href="#section-2">lien interne</a> et un <a href="https://www.rust-lang.org/">lien externe</a>.
+Les entités fonctionnent&nbsp;: &laquo;&nbsp;guillemets&nbsp;&raquo;, &copy; 2026, &euro;, caf&eacute;, &#x1F980; &amp; &lt;tags&gt;.</p>
+
+<h2>Listes</h2>
+<ul>
+  <li>Premier élément</li>
+  <li>Deuxième élément avec une <b>liste imbriquée</b>
+    <ul><li>Imbriqué A</li><li>Imbriqué B
+      <ul><li>Encore plus profond</li></ul></li></ul>
+  </li>
+  <li>Troisième élément
+</ul>
+<ol start="3">
+  <li>Trois</li>
+  <li>Quatre</li>
+  <li value="10">Dix</li>
+  <li>Onze</li>
+</ol>
+<ol type="i"><li>un</li><li>deux</li><li>trois</li><li>quatre</li></ol>
+
+<h2 id="section-2">Texte préformaté</h2>
+<pre>fn main() {
+    println!("Bonjour, monde !");
+	// une tabulation
+}</pre>
+<blockquote>Une citation en retrait. <q>Avec des guillemets</q>.</blockquote>
+<hr>
+<dl><dt>Terme</dt><dd>Définition du terme, en retrait.</dd></dl>
+<p>Texte <sub>indice</sub> et <sup>exposant</sup>, <small>petit</small>, <mark>surligné</mark>,
+<u>souligné</u>, <s>barré</s>, <kbd>Ctrl</kbd>+<kbd>L</kbd>.<br>
+Après un saut de ligne. <abbr title="HyperText Markup Language">HTML</abbr>.</p>
+<h3>Titre 3</h3><h4>Titre 4</h4><h5>Titre 5</h5><h6>Titre 6</h6>
+<address>Adresse en italique</address>
+<p>Un paragraphe implicitement fermé
+<p>Un autre paragraphe <span style="color: #c92a2a">en rouge</span> et <span style="background: #ffec99; padding: 2px 4px; border-radius: 3px">surligné</span>.
+<noscript><p>Le JavaScript est désactivé : ce texte est visible.</p></noscript>
+<script>document.write("ne doit pas apparaître");</script>
+<style>p.note { color: #555; font-style: italic }</style>
+<p class="note">Note stylée par une balise style dans le corps.</p>
+</body>
+</html>

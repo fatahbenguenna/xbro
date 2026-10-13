@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Forms</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  fieldset { margin-bottom: 16px; }
+  label { display: inline-block; min-width: 120px; }
+  .row { margin: 8px 0; }
+  input[type=text]:focus { outline: 2px solid #1c7ed6; }
+</style>
+</head>
+<body>
+<h1>Formulaires</h1>
+<form id="search" action="results.html" method="get">
+  <fieldset>
+    <legend>Recherche</legend>
+    <div class="row"><label for="q">Requête</label><input type="text" id="q" name="q" placeholder="Tapez quelque chose…"></div>
+    <div class="row"><label for="lang">Langue</label>
+      <select id="lang" name="lang"><option value="fr" selected>Français</option><option value="en">English</option><option value="de">Deutsch</option></select></div>
+    <div class="row"><label>Options</label>
+      <input type="checkbox" id="exact" name="exact" value="1" checked> <span>exact</span>
+      <input type="checkbox" id="images" name="images" value="1"> <span>images</span></div>
+    <div class="row"><label>Tri</label>
+      <input type="radio" name="sort" value="date" id="r1" checked> date
+      <input type="radio" name="sort" value="score" id="r2"> pertinence</div>
+    <input type="hidden" name="src" value="xbro">
+    <div class="row"><input type="submit" value="Chercher"> <input type="reset" value="Effacer"> <button type="button">Bouton <b>riche</b></button></div>
+  </fieldset>
+</form>
+<form action="post-target" method="post">
+  <div class="row"><label for="email">Email</label><input type="email" id="email" name="email" value="ferris@example.com" size="30"></div>
+  <div class="row"><label for="pw">Mot de passe</label><input type="password" id="pw" name="pw" value="secret"></div>
+  <div class="row"><label for="msg">Message</label><textarea id="msg" name="msg" rows="4" cols="40">Bonjour,
+ceci est un textarea
+sur plusieurs lignes.</textarea></div>
+  <div class="row"><label>Volume</label><input type="range" min="0" max="100" value="70"> <progress value="0.4"></progress> <input type="color" value="#e8590c"></div>
+  <div class="row"><input type="submit" value="Envoyer" disabled> <button>Envoyer (bouton)</button></div>
+</form>
+</body>
+</html>

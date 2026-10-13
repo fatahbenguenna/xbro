@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html class="client-nojs" lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<title>Rust (programming language) - Wikipedia</title>
+<link rel="stylesheet" href="wiki.css">
+<style>
+@import url("wiki-import.css");
+</style>
+</head>
+<body class="skin-vector mediawiki ltr">
+<div id="mw-page-base" class="noprint"></div>
+<header class="vector-header">
+  <a class="mw-logo" href="#"><span class="mw-logo-wordmark">Wikipedia</span><span class="mw-logo-tagline">The Free Encyclopedia</span></a>
+  <form class="vector-search" action="https://en.wikipedia.org/w/index.php" method="get">
+    <input type="search" name="search" placeholder="Search Wikipedia" class="cdx-text-input__input">
+    <input type="hidden" name="title" value="Special:Search">
+    <button class="cdx-button">Search</button>
+  </form>
+</header>
+<div class="mw-page-container">
+<nav id="vector-toc" class="vector-toc">
+  <div class="vector-toc-title">Contents</div>
+  <ul class="vector-toc-contents">
+    <li><a href="#History">History</a>
+      <ul><li><a href="#Origins">Origins (2006–2012)</a></li><li><a href="#Evolution">Evolution (2012–2015)</a></li></ul></li>
+    <li><a href="#Syntax">Syntax and features</a></li>
+    <li><a href="#References">References</a></li>
+  </ul>
+</nav>
+<main id="content" class="mw-body">
+<h1 id="firstHeading" class="firstHeading mw-first-heading"><span class="mw-page-title-main">Rust (programming language)</span></h1>
+<div id="siteSub" class="noprint">From Wikipedia, the free encyclopedia</div>
+<div id="bodyContent" class="vector-body">
+<div class="mw-parser-output">
+<div class="hatnote navigation-not-searchable">"Rust language" redirects here. For other uses, see <a href="#">Rust (disambiguation)</a>.</div>
+<table class="infobox vevent">
+<caption class="infobox-title summary">Rust</caption>
+<tbody>
+<tr><td colspan="2" class="infobox-image"><span><img alt="Rust logo" src="img/logo.png" width="64" height="64"></span><div class="infobox-caption">The official Rust logo</div></td></tr>
+<tr><th scope="row" class="infobox-label">Paradigms</th><td class="infobox-data">Concurrent, functional, generic, imperative, structured</td></tr>
+<tr><th scope="row" class="infobox-label">Designed&nbsp;by</th><td class="infobox-data">Graydon Hoare</td></tr>
+<tr><th scope="row" class="infobox-label">Developer</th><td class="infobox-data">The Rust Team</td></tr>
+<tr><th scope="row" class="infobox-label">First&nbsp;appeared</th><td class="infobox-data">January 19, 2012<span class="noprint">; 14 years ago</span></td></tr>
+<tr><th scope="row" class="infobox-label">Typing discipline</th><td class="infobox-data">Affine, inferred, nominal, static, strong</td></tr>
+<tr><th scope="row" class="infobox-label">License</th><td class="infobox-data">MIT, Apache 2.0<sup id="cite_ref-1" class="reference"><a href="#cite_note-1">[1]</a></sup></td></tr>
+<tr><th scope="row" class="infobox-label">Filename extensions</th><td class="infobox-data"><code>.rs</code>, <code>.rlib</code></td></tr>
+</tbody></table>
+<p><b>Rust</b> is a <a href="#">general-purpose</a> <a href="#">programming language</a> emphasizing <a href="#">performance</a>, <a href="#">type safety</a>, and <a href="#">concurrency</a>. It enforces <a href="#">memory safety</a>, meaning that all <a href="#">references</a> point to valid memory, without a <a href="#">garbage collector</a>.<sup id="cite_ref-2" class="reference"><a href="#cite_note-2">[2]</a></sup> To simultaneously enforce memory safety and prevent <a href="#">data races</a>, its "borrow checker" tracks the <a href="#">object lifetime</a> of all references in a program during <a href="#">compilation</a>.</p>
+<p>Rust was influenced by ideas from <a href="#">functional programming</a>, including <a href="#">immutability</a>, <a href="#">higher-order functions</a>, <a href="#">algebraic data types</a>, and <a href="#">pattern matching</a>. It also supports <a href="#">object-oriented programming</a> via structs, <a href="#">enums</a>, traits, and methods.</p>
+<div class="mw-heading mw-heading2"><h2 id="History">History</h2></div>
+<div class="mw-heading mw-heading3"><h3 id="Origins">Origins (2006–2012)</h3></div>
+<figure class="mw-default-size" typeof="mw:File/Thumb"><a href="#" class="mw-file-description"><img src="img/landscape.jpg" decoding="async" width="200" height="120" class="mw-file-element"></a><figcaption>Mozilla Foundation headquarters, 2012</figcaption></figure>
+<p>Rust began as a personal project in 2006 by <a href="#">Mozilla</a> employee Graydon Hoare. Hoare has stated that Rust was named for the <a href="#">group of fungi</a> that are "over-engineered for survival". During the time period between 2006 and 2009, Rust was not publicized to others at Mozilla and was written in Hoare's free time.</p>
+<div class="mw-heading mw-heading3"><h3 id="Evolution">Evolution (2012–2015)</h3></div>
+<p>The years from 2012 to 2015 were marked by substantial changes to the Rust <a href="#">type system</a>, especially, removal of the typestate system, consolidation of other language features, and the removal of the garbage collector.<sup class="reference"><a href="#cite_note-3">[3]</a></sup> Memory management through the ownership system was gradually consolidated and expanded to prevent memory-related bugs.</p>
+<div class="mw-heading mw-heading2"><h2 id="Syntax">Syntax and features</h2></div>
+<div class="mw-highlight mw-content-ltr" dir="ltr"><pre><span class="k">fn</span> <span class="nf">main</span><span class="p">()</span> <span class="p">{</span>
+    <span class="fm">println!</span><span class="p">(</span><span class="s">"Hello, World!"</span><span class="p">);</span>
+<span class="p">}</span></pre></div>
+<table class="wikitable">
+<caption>Primitive integer types</caption>
+<tbody><tr><th>Type</th><th>Size</th><th>Range</th></tr>
+<tr><td><code>i8</code></td><td>8 bits</td><td>−128 to 127</td></tr>
+<tr><td><code>u32</code></td><td>32 bits</td><td>0 to 4,294,967,295</td></tr>
+<tr><td><code>i128</code></td><td colspan="2">128 bits — huge</td></tr>
+</tbody></table>
+<div class="mw-heading mw-heading2"><h2 id="References">References</h2></div>
+<div class="reflist"><ol class="references">
+<li id="cite_note-1"><span class="mw-cite-backlink"><b><a href="#cite_ref-1">^</a></b></span> <span class="reference-text"><cite class="citation web cs1">"Rust License". <i>rust-lang.org</i>.</cite></span></li>
+<li id="cite_note-2"><span class="mw-cite-backlink"><b><a href="#cite_ref-2">^</a></b></span> <span class="reference-text">Klabnik, Steve; Nichols, Carol (2019). <i>The Rust Programming Language</i>.</span></li>
+<li id="cite_note-3"><span class="mw-cite-backlink"><b><a href="#">^</a></b></span> <span class="reference-text">Hoare, Graydon (2016). "Rust is mostly safety".</span></li>
+</ol></div>
+</div></div>
+</main>
+</div>
+<footer id="footer" class="mw-footer"><ul id="footer-info"><li>This page was last edited on 13 October 2026.</li><li>Text is available under the <a href="#">Creative Commons Attribution-ShareAlike 4.0 License</a>.</li></ul></footer>
+</body>
+</html>

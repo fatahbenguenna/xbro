@@ -1,0 +1,55 @@
+/* Simplified Vector-2022-like skin */
+:root { --color-base: #202122; --color-progressive: #36c; --border-color-base: #a2a9b1; --font-family-sans: -apple-system, 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'Lato', 'Helvetica', 'Arial', sans-serif; }
+html, body { height: 100%; margin: 0; padding: 0; font-family: var(--font-family-sans); }
+body { background-color: #f8f9fa; color: var(--color-base); }
+a { color: var(--color-progressive); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.vector-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: #fff; border-bottom: 1px solid #eaecf0; }
+.mw-logo { display: flex; flex-direction: column; color: var(--color-base); }
+.mw-logo-wordmark { font-family: 'Linux Libertine', 'Georgia', 'Times', serif; font-size: 1.5em; letter-spacing: 0.02em; }
+.mw-logo-tagline { font-size: 0.75em; color: #54595d; }
+.vector-search { display: flex; gap: 4px; }
+.cdx-text-input__input { width: min(400px, 40vw); padding: 5px 8px; border: 1px solid var(--border-color-base); border-radius: 2px; font-size: 14px; }
+.cdx-button { padding: 5px 12px; border: 1px solid var(--border-color-base); border-radius: 2px; background: #f8f9fa; font-weight: bold; font-size: 14px; }
+.mw-page-container { display: flex; max-width: 1200px; margin: 0 auto; padding: 0 16px; gap: 24px; }
+.vector-toc { flex: 0 0 200px; padding-top: 24px; font-size: 0.875rem; }
+.vector-toc-title { font-weight: bold; margin-bottom: 8px; }
+.vector-toc-contents, .vector-toc-contents ul { list-style: none; margin: 0; padding: 0; }
+.vector-toc-contents ul { padding-left: 1em; }
+.vector-toc-contents li { margin: 4px 0; }
+.mw-body { flex: 1 1 auto; min-width: 0; background: #fff; padding: 16px 24px 24px; border: 1px solid #eaecf0; }
+.firstHeading { font-family: 'Linux Libertine', 'Georgia', 'Times', serif; font-weight: normal; font-size: 1.8em; margin: 0 0 4px; border-bottom: 1px solid var(--border-color-base); padding-bottom: 4px; line-height: 1.375; }
+#siteSub { font-size: 0.8125em; color: #54595d; margin-bottom: 12px; }
+.mw-parser-output { font-size: 0.875rem; line-height: 1.6; }
+.hatnote { font-style: italic; padding-left: 1.6em; margin-bottom: 0.5em; }
+.infobox { float: right; clear: right; width: 22em; margin: 0 0 1em 1em; padding: 0.2em; border: 1px solid var(--border-color-base); background: #f8f9fa; font-size: 88%; line-height: 1.5em; border-spacing: 3px; }
+.infobox-title { font-size: 125%; font-weight: bold; padding: 0.2em; }
+.infobox-image { text-align: center; }
+.infobox-caption { font-size: 90%; }
+.infobox-label { text-align: left; vertical-align: top; padding-right: 0.6em; }
+.infobox-data { vertical-align: top; }
+.mw-heading2 h2 { font-family: 'Linux Libertine', 'Georgia', 'Times', serif; font-weight: normal; font-size: 1.5em; border-bottom: 1px solid var(--border-color-base); margin: 1em 0 0.25em; padding: 0; }
+.mw-heading3 h3 { font-size: 1.2em; margin: 0.3em 0 0; }
+figure.mw-default-size { float: right; clear: right; margin: 0.5em 0 1.3em 1.4em; border: 1px solid #c8ccd1; padding: 3px; background: #f8f9fa; width: max-content; }
+figure img { display: block; }
+figcaption { font-size: 88%; line-height: 1.4em; padding: 3px; max-width: 200px; }
+sup.reference { font-size: 80%; line-height: 1; }
+.mw-highlight pre { background: #f8f9fa; border: 1px solid #eaecf0; padding: 1em; overflow-x: auto; }
+.mw-highlight .k { color: #008000; font-weight: bold; }
+.mw-highlight .nf { color: #0000ff; }
+.mw-highlight .s { color: #ba2121; }
+.mw-highlight .fm { color: #0000ff; }
+.wikitable { background-color: #f8f9fa; color: #202122; margin: 1em 0; border: 1px solid #a2a9b1; border-collapse: collapse; }
+.wikitable > tr > th, .wikitable > tr > td, .wikitable > * > tr > th, .wikitable > * > tr > td { border: 1px solid #a2a9b1; padding: 0.2em 0.4em; }
+.wikitable > tr > th, .wikitable > * > tr > th { background-color: #eaecf0; text-align: center; }
+.wikitable > caption { font-weight: bold; }
+.reflist { font-size: 90%; }
+ol.references { margin-left: 0; padding-left: 2em; }
+.mw-cite-backlink b a { font-weight: bold; }
+.mw-footer { max-width: 1200px; margin: 0 auto; padding: 16px; font-size: 0.75em; color: #54595d; }
+#footer-info { list-style: none; padding: 0; margin: 0; }
+@media screen and (max-width: 720px) {
+  .vector-toc { display: none; }
+  .infobox { float: none; width: auto; margin: 0 0 1em; }
+}
+@media print { body { background: white; } .noprint { display: none; } }

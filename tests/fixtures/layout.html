@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Layout torture test</title>
+<style>
+  body { font: 14px/1.4 sans-serif; margin: 20px; }
+  .box { border: 2px solid #333; padding: 10px; margin: 10px 0; }
+  .float-left { float: left; width: 120px; height: 80px; background: #d0ebff; margin: 0 10px 10px 0; }
+  .float-right { float: right; width: 100px; height: 120px; background: #ffe3e3; margin: 0 0 10px 10px; }
+  .clear { clear: both; }
+  .rel { position: relative; height: 120px; background: #f1f3f5; }
+  .abs { position: absolute; width: 80px; height: 40px; background: rgba(28, 126, 214, 0.6); color: white; }
+  .abs.tl { top: 10px; left: 10px; }
+  .abs.br { bottom: 10px; right: 10px; z-index: 2; }
+  .abs.mid { top: 30px; left: 60px; background: rgba(224, 49, 49, 0.6); z-index: 1; }
+  .fixed { position: fixed; bottom: 10px; right: 10px; background: #212529; color: white; padding: 6px 10px; border-radius: 6px; }
+  .inline-blocks span { display: inline-block; width: 60px; height: 30px; margin: 4px; background: #e6fcf5; border: 1px solid #0ca678; vertical-align: middle; text-align: center; }
+  .inline-blocks span.tall { height: 50px; }
+  .center { width: 50%; margin: 10px auto; background: #fff3bf; text-align: center; }
+  .justify { text-align: justify; width: 300px; }
+  .nowrap { white-space: nowrap; overflow: hidden; width: 200px; border: 1px dashed #999; }
+  .pre-wrap { white-space: pre-wrap; font-family: monospace; width: 250px; border: 1px dotted #999; }
+  .long-word { width: 150px; border: 1px solid #ccc; overflow-wrap: anywhere; }
+  .margins > div { margin: 20px 0; background: #eebefa; height: 20px; }
+  .collapse-parent { margin: 30px 0; background: #c5f6fa; }
+  .collapse-parent > p { margin: 25px 0; }
+  .opacity { opacity: 0.5; background: #000; color: #fff; padding: 8px; }
+  .radius { border-radius: 16px; background: linear-gradient(to right, #ff8787, #74c0fc); height: 50px; border: 3px solid #495057; }
+  .dashed { border: 3px dashed #e8590c; padding: 6px; }
+  .dotted { border: 3px dotted #2b8a3e; padding: 6px; }
+  .double { border: 6px double #1971c2; padding: 6px; }
+  .hidden { visibility: hidden; }
+  .overflow-clip { height: 40px; overflow: hidden; border: 1px solid #000; }
+  .before::before { content: "[avant] "; color: #c2255c; }
+  .after::after { content: " [après: " attr(data-x) "]"; color: #5f3dc4; }
+  .va span { font-size: 10px; }
+  .bg-img { height: 60px; background: #eee url("img/tile.png") repeat; border: 1px solid #aaa; }
+  .bg-img-center { height: 100px; background-image: url("img/logo.png"); background-repeat: no-repeat; background-position: center; border: 1px solid #aaa; }
+  .cover { height: 80px; background: url("img/photo.png") center / cover no-repeat; }
+</style>
+</head>
+<body>
+<h1>Layout</h1>
+<div class="box">
+  <div class="float-left">float left</div>
+  <div class="float-right">float right</div>
+  <p>Ce texte doit s'écouler autour des deux flottants. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p>
+  <div class="clear"></div>
+</div>
+<div class="rel box">
+  <div class="abs tl">top-left</div>
+  <div class="abs mid">middle z1</div>
+  <div class="abs br">bottom-right z2</div>
+</div>
+<div class="fixed">position: fixed</div>
+<div class="inline-blocks">Texte <span>a</span><span class="tall">b</span><span>c</span> fin de ligne avec <img src="img/logo.png" width="32" height="32" alt="logo"> image.</div>
+<div class="center">centré avec margin auto</div>
+<p class="justify">Ce paragraphe est justifié : les espaces entre les mots sont étirés pour que chaque ligne, sauf la dernière, occupe toute la largeur disponible.</p>
+<div class="nowrap">Ce texte ne revient jamais à la ligne même s'il est très long</div>
+<div class="pre-wrap">pre-wrap   garde   les espaces
+et les sauts de ligne, mais revient à la ligne quand c'est nécessaire.</div>
+<div class="long-word">Unmotextrêmementlongquinepeutpastenirdanslaboîte</div>
+<div class="margins"><div></div><div></div></div>
+<div class="collapse-parent"><p>marges fusionnées avec le parent</p></div>
+<div class="opacity">opacity 0.5</div>
+<div class="radius"></div>
+<div class="dashed">bordure tiretée</div>
+<div class="dotted">bordure pointillée</div>
+<div class="double">bordure double</div>
+<div class="hidden">invisible mais occupe de la place</div>
+<div class="overflow-clip">ligne 1<br>ligne 2<br>ligne 3 coupée<br>ligne 4 coupée</div>
+<p class="before">contenu généré</p>
+<p class="after" data-x="42">contenu généré</p>
+<p class="va">base <span style="vertical-align: super">sup</span> <span style="vertical-align: sub">sub</span> <span style="vertical-align: top">top</span> <span style="vertical-align: middle">middle</span> <span style="vertical-align: bottom">bottom</span> <big>GRAND</big></p>
+<div class="bg-img"></div>
+<div class="bg-img-center"></div>
+<div class="cover"></div>
+<p>Image SVG externe : <img src="img/icon.svg" alt="ok"> et SVG en ligne :
+<svg width="40" height="40" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" rx="2" fill="#1c7ed6"/><circle cx="5" cy="5" r="2" fill="white"/></svg>
+et image cassée : <img src="img/missing.png" alt="[image manquante]">.</p>
+<p><img src="img/photo.png" alt="photo"> <img src="img/landscape.jpg" style="width: 100px" alt="paysage redimensionné"></p>
+<div style="height: 1200px; background: linear-gradient(#fff, #dee2e6)">Grand bloc pour tester le défilement</div>
+<p id="bottom">Fin de page.</p>
+</body>
+</html>

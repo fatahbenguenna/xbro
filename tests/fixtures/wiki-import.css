@@ -1,0 +1,2 @@
+/* Loaded through @import from wiki.html: proves @import handling */
+#siteSub::before { content: "\2192\00a0"; color: #36c; }

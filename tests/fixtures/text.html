@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Text rendering</title>
+<style>
+  body { margin: 16px; font-family: serif; }
+  .sans { font-family: Arial, Helvetica, sans-serif; }
+  .mono { font-family: "Courier New", monospace; }
+  .sizes span { margin-right: 8px; }
+  .upper { text-transform: uppercase; }
+  .cap { text-transform: capitalize; }
+  .spaced { letter-spacing: 3px; word-spacing: 10px; }
+  .indent { text-indent: 2em; }
+  .right { text-align: right; }
+  .center { text-align: center; }
+  .lh { line-height: 2; background: #f8f9fa; }
+  .deco { text-decoration: underline overline; text-decoration-color: #e03131; }
+  .nested-deco { text-decoration: underline; }
+  .nested-deco em { color: #1971c2; }
+  .weights span { display: inline-block; margin-right: 10px; }
+</style>
+</head>
+<body>
+<p class="sans">Sans-serif : Portez ce vieux whisky au juge blond qui fume.</p>
+<p>Serif : The quick brown fox jumps over the lazy dog.</p>
+<p class="mono">Monospace : 0123456789 ()[]{} =&gt; -&gt; &amp;&amp; ||</p>
+<p class="sizes sans"><span style="font-size: 10px">10px</span><span style="font-size: 14px">14px</span><span style="font-size: 20px">20px</span><span style="font-size: 28px">28px</span><span style="font-size: 40px">40px</span></p>
+<p class="weights sans"><span style="font-weight: 300">300</span><span style="font-weight: 400">400</span><span style="font-weight: 700">700</span><span style="font-style: italic">italique</span><span style="font-weight: bold; font-style: italic">gras italique</span></p>
+<p class="upper sans">texte en majuscules</p>
+<p class="cap sans">chaque mot capitalisé ici</p>
+<p class="spaced sans">lettres espacées et mots espacés</p>
+<p class="indent">Paragraphe avec un retrait de première ligne. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+<p class="right">aligné à droite</p>
+<p class="center">centré</p>
+<p class="lh">Interligne double. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam.</p>
+<p class="deco">souligné et surligné en rouge</p>
+<p class="nested-deco">souligné qui se propage <em>dans les enfants</em> et <span style="display:inline-block">pas dans un inline-block</span>.</p>
+<p>Unicode : Ελληνικά, Русский, 日本語, 中文, العربية, עברית, emoji 🦀🚀, symboles ✓ ✗ → ← ★ ♥ €£¥, ligatures fi fl.</p>
+<p>Espaces    multiples     réduites
+et sauts de ligne
+ignorés.</p>
+<p>Mot&shy;coupure&shy;possible et espace&#8203;de&#8203;largeur&#8203;nulle.</p>
+</body>
+</html>
