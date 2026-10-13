@@ -14,6 +14,9 @@ pub trait Element: Sized + Clone {
     fn parent_element(&self) -> Option<Self>;
     fn prev_sibling_element(&self) -> Option<Self>;
     fn next_sibling_element(&self) -> Option<Self>;
+    /// First element child (used, with `next_sibling_element`, to walk
+    /// descendants for `:has()`).
+    fn first_child_element(&self) -> Option<Self>;
     /// True for the document element (`<html>`).
     fn is_root(&self) -> bool;
     /// True when the element has no element children and no non-empty text (`:empty`).
