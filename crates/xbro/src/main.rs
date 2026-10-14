@@ -55,6 +55,24 @@ OPTIONS:
 URL may be a full URL, a domain (example.com), a local file path, or search terms.
 ";
 
+/// Resolves a command-line address: an existing file or directory (relative
+/// to the current directory, like other browsers do for command-line
+/// arguments) opens as a `file://` URL; anything else is interpreted like
+/// address-bar input (URL, domain or search terms).
+pub fn resolve_input(input: &str) -> url::Url {
+    let path = std::path::Path::new(input);
+    if !input.is_empty() && !input.contains("://") && path.exists() {
+        if let Ok(url) = path
+            .canonicalize()
+            .map_err(|_| ())
+            .and_then(url::Url::from_file_path)
+        {
+            return url;
+        }
+    }
+    xbro_net::parse_user_input(input)
+}
+
 pub fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut opts = Options {
         mode: Mode::Gui,
@@ -178,5 +196,14 @@ mod tests {
         assert!(parse_args(&args("--dump-dom")).is_err());
         assert!(parse_args(&args("--bogus x")).is_err());
         assert!(parse_args(&args("a b")).is_err());
+    }
+
+    #[test]
+    fn resolves_existing_relative_paths_to_file_urls() {
+        let url = resolve_input("Cargo.toml");
+        assert_eq!(url.scheme(), "file");
+        assert!(url.path().ends_with("/Cargo.toml"));
+        assert_eq!(resolve_input("about:home").as_str(), "about:home");
+        assert_eq!(resolve_input("does-not-exist.example").scheme(), "https");
     }
 }
