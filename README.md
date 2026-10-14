@@ -10,6 +10,14 @@ externes.
 > Hacker News, blogs, documentation, DuckDuckGo HTML…), les balises
 > `<noscript>` sont donc rendues.
 
+## Captures d'écran
+
+| Page d'accueil (`about:home`) | Article façon Wikipédia (`tests/fixtures/wiki.html`) |
+|---|---|
+| ![Page d'accueil](docs/screenshots/home.png) | ![Article Wikipédia](docs/screenshots/wiki.png) |
+| **Hacker News** (`tests/fixtures/hn.html`) | **Mise en page moderne** (`tests/fixtures/modern.html`) |
+| ![Hacker News](docs/screenshots/hn.png) | ![Mise en page moderne](docs/screenshots/modern.png) |
+
 ## Fonctionnalités
 
 **Moteur**

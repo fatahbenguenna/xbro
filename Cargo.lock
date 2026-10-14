@@ -2942,6 +2942,7 @@ dependencies = [
  "tiny-skia 0.11.4",
  "url",
  "winit",
+ "xbro-css",
  "xbro-engine",
  "xbro-net",
  "xbro-paint",

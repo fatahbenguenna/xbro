@@ -5,8 +5,12 @@ use xbro_paint::tiny_skia::Pixmap;
 
 use crate::{Mode, Options};
 
-/// Tallest screenshot we produce, in device pixels (larger pages are cut).
+/// Largest screenshot side, in device pixels (larger pages are cut).
 const MAX_SCREENSHOT_HEIGHT: f32 = 32_768.0;
+const MAX_SCREENSHOT_WIDTH: f32 = 32_768.0;
+/// Largest screenshot area in device pixels (1 GiB of RGBA); taller
+/// images are cut to fit.
+const MAX_SCREENSHOT_PIXELS: f32 = (1 << 28) as f32;
 
 /// Viewport height used for layout when a full-page screenshot is requested.
 const DEFAULT_VIEWPORT_HEIGHT: u32 = 768;
@@ -59,17 +63,22 @@ fn screenshot(page: &Page, opts: &Options, output: &str) -> Result<(), String> {
 }
 
 /// Device-pixel size of the screenshot: the viewport, or the whole document
-/// when `--height 0` was given (capped at [`MAX_SCREENSHOT_HEIGHT`]).
+/// when `--height 0` was given (capped at [`MAX_SCREENSHOT_WIDTH`] ×
+/// [`MAX_SCREENSHOT_HEIGHT`] and [`MAX_SCREENSHOT_PIXELS`], so that huge
+/// `--width`/`--scale` values cannot exhaust memory).
 fn screenshot_size(opts: &Options, viewport: Size, document: Size) -> (u32, u32) {
     let css_height = if opts.height == 0 {
         document.height.max(viewport.height)
     } else {
         viewport.height
     };
-    let width = (viewport.width * opts.scale).round().max(1.0);
+    let width = (viewport.width * opts.scale)
+        .round()
+        .clamp(1.0, MAX_SCREENSHOT_WIDTH);
     let height = (css_height * opts.scale)
         .round()
-        .clamp(1.0, MAX_SCREENSHOT_HEIGHT);
+        .clamp(1.0, MAX_SCREENSHOT_HEIGHT)
+        .min((MAX_SCREENSHOT_PIXELS / width).floor());
     (width as u32, height as u32)
 }
 
@@ -117,5 +126,13 @@ mod tests {
             Size::new(800.0, 1e7),
         );
         assert_eq!(huge, (1600, MAX_SCREENSHOT_HEIGHT as u32));
+        // A huge viewport stays within the pixel budget.
+        let wide = screenshot_size(
+            &opts(100_000, 20_000, 8.0),
+            Size::new(100_000.0, 20_000.0),
+            Size::new(100_000.0, 20_000.0),
+        );
+        assert_eq!(wide, (32_768, 8_192));
+        assert!(u64::from(wide.0) * u64::from(wide.1) <= 1 << 28);
     }
 }
