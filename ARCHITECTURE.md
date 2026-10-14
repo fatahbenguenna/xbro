@@ -330,6 +330,9 @@ La crate ne connaît pas le DOM ni les propriétés : elle fournit les briques.
   valide), comme `:visited`. Spécificité calculée à l'analyse. Le moteur de
   correspondance passe par le trait `Element`. Bornes : ≤ 64 composés par
   sélecteur, imbrication des pseudo-classes fonctionnelles ≤ 16.
+  `Selector::matches_with_cache` partage un `MatchCache` pendant une passe de
+  cascade : les résultats de `:has()` y sont mémorisés par élément, ce qui
+  évite de reparcourir les mêmes sous-arbres pour chaque règle.
 - **Media queries** (`media`) : Media Queries 4 partiel, logique à trois
   valeurs (une caractéristique inconnue rend la requête fausse). Types
   `all`/`screen` (vrais) et `print` etc. (faux), `not`, `only`, `and`,
@@ -578,7 +581,9 @@ Atomic(LayoutBox)}`. Un `TextFragment` porte ses glyphes déjà positionnés
   des masques de glyphes mis en cache et mélangés dans une boucle dédiée,
   images avec filtrage bilinéaire (réduction préalable par moyenne pour les
   fortes réductions, sans moiré), SVG rendu par `resvg` à la taille de
-  destination (cache borné), découpages arrondis par masques construits à la
+  destination (cache borné ; au-delà de 1024 × 1024 px seule la partie visible
+  est rendue, par blocs de 256 px, et un SVG à filtres est plafonné à
+  512 × 512 px puis agrandi), découpages arrondis par masques construits à la
   demande, groupes d'opacité dans des calques transparents composés sur leur
   seule zone modifiée.
 - **Images** (`image`) : `Image::Raster(Arc<Pixmap>)` (prémultiplié) ou
@@ -603,7 +608,8 @@ Atomic(LayoutBox)}`. Un `TextFragment` porte ses glyphes déjà positionnés
   reste l'URL demandée) ; `load_html(html, url, viewport)` part d'une chaîne.
   `NavigationRequest::{Get(Url), Post { url, fields }}`.
 - **Sous-ressources** (`stylesheets`, `images`, `fetch`) : feuilles et
-  `@import` (profondeur ≤ 4, ≤ 64 imports, ≤ 256 feuilles liées) niveau par
+  `@import` (profondeur ≤ 4, ≤ 64 imports, ≤ 256 feuilles liées ; un import
+  qui reviendrait vers une feuille de la chaîne est ignoré) niveau par
   niveau ; images avec un budget par page (400 URL, 20 s, 512 Mio de pixels
   décodés, comptés depuis l'en-tête avant décodage) ; ce qui dépasse est
   ignoré et signalé dans `Page::console()` (≤ 1000 messages). `srcset` et

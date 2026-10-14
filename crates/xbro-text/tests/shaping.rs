@@ -15,20 +15,38 @@ fn assert_consistent(fonts: &FontSystem, font: FontId, size: f32, text: &str, ls
         run.width.to_bits(),
         "measure != shape for {text:?}"
     );
-    let mut pen = 0.0f32;
+    // Pen positions are accumulated in f64 and rounded to f32 per glyph.
+    let mut pen = 0.0f64;
     for glyph in &run.glyphs {
         assert_eq!(
             glyph.x.to_bits(),
-            pen.to_bits(),
+            (pen as f32).to_bits(),
             "x of {glyph:?} in {text:?}"
         );
-        pen += glyph.advance;
+        pen += f64::from(glyph.advance);
     }
     assert_eq!(
-        pen.to_bits(),
+        (pen as f32).to_bits(),
         run.width.to_bits(),
         "width != sum of advances"
     );
+}
+
+#[test]
+fn long_runs_do_not_drift() {
+    let Some(fonts) = dejavu() else { return };
+    let one = fonts.measure(FontId(0), 13.0, "x", 0.0, 0.0);
+    let text = "x".repeat(500_000);
+    let run = fonts.shape(FontId(0), 13.0, &text, 0.0, 0.0);
+    let expected = f64::from(one) * 500_000.0;
+    assert!(
+        (f64::from(run.width) - expected).abs() < 1.0,
+        "width {} vs {expected}",
+        run.width
+    );
+    let last = run.glyphs.last().unwrap();
+    assert!((f64::from(last.x) - (expected - f64::from(one))).abs() < 1.0);
+    assert_eq!(fonts.measure(FontId(0), 13.0, &text, 0.0, 0.0), run.width);
 }
 
 #[test]

@@ -40,15 +40,16 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     (value, start.elapsed())
 }
 
-/// Parsing time must grow linearly: 4x the input may take at most ~8x the
-/// time (generous for timer noise), whereas the old quadratic scan took 16x.
+/// Parsing time must grow linearly: 8x the input may take at most 24x the
+/// time, whereas the old quadratic scan took 64x. The wide margin keeps the
+/// test reliable on a machine loaded by parallel builds.
 fn assert_linear(make: impl Fn(usize) -> String, expected_rules: impl Fn(usize) -> usize) {
     let small = 5_000;
-    let large = 4 * small;
+    let large = 8 * small;
     // Warm up allocations, then keep the best of a few runs.
     let best = |n: usize| {
         let css = make(n);
-        (0..3)
+        (0..5)
             .map(|_| {
                 let (sheet, elapsed) = timed(|| parse_stylesheet(&css));
                 assert_eq!(style_rules(&sheet.rules).len(), expected_rules(n));
@@ -60,7 +61,7 @@ fn assert_linear(make: impl Fn(usize) -> String, expected_rules: impl Fn(usize) 
     let t_small = best(small).max(Duration::from_micros(500));
     let t_large = best(large);
     assert!(
-        t_large < t_small * 8,
+        t_large < t_small * 24,
         "{small} rules: {t_small:?}, {large} rules: {t_large:?}"
     );
 }

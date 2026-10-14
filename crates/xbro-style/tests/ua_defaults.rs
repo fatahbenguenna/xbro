@@ -294,3 +294,21 @@ fn fieldset_and_legend() {
         }
     );
 }
+
+#[test]
+fn disabled_controls_are_faded() {
+    let s = style(
+        "<input id=t disabled><button id=b disabled>x</button><input id=c type=checkbox disabled>\
+         <input id=e>",
+        "",
+    );
+    let faded_text = Color::rgba(16, 16, 16, 77);
+    assert_eq!(s.get("t").color, faded_text);
+    assert_eq!(s.get("t").background_color, Color::rgba(239, 239, 239, 77));
+    assert_eq!(s.get("b").color, faded_text);
+    assert_eq!(s.get("b").border.top.color, Color::rgba(118, 118, 118, 77));
+    // Checkboxes keep their transparent background; enabled fields are untouched.
+    assert_eq!(s.get("c").background_color, Color::TRANSPARENT);
+    assert_eq!(s.get("e").color, Color::BLACK);
+    assert_eq!(s.get("e").background_color, Color::WHITE);
+}

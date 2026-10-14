@@ -103,14 +103,19 @@ fn check_run(fonts: &FontSystem, font: FontId, size: f32, text: &str, ls: f32, w
     assert!(run.width.is_finite(), "width {} for {text:?}", run.width);
     let visible = text.chars().filter(|c| !ignorable(*c)).count();
     assert_eq!(run.glyphs.len(), visible, "one glyph per visible char");
-    let mut pen = 0.0f32;
+    // Pen positions are accumulated in f64 and rounded to f32 per glyph.
+    let mut pen = 0.0f64;
     let mut last_cluster = None;
     for glyph in &run.glyphs {
         assert!(
             glyph.x.is_finite() && glyph.advance.is_finite(),
             "{glyph:?}"
         );
-        assert_eq!(glyph.x.to_bits(), pen.to_bits(), "x is the running sum");
+        assert_eq!(
+            glyph.x.to_bits(),
+            (pen as f32).to_bits(),
+            "x is the running sum"
+        );
         assert!(text.is_char_boundary(glyph.cluster), "{glyph:?}");
         let c = text[glyph.cluster..]
             .chars()
@@ -120,10 +125,10 @@ fn check_run(fonts: &FontSystem, font: FontId, size: f32, text: &str, ls: f32, w
         assert!(last_cluster < Some(glyph.cluster), "clusters increase");
         last_cluster = Some(glyph.cluster);
         assert!(fonts.face_count() == 0 || (glyph.font.0 as usize) < fonts.face_count());
-        pen += glyph.advance;
+        pen += f64::from(glyph.advance);
     }
     assert_eq!(
-        pen.to_bits(),
+        (pen as f32).to_bits(),
         run.width.to_bits(),
         "width = sum of advances"
     );

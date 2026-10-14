@@ -213,6 +213,10 @@ xdotool key ctrl+w                    # fermer le dernier onglet quitte xbro
 - N'utilisez pas `xdotool key --window …` : il passe par `XSendEvent`, dont
   `winit` ignore les événements ; donnez le focus puis envoyez les touches
   sans `--window`.
+- Sous Xvfb, chaque `xdotool click 4` / `click 5` arrive deux fois dans
+  `winit` 0.30 (appui et relâchement du bouton de molette émulé) : un cran
+  fait défiler de 96 px au lieu de 48, ou zoome de deux niveaux avec `Ctrl`.
+  Les vraies souris (libinput) ne sont pas concernées.
 - `-w` et `-H` fixent la taille initiale de la fenêtre en px logiques ; les
   captures de `docs/screenshots/` font 1280×860.
 - Sans `DISPLAY` ni `WAYLAND_DISPLAY`, xbro s'arrête avec `cannot open a

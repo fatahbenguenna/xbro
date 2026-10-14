@@ -200,6 +200,15 @@ input:is([type=submit i], [type=reset i], [type=button i], [type=image i], [type
   box-sizing: border-box;
 }
 select { padding: 1px 0; }
+/* Disabled controls are drawn faded, like Chrome. */
+input:disabled, textarea:disabled, select:disabled, button:disabled {
+  color: rgba(16, 16, 16, 0.3);
+}
+textarea:disabled, select:disabled, button:disabled,
+input:disabled:not([type=checkbox i], [type=radio i], [type=range i], [type=image i]) {
+  border-color: rgba(118, 118, 118, 0.3);
+  background-color: rgba(239, 239, 239, 0.3);
+}
 fieldset {
   display: block;
   min-inline-size: min-content;

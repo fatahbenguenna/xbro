@@ -211,7 +211,7 @@ position physique de la touche sert de repli.
 | Onglet suivant / précédent | `Ctrl+Tab` / `Ctrl+Shift+Tab`, `Ctrl+Page↓` / `Ctrl+Page↑` |
 | Aller à l'onglet *n* | `Ctrl+1` … `Ctrl+8` ; `Ctrl+9` : dernier onglet |
 | Rechercher dans la page | `Ctrl+F` ; `Entrée` / `Shift+Entrée`, `F3` / `Shift+F3`, `Ctrl+G` / `Ctrl+Shift+G` ; `Échap` ferme |
-| Zoom | `Ctrl++` (ou `Ctrl+=`), `Ctrl+-`, `Ctrl+0`, `Ctrl`+molette |
+| Zoom | `Ctrl++` (ou `Ctrl+=`), `Ctrl+-`, `Ctrl+0`, `Ctrl`+molette ; un clic sur le badge « 125 % » de la barre d'adresse revient à 100 % |
 | Défiler | molette (`Shift`+molette : horizontal), flèches, `Espace` / `Shift+Espace`, `Page↑/↓`, `Début`/`Fin` (aussi avec `Ctrl`), barres de défilement (glisser ou cliquer dans la piste) |
 | Parcourir les liens et champs | `Tab` / `Shift+Tab` ; `Entrée` active ; `Espace` active une case à cocher, un bouton, une liste ou un `<summary>` (sinon fait défiler) |
 | Ouvrir un lien dans un onglet en arrière-plan | `Ctrl+clic` ou clic du milieu |

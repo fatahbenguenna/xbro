@@ -135,7 +135,9 @@ pub enum Display {
     ListItem,
     Flex,
     InlineFlex,
-    /// `grid` / `inline-grid` are laid out by xbro as flex rows that wrap (approximation).
+    /// `grid` / `inline-grid`: CSS grid with track sizing (fixed, `fr`, intrinsic,
+    /// `minmax()`, auto-fill/auto-fit) and line/span placement; areas and named
+    /// lines are not supported.
     Grid,
     InlineGrid,
     Table,

@@ -73,7 +73,9 @@ impl FontSystem {
             self.valid_font(font)
         };
 
-        let mut pen = 0.0f32;
+        // Accumulated in f64 so positions don't drift on very long runs
+        // (f32 loses whole pixels after ~20k glyphs).
+        let mut pen = 0.0f64;
         let mut pending: Option<Pending> = None;
         // Lock order: kerning cache, then glyph cache (never the reverse).
         let kerns = read(&self.kern_cache);
@@ -118,7 +120,7 @@ impl FontSystem {
                         prev.glyph.advance += kern * size;
                     }
                 }
-                pen += prev.glyph.advance;
+                pen += f64::from(prev.glyph.advance);
                 emit(prev.glyph);
             }
 
@@ -130,7 +132,7 @@ impl FontSystem {
                 glyph: ShapedGlyph {
                     font: entry.font,
                     glyph_id: entry.glyph,
-                    x: pen,
+                    x: pen as f32,
                     advance,
                     cluster,
                 },
@@ -147,10 +149,10 @@ impl FontSystem {
             map.extend(new_kerns.into_iter().take(MAX_KERN_ENTRIES));
         }
         if let Some(last) = pending {
-            pen += last.glyph.advance;
+            pen += f64::from(last.glyph.advance);
             emit(last.glyph);
         }
-        pen
+        pen as f32
     }
 
     /// Resolves `c` for `font` and caches the result when it is final.
