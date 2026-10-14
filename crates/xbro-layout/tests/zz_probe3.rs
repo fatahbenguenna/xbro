@@ -10,7 +10,12 @@ fn page(body: &str) -> String {
 #[test]
 fn r1_relative_cell_abspos() {
     let Some(l) = lay(&page("<table cellspacing=0 cellpadding=0><tr><td id=c style='position:relative;vertical-align:middle;width:100px'>x<span id=b style='position:absolute;bottom:0;right:0;width:10px;height:10px'></span><span id=t style='position:absolute;top:0;left:0;width:10px;height:10px'></span></td><td style='height:100px'>y</td></tr></table>"), 400.0) else { return };
-    eprintln!("R1 c={:?} b={:?} t={:?}", l.rect("c"), l.rect("b"), l.rect("t"));
+    eprintln!(
+        "R1 c={:?} b={:?} t={:?}",
+        l.rect("c"),
+        l.rect("b"),
+        l.rect("t")
+    );
 }
 
 #[test]
@@ -29,13 +34,23 @@ fn r3_rowspan_across_groups() {
 #[test]
 fn r4_col_width() {
     let Some(l) = lay(&page("<table id=t cellspacing=0 cellpadding=0><colgroup><col width=100><col style='width:50px'></colgroup><tr><td id=a>a</td><td id=b>b</td><td id=c>c</td></tr></table>"), 400.0) else { return };
-    eprintln!("R4 a={:?} b={:?} c={:?}", l.rect("a"), l.rect("b"), l.rect("c"));
+    eprintln!(
+        "R4 a={:?} b={:?} c={:?}",
+        l.rect("a"),
+        l.rect("b"),
+        l.rect("c")
+    );
 }
 
 #[test]
 fn r5_fixed_doc_size_and_hit() {
     let Some(l) = lay(&page("<div id=f style='position:fixed;top:0;left:0;width:100px;height:3000px'></div><div style='height:10px'></div>"), 400.0) else { return };
-    eprintln!("R5 ds={:?} hit={:?}", l.tree.document_size, l.tree.hit_test(Point::new(10.0, 1000.0), Point::new(0.0, 900.0)));
+    eprintln!(
+        "R5 ds={:?} hit={:?}",
+        l.tree.document_size,
+        l.tree
+            .hit_test(Point::new(10.0, 1000.0), Point::new(0.0, 900.0))
+    );
 }
 
 #[test]
@@ -46,7 +61,12 @@ fn r6_abspos_in_inline_block_rel() {
 
 #[test]
 fn r7_overflow_hidden_doc_size() {
-    let Some(l) = lay(&page("<div style='overflow:hidden;height:100px'><div style='height:5000px'></div></div>"), 400.0) else { return };
+    let Some(l) = lay(
+        &page("<div style='overflow:hidden;height:100px'><div style='height:5000px'></div></div>"),
+        400.0,
+    ) else {
+        return;
+    };
     eprintln!("R7 ds={:?}", l.tree.document_size);
 }
 
@@ -83,12 +103,22 @@ fn r12_flex_img_auto_min() {
 
 #[test]
 fn r13_inline_svg_viewbox_in_shrink() {
-    let Some(l) = lay(&page("<div id=f style='float:left'><svg id=s viewBox='0 0 24 24'></svg></div>"), 400.0) else { return };
+    let Some(l) = lay(
+        &page("<div id=f style='float:left'><svg id=s viewBox='0 0 24 24'></svg></div>"),
+        400.0,
+    ) else {
+        return;
+    };
     eprintln!("R13 f={:?} s={:?}", l.rect("f"), l.rect("s"));
 }
 
 #[test]
 fn r14_textarea_baseline() {
-    let Some(l) = lay(&page("<div id=d>label <textarea id=t rows=3></textarea></div>"), 400.0) else { return };
+    let Some(l) = lay(
+        &page("<div id=d>label <textarea id=t rows=3></textarea></div>"),
+        400.0,
+    ) else {
+        return;
+    };
     eprintln!("R14 t={:?} d={:?}\n{}", l.rect("t"), l.rect("d"), l.dump());
 }

@@ -275,8 +275,7 @@ impl<'t> LayoutCx<'t> {
                 }
             }
         }
-        let collapse_top =
-            cleared.is_none() && edges.padding.top == 0.0 && edges.border.top == 0.0;
+        let collapse_top = cleared.is_none() && edges.padding.top == 0.0 && edges.border.top == 0.0;
         let border_top = if cleared.is_some() {
             Some(flow.y)
         } else {
@@ -321,9 +320,8 @@ impl<'t> LayoutCx<'t> {
         let collapse_bottom = spec_h.is_none() && ratio_h.is_none() && no_bottom_pb;
         // Top and bottom margins of an empty box are adjoining when its
         // height is auto or zero (CSS 2.1 §8.3.1).
-        let collapse_through = no_bottom_pb
-            && min_h <= 0.0
-            && spec_h.or(ratio_h).is_none_or(|h| h <= 0.0);
+        let collapse_through =
+            no_bottom_pb && min_h <= 0.0 && spec_h.or(ratio_h).is_none_or(|h| h <= 0.0);
         let content_top = match border_top {
             Some(bt) => bt + edges.border.top + edges.padding.top,
             None => match first_top {

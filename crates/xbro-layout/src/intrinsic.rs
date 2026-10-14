@@ -14,8 +14,8 @@ use crate::box_tree::{BoxNode, Kind};
 use crate::cx::LayoutCx;
 use crate::inline::ifc_intrinsic;
 use crate::sizing::{
-    box_edges, clamp_size, height_limits, ratio_width, sane_size, specified_height, specified_width,
-    width_limits,
+    box_edges, clamp_size, height_limits, ratio_width, sane_size, specified_height,
+    specified_width, width_limits,
 };
 use crate::{flex, table};
 
