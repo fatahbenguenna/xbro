@@ -6,6 +6,7 @@
 //! the lifetime of the document (styles and layout boxes refer to them).
 
 use std::fmt::Write as _;
+use std::sync::OnceLock;
 
 /// Index of a node inside a [`Document`] arena.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -151,6 +152,10 @@ pub struct Document {
     nodes: Vec<Node>,
     /// True when the parser saw a doctype that triggers quirks mode (or none at all).
     pub quirks_mode: bool,
+    /// Lazily computed position of every node in its parent's child list, so
+    /// sibling navigation is O(1). Reset by every `&mut self` method (including
+    /// [`Document::node_mut`], since callers may edit `children` directly).
+    sibling_index: OnceLock<Vec<u32>>,
 }
 
 impl Default for Document {
@@ -169,6 +174,7 @@ impl Document {
                 data: NodeData::Document,
             }],
             quirks_mode: false,
+            sibling_index: OnceLock::new(),
         }
     }
 
@@ -190,7 +196,12 @@ impl Document {
     }
 
     pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        self.invalidate();
         &mut self.nodes[id.0]
+    }
+
+    fn invalidate(&mut self) {
+        self.sibling_index.take();
     }
 
     /// All node ids in creation order (including detached nodes).
@@ -199,6 +210,7 @@ impl Document {
     }
 
     fn push(&mut self, data: NodeData) -> NodeId {
+        self.invalidate();
         let id = NodeId(self.nodes.len());
         self.nodes.push(Node {
             parent: None,
@@ -226,6 +238,7 @@ impl Document {
 
     /// Unlinks `child` from its parent (no-op for a detached node).
     pub fn detach(&mut self, child: NodeId) {
+        self.invalidate();
         if let Some(parent) = self.nodes[child.0].parent.take() {
             self.nodes[parent.0].children.retain(|&c| c != child);
         }
@@ -235,6 +248,7 @@ impl Document {
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         debug_assert_ne!(parent, child);
         self.detach(child);
+        self.invalidate();
         self.nodes[child.0].parent = Some(parent);
         self.nodes[parent.0].children.push(child);
     }
@@ -243,6 +257,7 @@ impl Document {
     /// appends when `reference` is not found.
     pub fn insert_before(&mut self, parent: NodeId, child: NodeId, reference: NodeId) {
         self.detach(child);
+        self.invalidate();
         self.nodes[child.0].parent = Some(parent);
         let children = &mut self.nodes[parent.0].children;
         match children.iter().position(|&c| c == reference) {
@@ -253,6 +268,7 @@ impl Document {
 
     /// Appends text to `parent`, merging with a trailing text node if there is one.
     pub fn append_text(&mut self, parent: NodeId, text: &str) {
+        self.invalidate();
         if let Some(&last) = self.nodes[parent.0].children.last() {
             if let NodeData::Text(existing) = &mut self.nodes[last.0].data {
                 existing.push_str(text);
@@ -276,6 +292,7 @@ impl Document {
     }
 
     pub fn element_mut(&mut self, id: NodeId) -> Option<&mut ElementData> {
+        self.invalidate();
         self.nodes[id.0].element_mut()
     }
 
@@ -314,10 +331,30 @@ impl Document {
             .filter(move |&c| self.node(c).is_element())
     }
 
+    /// Parent of `id` and the position of `id` in the parent's child list (O(1)
+    /// once the index is built; the index is rebuilt lazily after mutations).
     fn sibling_index(&self, id: NodeId) -> Option<(NodeId, usize)> {
         let parent = self.parent(id)?;
-        let pos = self.children(parent).iter().position(|&c| c == id)?;
-        Some((parent, pos))
+        let index = self.sibling_index.get_or_init(|| {
+            let mut index = vec![u32::MAX; self.nodes.len()];
+            for node in &self.nodes {
+                for (i, &c) in node.children.iter().enumerate() {
+                    if let Some(slot) = index.get_mut(c.0) {
+                        *slot = u32::try_from(i).unwrap_or(u32::MAX);
+                    }
+                }
+            }
+            index
+        });
+        let children = self.children(parent);
+        match index.get(id.0).map(|&i| i as usize) {
+            Some(pos) if children.get(pos) == Some(&id) => Some((parent, pos)),
+            // Defensive fallback (index overflow or a stale entry).
+            _ => children
+                .iter()
+                .position(|&c| c == id)
+                .map(|pos| (parent, pos)),
+        }
     }
 
     pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
@@ -522,6 +559,33 @@ mod tests {
             vec![html, doc.root()]
         );
         assert!(doc.is_connected(body));
+    }
+
+    #[test]
+    fn sibling_navigation_tracks_mutations() {
+        let mut doc = Document::new();
+        let ul = doc.create_element("ul", vec![]);
+        doc.append_child(doc.root(), ul);
+        let items: Vec<NodeId> = (0..1000)
+            .map(|_| {
+                let li = doc.create_element("li", vec![]);
+                doc.append_child(ul, li);
+                doc.append_text(ul, " ");
+                li
+            })
+            .collect();
+        assert_eq!(doc.next_sibling_element(items[10]), Some(items[11]));
+        assert_eq!(doc.prev_sibling_element(items[10]), Some(items[9]));
+        assert_eq!(doc.prev_sibling_element(items[0]), None);
+        // Mutations invalidate the cached index.
+        let first = doc.create_element("li", vec![]);
+        doc.insert_before(ul, first, items[0]);
+        assert_eq!(doc.prev_sibling(items[0]), Some(first));
+        doc.detach(items[500]);
+        assert_eq!(doc.next_sibling_element(items[499]), Some(items[501]));
+        let moved = std::mem::take(&mut doc.node_mut(ul).children);
+        doc.node_mut(ul).children = moved.into_iter().rev().collect();
+        assert_eq!(doc.next_sibling_element(items[11]), Some(items[10]));
     }
 
     #[test]

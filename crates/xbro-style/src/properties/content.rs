@@ -244,11 +244,11 @@ fn list_position(v: &CV) -> Option<ListStylePosition> {
 }
 
 /// `none` → `Some(None)`, `url()` → `Some(Some(url))`.
-fn list_image(v: &CV) -> Option<Option<String>> {
+fn list_image(v: &CV) -> Option<Option<std::sync::Arc<str>>> {
     if v.is_ident("none") {
         return Some(None);
     }
-    url(v).or_else(|| image_set_url(v)).map(Some)
+    url(v).or_else(|| image_set_url(v)).map(|u| Some(u.into()))
 }
 
 pub(super) fn list_style_type(

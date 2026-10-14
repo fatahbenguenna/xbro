@@ -148,7 +148,7 @@ pub(crate) enum Spec {
     Bool(bool),
     ListStyleType(ListStyleType),
     ListStylePosition(ListStylePosition),
-    ListStyleImage(Option<String>),
+    ListStyleImage(Option<std::sync::Arc<str>>),
     BorderCollapse(BorderCollapse),
     BorderSpacing(MathExpr, MathExpr),
     DecorationLine(TextDecorationLine),

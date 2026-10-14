@@ -637,8 +637,8 @@ pub struct ComputedStyle {
     pub break_anywhere: bool,
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
-    /// `list-style-image` raw URL.
-    pub list_style_image: Option<String>,
+    /// `list-style-image` raw URL (shared: it is inherited by every descendant).
+    pub list_style_image: Option<Arc<str>>,
     pub border_collapse: BorderCollapse,
     /// Horizontal / vertical `border-spacing` in px.
     pub border_spacing: (f32, f32),
