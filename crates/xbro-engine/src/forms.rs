@@ -95,17 +95,33 @@ pub(crate) fn is_disabled(doc: &Document, node: NodeId) -> bool {
     }
     let mut child = node;
     for ancestor in doc.ancestors(node) {
-        if doc.is_element_named(ancestor, "fieldset") && doc.attr(ancestor, "disabled").is_some() {
-            let first_legend = doc
-                .element_children(ancestor)
-                .find(|&c| doc.is_element_named(c, "legend"));
-            if first_legend != Some(child) {
-                return true;
-            }
+        if doc.is_element_named(ancestor, "fieldset")
+            && doc.attr(ancestor, "disabled").is_some()
+            && !is_first_legend(doc, child)
+        {
+            return true;
         }
         child = ancestor;
     }
     false
+}
+
+/// True when `node` is a `<legend>` with no `<legend>` element sibling
+/// before it (the first legend child of its parent). Only legends pay for
+/// the sibling walk, which stops at the first earlier legend, so checking
+/// every control of a huge disabled fieldset stays linear.
+fn is_first_legend(doc: &Document, node: NodeId) -> bool {
+    if !doc.is_element_named(node, "legend") {
+        return false;
+    }
+    let mut sibling = doc.prev_sibling_element(node);
+    while let Some(s) = sibling {
+        if doc.is_element_named(s, "legend") {
+            return false;
+        }
+        sibling = doc.prev_sibling_element(s);
+    }
+    true
 }
 
 /// `readonly` text fields keep focus but cannot be edited.
@@ -116,16 +132,46 @@ pub(crate) fn is_readonly(doc: &Document, node: NodeId) -> bool {
 /// The form a control belongs to: the element named by its `form`
 /// attribute (when it is a `<form>`), else its nearest `<form>` ancestor.
 pub(crate) fn form_owner(doc: &Document, control: NodeId) -> Option<NodeId> {
-    if let Some(id) = doc.attr(control, "form") {
-        let id = id.trim();
-        if !id.is_empty() {
-            return doc
-                .get_element_by_id(id)
-                .filter(|&f| doc.is_element_named(f, "form"));
-        }
+    Owners::new(doc).owner(control)
+}
+
+/// Form owner lookups for many controls: the `id` index needed by `form`
+/// attributes is built once (a lookup by id scans the whole document, so
+/// thousands of `<input form=…>` made each submission quadratic).
+pub(crate) struct Owners<'a> {
+    doc: &'a Document,
+    ids: Option<HashMap<&'a str, NodeId>>,
+}
+
+impl<'a> Owners<'a> {
+    pub(crate) fn new(doc: &'a Document) -> Self {
+        Self { doc, ids: None }
     }
-    doc.ancestors(control)
-        .find(|&a| doc.is_element_named(a, "form"))
+
+    /// See [`form_owner`].
+    pub(crate) fn owner(&mut self, control: NodeId) -> Option<NodeId> {
+        let doc = self.doc;
+        if let Some(id) = doc.attr(control, "form") {
+            let id = id.trim();
+            if !id.is_empty() {
+                let ids = self.ids.get_or_insert_with(|| {
+                    let mut ids = HashMap::new();
+                    for n in doc.descendants(doc.root()) {
+                        if let Some(id) = doc.element(n).and_then(|e| e.id()) {
+                            ids.entry(id).or_insert(n);
+                        }
+                    }
+                    ids
+                });
+                return ids
+                    .get(id)
+                    .copied()
+                    .filter(|&f| doc.is_element_named(f, "form"));
+            }
+        }
+        doc.ancestors(control)
+            .find(|&a| doc.is_element_named(a, "form"))
+    }
 }
 
 /// Whitespace-collapsed text of an element.
@@ -221,8 +267,9 @@ pub(crate) fn form_data(
     submitter: Option<Submitter>,
 ) -> Vec<(String, String)> {
     let mut fields = Vec::new();
+    let mut owners = Owners::new(doc);
     for node in doc.descendants(doc.root()) {
-        if !is_listed_control(doc, node) || form_owner(doc, node) != Some(form) {
+        if !is_listed_control(doc, node) || owners.owner(node) != Some(form) {
             continue;
         }
         if is_disabled(doc, node)
@@ -380,11 +427,12 @@ pub(crate) fn implicit_submission(
     base: &Url,
     document_url: &Url,
 ) -> Option<NavigationRequest> {
-    let form = form_owner(doc, field)?;
+    let mut owners = Owners::new(doc);
+    let form = owners.owner(field)?;
     let mut default_button = None;
     let mut blocking = 0usize;
     for node in doc.descendants(doc.root()) {
-        if !is_listed_control(doc, node) || form_owner(doc, node) != Some(form) {
+        if !is_listed_control(doc, node) || owners.owner(node) != Some(form) {
             continue;
         }
         if default_button.is_none() && is_submit_button(doc, node) {
@@ -470,17 +518,20 @@ fn set_flag(doc: &mut Document, node: NodeId, name: &str, on: bool) -> bool {
 /// Restores the load-time state of the controls of `form`. Returns true if
 /// anything changed.
 pub(crate) fn reset(doc: &mut Document, form: NodeId, defaults: &FormDefaults) -> bool {
+    let mut owners = Owners::new(doc);
     let nodes: Vec<NodeId> = doc
         .descendants(doc.root())
         .filter(|&n| {
+            if !defaults.controls.contains_key(&n) {
+                return false;
+            }
             let owner_node = if doc.is_element_named(n, "option") {
                 doc.ancestors(n)
                     .find(|&a| doc.is_element_named(a, "select"))
             } else {
                 Some(n)
             };
-            defaults.controls.contains_key(&n)
-                && owner_node.is_some_and(|o| form_owner(doc, o) == Some(form))
+            owner_node.is_some_and(|o| owners.owner(o) == Some(form))
         })
         .collect();
     let mut changed = false;
@@ -522,14 +573,15 @@ fn radio_group(doc: &Document, radio: NodeId) -> Vec<NodeId> {
     let Some(name) = doc.attr(radio, "name").filter(|n| !n.is_empty()) else {
         return Vec::new();
     };
-    let owner = form_owner(doc, radio);
+    let mut owners = Owners::new(doc);
+    let owner = owners.owner(radio);
     doc.descendants(doc.root())
         .filter(|&n| {
             n != radio
                 && doc.is_element_named(n, "input")
                 && input_type(doc, n) == "radio"
                 && doc.attr(n, "name") == Some(name)
-                && form_owner(doc, n) == owner
+                && owners.owner(n) == owner
         })
         .collect()
 }
@@ -876,6 +928,13 @@ mod tests {
         );
         assert!(!is_disabled(&d, by_id(&d, "b1")));
         assert!(is_disabled(&d, by_id(&d, "b2")));
+        // Only the first legend child is exempt, wherever it is.
+        let d2 = doc("<fieldset disabled><p>x</p><legend><input id=l1></legend>\
+                      <legend><input id=l2></legend><div><legend><input id=l3></legend></div>\
+                      </fieldset>");
+        assert!(!is_disabled(&d2, by_id(&d2, "l1")));
+        assert!(is_disabled(&d2, by_id(&d2, "l2")));
+        assert!(is_disabled(&d2, by_id(&d2, "l3")));
         assert_eq!(form_owner(&d, by_id(&d, "b2")), Some(by_id(&d, "f1")));
         assert_eq!(form_owner(&d, by_id(&d, "b3")), None);
     }

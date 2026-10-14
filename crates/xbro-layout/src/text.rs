@@ -60,6 +60,41 @@ pub(crate) fn is_break_after_dash(c: char) -> bool {
     matches!(c, '-' | '\u{2010}' | '\u{2013}' | '\u{2014}')
 }
 
+/// Closing punctuation, quotes and other characters a line may not start
+/// with even after an atomic inline (UAX #14 classes CL, CP, EX, IS, SY,
+/// QU, approximated).
+#[inline]
+pub(crate) fn no_break_before(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']'
+            | '}'
+            | '!'
+            | ','
+            | '.'
+            | ':'
+            | ';'
+            | '?'
+            | '/'
+            | '"'
+            | '\''
+            | '\u{BB}'
+            | '\u{2019}'
+            | '\u{201D}'
+            | '\u{203A}'
+    ) || is_cjk_closing(c)
+}
+
+/// Opening punctuation and quotes a line may not end with before an
+/// atomic inline (UAX #14 classes OP, QU, approximated).
+#[inline]
+pub(crate) fn no_break_after(c: char) -> bool {
+    matches!(
+        c,
+        '(' | '[' | '{' | '"' | '\'' | '\u{AB}' | '\u{2018}' | '\u{201C}' | '\u{2039}'
+    )
+}
+
 /// Appends `c` to `out` transformed per `text-transform`. `word_start` tells
 /// whether `c` begins a word (for `capitalize`).
 #[inline]

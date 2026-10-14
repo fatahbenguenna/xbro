@@ -15,6 +15,10 @@
 //!   backgrounds fill them) and its content is moved per `vertical-align`:
 //!   `top`, `middle`, `bottom`, or `baseline` (other values) aligning the
 //!   first baselines of the row's baseline cells.
+//! * A positioned cell is the containing block of its absolutely
+//!   positioned descendants: their layout is deferred until the cell has
+//!   its final height and position (cells are never laid out twice, so
+//!   nested tables stay linear).
 //! * Separated borders: `border-spacing` around and between cells.
 //!   Collapsed borders (approximation): adjacent cells overlap by the
 //!   width of their shared borders (so a 1px grid stays 1px), the outer
@@ -26,7 +30,7 @@ use super::structure::{self, Grid};
 use super::widths;
 use crate::block::{Cb, ContentLayout};
 use crate::box_tree::BoxNode;
-use crate::cx::LayoutCx;
+use crate::cx::{translate_deferred, LayoutCx, PendingAbs};
 use crate::geom::Rect;
 use crate::intrinsic::Intrinsic;
 use crate::sizing::{box_edges, height_limits, sane, sane_size, specified_height, BoxEdges};
@@ -204,11 +208,14 @@ fn cell_align(style: &ComputedStyle) -> CellAlign {
 }
 
 /// A cell laid out at the top of its first row.
-struct LaidCell {
+struct LaidCell<'t> {
     lb: LayoutBox,
     /// Pending-box marks of its layout.
     start: u64,
     end: u64,
+    /// Absolutely positioned boxes whose containing block is the cell
+    /// (positioned cells), laid out once the cell has its final height.
+    deferred: Vec<PendingAbs<'t>>,
     /// Border-box height as laid out (content height).
     h: f32,
     /// Border-box height the cell needs: its content, or its specified
@@ -280,28 +287,28 @@ fn covered_edges(grid: &Grid<'_>) -> Vec<(usize, usize)> {
     out
 }
 
-/// True for an absolutely positioned box placed by a vertical inset
-/// (`top`/`bottom`) against its containing block rather than at its static
-/// position.
-fn is_inset_abspos(b: &LayoutBox) -> bool {
-    b.style.position.is_out_of_flow() && !(b.style.top.is_auto() && b.style.bottom.is_auto())
-}
-
-/// Moves the content (lines and children, not the box) of a laid-out cell.
-/// Absolutely positioned children of a positioned cell that are placed by
-/// `top`/`bottom` stay where they are: they belong to the cell's padding
-/// box, not to its aligned content.
-fn shift_content(cx: &mut LayoutCx<'_>, c: &mut LaidCell, dy: f32) {
+/// Moves the content (lines and children, not the box) of a laid-out cell,
+/// with the static positions of the boxes registered inside it.
+fn shift_content(cx: &mut LayoutCx<'_>, c: &mut LaidCell<'_>, dy: f32) {
     if dy == 0.0 || !dy.is_finite() {
         return;
     }
     crate::tree::translate_lines(&mut c.lb.lines, 0.0, dy);
     for child in &mut c.lb.children {
-        if !is_inset_abspos(child) {
-            crate::tree::translate_box(child, 0.0, dy);
-        }
+        crate::tree::translate_box(child, 0.0, dy);
     }
     cx.translate_pending_range(c.start, c.end, 0.0, dy);
+    translate_deferred(&mut c.deferred, 0.0, dy);
+}
+
+/// Moves a laid-out cell (box, content and pending boxes).
+fn move_cell(cx: &mut LayoutCx<'_>, c: &mut LaidCell<'_>, dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    crate::tree::translate_box(&mut c.lb, dx, dy);
+    cx.translate_pending_range(c.start, c.end, dx, dy);
+    translate_deferred(&mut c.deferred, dx, dy);
 }
 
 /// Lays out the contents of table `b` (see the module docs of
@@ -387,7 +394,7 @@ pub(crate) fn layout_table_contents<'t>(
         width: cb.width,
         height: None,
     };
-    let mut laid: Vec<LaidCell> = Vec::with_capacity(grid.cells.len());
+    let mut laid: Vec<LaidCell<'t>> = Vec::with_capacity(grid.cells.len());
     let mut heights = vec![0.0f32; nrows];
     let mut tops = vec![0.0f32; nrows];
     let mut ry = top + if nrows > 0 { sp.top } else { 0.0 };
@@ -404,7 +411,8 @@ pub(crate) fn layout_table_contents<'t>(
             e.margin = crate::geom::Edges::ZERO;
             let w = sane_size(span_width(c.col, c.colspan) - e.pb_h());
             let start = cx.pending_mark();
-            let lb = cx.layout_independent(c.b, x, ry, w, &e, cell_cb, None);
+            let (lb, deferred) =
+                cx.layout_independent_deferring(c.b, x, ry, w, &e, cell_cb, None, true);
             let end = cx.pending_mark();
             let align = cell_align(&c.b.style);
             let bb = lb.border_box();
@@ -423,6 +431,7 @@ pub(crate) fn layout_table_contents<'t>(
                 lb,
                 start,
                 end,
+                deferred,
                 align,
                 baseline: sane(baseline),
                 shift: 0.0,
@@ -495,10 +504,7 @@ pub(crate) fn layout_table_contents<'t>(
         let r1 = (g.row + g.rowspan - 1).min(nrows.saturating_sub(1));
         let t0 = tops.get(r0).copied().unwrap_or(top);
         let dy = t0 - old_tops.get(r0).copied().unwrap_or(t0);
-        if dy != 0.0 {
-            crate::tree::translate_box(&mut c.lb, 0.0, dy);
-            cx.translate_pending_range(c.start, c.end, 0.0, dy);
-        }
+        move_cell(cx, &mut c, 0.0, dy);
         let bottom = tops.get(r1).copied().unwrap_or(t0) + heights.get(r1).copied().unwrap_or(0.0);
         let full = sane_size(bottom - t0);
         let free = sane_size(full - c.h);
@@ -508,36 +514,14 @@ pub(crate) fn layout_table_contents<'t>(
             CellAlign::Bottom => free,
             CellAlign::Baseline => c.shift.min(free),
         };
-        if free > 0.0 && g.b.style.position.is_positioned() {
-            // A positioned cell is the containing block of its absolutely
-            // positioned descendants: lay it out again at its final height
-            // so that they see its full padding box (`bottom: 0`, `height:
-            // 100%`…). Its content still starts at the top and is aligned
-            // below.
-            cx.discard_pending_range(c.start, c.end);
-            let mut e = box_edges(&g.b.style, cb.width);
-            e.margin = crate::geom::Edges::ZERO;
-            let bb = c.lb.border_box();
-            let content_h = sane_size(full - e.pb_v());
-            let start = cx.pending_mark();
-            c.lb = cx.layout_independent(
-                g.b,
-                bb.x,
-                bb.y,
-                c.lb.content.width,
-                &e,
-                cell_cb,
-                Some(content_h),
-            );
-            c.start = start;
-            c.end = cx.pending_mark();
-            shift_content(cx, &mut c, content_dy);
-        } else {
-            shift_content(cx, &mut c, content_dy);
-            c.lb.content.height += free;
-        }
+        shift_content(cx, &mut c, content_dy);
+        c.lb.content.height += free;
+        // Relative offset first: the deferred absolutely positioned boxes
+        // are then laid out against the final padding box of the cell.
+        let (rdx, rdy) = crate::position::relative_offset(&c.lb.style, cell_cb);
+        move_cell(cx, &mut c, rdx, rdy);
         let mut lb = c.lb;
-        cx.apply_relative_range(&mut lb, cell_cb, (c.start, c.end));
+        cx.finish_deferred_abs(&mut lb, c.deferred);
         // A cell spanning rows is a child of the last one so that it paints
         // (and is hit) above the backgrounds of all the rows it covers.
         if let Some(v) = row_children.get_mut(r1) {

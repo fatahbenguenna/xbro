@@ -16,14 +16,19 @@
 //! * Floats and absolutely positioned boxes stay in the child lists and are
 //!   handled as out-of-flow by layout.
 //! * Table parts are organised by [`crate::table`].
+//! * The element whose `overflow` propagates to the viewport (the root
+//!   element, or `<body>` when the root's is `visible`) gets a used
+//!   `overflow: visible` (see [`viewport_overflow`]).
+//! * `<button>` boxes are flagged ([`BoxNode::button`]): they establish a
+//!   formatting context and are fit-content wide even when block-level.
 
 use std::cell::Cell;
 use std::sync::Arc;
 
 use xbro_dom::{Document, NodeData, NodeId};
 use xbro_style::{
-    Color, ComputedStyle, Content, ContentItem, Display, Float, ListStylePosition, StyleMap,
-    WhiteSpace,
+    Color, ComputedStyle, Content, ContentItem, Display, Float, ListStylePosition, Overflow,
+    StyleMap, WhiteSpace,
 };
 
 use crate::geom::Size;
@@ -142,6 +147,10 @@ pub(crate) struct BoxNode {
     /// For tables: the columns declared by `<col>`/`<colgroup>` children
     /// (which generate no boxes), in order.
     pub cols: Vec<ColSpec>,
+    /// Box of a `<button>` element: it establishes a formatting context
+    /// and an auto width is its fit-content width even when block-level
+    /// (HTML rendering, "button layout").
+    pub button: bool,
 }
 
 impl BoxNode {
@@ -164,6 +173,7 @@ impl BoxNode {
             ordinal: None,
             intrinsic: Cell::new(None),
             cols: Vec::new(),
+            button: false,
         }
     }
 
@@ -233,8 +243,41 @@ impl BoxNode {
     }
 }
 
+/// `overflow-x` / `overflow-y` of the viewport.
+pub(crate) type ViewportOverflow = (Overflow, Overflow);
+
+/// Overflow propagation to the viewport (CSS Overflow 3 §3.3): the root
+/// element's `overflow` applies to the viewport, or the `<body>`'s when the
+/// root's is `visible`. Returns the element whose value propagates (its
+/// used `overflow` becomes `visible`: it neither clips nor establishes a
+/// formatting context because of it) and the viewport's values.
+pub(crate) fn viewport_overflow(
+    doc: &Document,
+    styles: &StyleMap,
+) -> (Option<NodeId>, ViewportOverflow) {
+    let visible = (Overflow::Visible, Overflow::Visible);
+    let Some(root) = doc.document_element() else {
+        return (None, visible);
+    };
+    let of = |n: NodeId| styles.get(n).map(|s| (s.overflow_x, s.overflow_y));
+    match of(root) {
+        Some(o) if o != visible => (Some(root), o),
+        Some(_) if doc.is_element_named(root, "html") => {
+            let body = doc
+                .element_children(root)
+                .find(|&c| doc.is_element_named(c, "body"));
+            match body.and_then(|b| of(b).map(|o| (b, o))) {
+                Some((b, o)) if o != visible => (Some(b), o),
+                _ => (None, visible),
+            }
+        }
+        _ => (None, visible),
+    }
+}
+
 /// Builds the box tree for `doc`. Returns `None` when the document element
-/// is missing or not rendered.
+/// is missing or not rendered. The element whose `overflow` propagates to
+/// the viewport (see [`viewport_overflow`]) gets `overflow: visible`.
 pub(crate) fn build(
     doc: &Document,
     styles: &StyleMap,
@@ -246,6 +289,7 @@ pub(crate) fn build(
         doc,
         styles,
         replaced,
+        propagated: viewport_overflow(doc, styles).0,
     };
     let mut out = Vec::new();
     builder.element(root, None, &mut out, 0);
@@ -270,6 +314,8 @@ struct Builder<'a> {
     doc: &'a Document,
     styles: &'a StyleMap,
     replaced: &'a dyn ReplacedSizes,
+    /// Element whose `overflow` was propagated to the viewport.
+    propagated: Option<NodeId>,
 }
 
 impl Builder<'_> {
@@ -287,6 +333,16 @@ impl Builder<'_> {
         if style.display == Display::None {
             return;
         }
+        let visible_style;
+        let style = if self.propagated == Some(el) {
+            let mut s = (**style).clone();
+            s.overflow_x = Overflow::Visible;
+            s.overflow_y = Overflow::Visible;
+            visible_style = Arc::new(s);
+            &visible_style
+        } else {
+            style
+        };
         let name = data.name.as_str();
         if let Some(replaced) = self.replaced_kind(el, name) {
             if style.display == Display::Contents {
@@ -326,6 +382,7 @@ impl Builder<'_> {
             if matches!(b.kind, Kind::Table) {
                 b.cols = self.table_columns(el);
             }
+            b.button = name == "button" && matches!(b.kind, Kind::Block | Kind::Flex);
             out.push(b);
         }
     }

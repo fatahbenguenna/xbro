@@ -3,7 +3,7 @@
 //! parallel loading with a per-page budget, and the [`PageImages`] store
 //! consulted by layout (natural sizes) and paint (pixels).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,15 +15,19 @@ use xbro_net::{resolve, Fetcher, Url};
 use xbro_paint::{Image, ImageProvider};
 use xbro_style::{BackgroundImage, ComputedStyle, Content, ContentItem, Display, StyleMap};
 
-use crate::fetch::{detached_map, scoped_map, MAX_WORKERS};
+use crate::fetch::{detached_map, scoped_map, Policy, MAX_WORKERS};
 use crate::srcset;
-use crate::svg::{serialize_svg, IdIndex};
+use crate::svg::{complete, serialize_tree, IdIndex};
 
 /// Maximum number of distinct image URLs loaded per page.
 pub(crate) const MAX_IMAGES: usize = 400;
 
 /// Maximum number of inline `<svg>` elements rendered per page.
 const MAX_INLINE_SVGS: usize = 400;
+
+/// Total size of the distinct inline SVG documents serialized and parsed
+/// per page; beyond it, the remaining `<svg>`s are not rendered.
+const MAX_TOTAL_SVG_BYTES: usize = 8 << 20;
 
 /// Wall-clock budget for loading all the images of a page.
 pub(crate) const IMAGE_TIME_BUDGET: Duration = Duration::from_secs(20);
@@ -110,7 +114,8 @@ struct Request {
     url: Url,
     /// Elements showing the image, with their `srcset` density.
     nodes: Vec<(NodeId, f32)>,
-    /// Raw style strings (deduplicated) the display list will look up.
+    /// Raw style strings the display list will look up (each raw string is
+    /// added once: the collector deduplicates them).
     keys: Vec<String>,
 }
 
@@ -119,11 +124,7 @@ impl Request {
         match target {
             // Each element is visited once.
             Target::Node(node, density) => self.nodes.push((node, density)),
-            Target::Key(key) => {
-                if !self.keys.contains(&key) {
-                    self.keys.push(key);
-                }
-            }
+            Target::Key(key) => self.keys.push(key),
         }
     }
 }
@@ -184,14 +185,45 @@ struct Collector<'a> {
     styles: &'a StyleMap,
     base: &'a Url,
     media: MediaContext,
+    policy: Policy,
     requests: Vec<Request>,
     by_url: HashMap<String, usize>,
+    /// Raw CSS URL strings already handled (styles are shared by many
+    /// elements: each string is resolved once).
+    css_keys: HashSet<String>,
+    /// Absolute URLs not loaded (over the limit, or refused by the policy),
+    /// so each is reported once.
+    dropped: HashSet<String>,
     svgs: Vec<NodeId>,
     console: &'a mut Vec<String>,
     skipped: usize,
 }
 
-impl Collector<'_> {
+impl<'a> Collector<'a> {
+    fn new(
+        doc: &'a Document,
+        styles: &'a StyleMap,
+        base: &'a Url,
+        media: MediaContext,
+        policy: Policy,
+        console: &'a mut Vec<String>,
+    ) -> Self {
+        Self {
+            doc,
+            styles,
+            base,
+            media,
+            policy,
+            requests: Vec::new(),
+            by_url: HashMap::new(),
+            css_keys: HashSet::new(),
+            dropped: HashSet::new(),
+            svgs: Vec::new(),
+            console,
+            skipped: 0,
+        }
+    }
+
     /// Adds a target for `raw` (resolved against the base URL).
     fn add(&mut self, raw: &str, target: Target) {
         let raw = raw.trim();
@@ -212,8 +244,17 @@ impl Collector<'_> {
             }
             return;
         }
+        if let Some(why) = self.policy.refusal(&url) {
+            if self.dropped.insert(key) {
+                self.console.push(format!("Image blocked ({why}): {url}"));
+            }
+            return;
+        }
         if self.requests.len() >= MAX_IMAGES {
-            self.skipped += 1;
+            // Count distinct URLs, not references.
+            if self.dropped.insert(key) {
+                self.skipped += 1;
+            }
             return;
         }
         self.by_url.insert(key, self.requests.len());
@@ -228,7 +269,8 @@ impl Collector<'_> {
 
     /// Adds a CSS image URL: keyed by its raw string and its absolute form.
     fn add_css(&mut self, raw: &str) {
-        if !raw.trim().is_empty() {
+        if !raw.trim().is_empty() && !self.css_keys.contains(raw) {
+            self.css_keys.insert(raw.to_string());
             self.add(raw, Target::Key(raw.to_string()));
         }
     }
@@ -418,13 +460,25 @@ impl Collector<'_> {
     }
 }
 
-/// Fetches and decodes one image.
 /// Fetches and decodes one image, charging its pixels to `budget` (bytes
 /// still available for decoded images of the page).
 fn fetch_image(fetcher: &Fetcher, url: &Url, budget: &AtomicUsize) -> Result<Image, String> {
+    let exhausted = || {
+        format!(
+            "image memory budget exceeded ({} MiB per page)",
+            MAX_DECODED_BYTES >> 20
+        )
+    };
+    if budget.load(Ordering::Relaxed) == 0 {
+        return Err(exhausted());
+    }
     let response = fetcher.fetch(url).map_err(|e| e.to_string())?;
     if !response.is_success() {
         return Err(format!("HTTP {}", response.status));
+    }
+    // Do not spend time and memory decoding once the budget is spent.
+    if budget.load(Ordering::Relaxed) == 0 {
+        return Err(exhausted());
     }
     let image =
         Image::decode(&response.body, response.content_type.as_deref()).ok_or_else(|| {
@@ -440,10 +494,7 @@ fn fetch_image(fetcher: &Fetcher, url: &Url, budget: &AtomicUsize) -> Result<Ima
     });
     match charged {
         Ok(_) => Ok(image),
-        Err(_) => Err(format!(
-            "image memory budget exceeded ({} MiB per page)",
-            MAX_DECODED_BYTES >> 20
-        )),
+        Err(_) => Err(exhausted()),
     }
 }
 
@@ -466,28 +517,28 @@ fn natural_size(image: &Image, density: f32) -> Size {
     Size::new(s.width / d, s.height / d)
 }
 
-/// Discovers and loads the images of a document. `preloaded` holds images
-/// already decoded by the caller, by absolute URL (not fetched again).
+/// What [`load_images`] needs to know about the document besides its tree.
+pub(crate) struct ImageContext<'a> {
+    /// Base URL for relative image URLs.
+    pub base: &'a Url,
+    /// Media environment (`<picture><source media>`, `sizes`).
+    pub media: MediaContext,
+    /// Which URLs the document may load.
+    pub policy: Policy,
+    /// Images already decoded by the caller, by absolute URL (not fetched again).
+    pub preloaded: &'a [(String, Image)],
+}
+
+/// Discovers and loads the images of a document (see [`ImageContext`]).
 pub(crate) fn load_images(
     fetcher: &Arc<Fetcher>,
     doc: &Document,
     styles: &StyleMap,
-    base: &Url,
-    media: MediaContext,
-    preloaded: &[(String, Image)],
+    cx: &ImageContext<'_>,
     console: &mut Vec<String>,
 ) -> PageImages {
-    let mut collector = Collector {
-        doc,
-        styles,
-        base,
-        media,
-        requests: Vec::new(),
-        by_url: HashMap::new(),
-        svgs: Vec::new(),
-        console,
-        skipped: 0,
-    };
+    let preloaded = cx.preloaded;
+    let mut collector = Collector::new(doc, styles, cx.base, cx.media, cx.policy, console);
     collector.collect();
     let Collector {
         requests,
@@ -561,6 +612,12 @@ pub(crate) fn load_images(
 }
 
 /// Serializes and renders the inline `<svg>` elements.
+///
+/// `<svg>` elements with identical trees (the same icon repeated, or many
+/// `<use>`s of one sprite symbol) share one document, serialized and parsed
+/// once. The distinct documents are bounded in total
+/// ([`MAX_TOTAL_SVG_BYTES`]), so an icon sprite referenced by hundreds of
+/// different `<svg>`s cannot multiply the page into gigabytes of SVG.
 fn load_inline_svgs(
     doc: &Document,
     styles: &StyleMap,
@@ -575,27 +632,65 @@ fn load_inline_svgs(
         ));
     }
     let mut ids = IdIndex::default();
-    let jobs: Vec<(NodeId, String)> = svgs
-        .iter()
-        .take(MAX_INLINE_SVGS)
-        .filter_map(|&svg| {
-            let color = styles.get(svg).map(|s| s.color).unwrap_or_default();
-            let xml = serialize_svg(doc, svg, color, &mut ids);
-            if xml.is_none() {
-                console.push(format!(
-                    "Inline SVG #{} is too large to render",
-                    svg.index()
-                ));
+    // Distinct documents to parse, and which element shows which one.
+    let mut jobs: Vec<String> = Vec::new();
+    // Serialized `<svg>` tree → index of its document in `jobs` (`None`
+    // when it could not be serialized or did not fit the budget).
+    let mut by_tree: HashMap<String, Option<usize>> = HashMap::new();
+    let mut owners: Vec<(NodeId, usize)> = Vec::new();
+    let (mut total, mut over_budget) = (0usize, 0usize);
+    for &svg in svgs.iter().take(MAX_INLINE_SVGS) {
+        let color = styles.get(svg).map(|s| s.color).unwrap_or_default();
+        let Some(tree) = serialize_tree(doc, svg, color) else {
+            console.push(format!(
+                "Inline SVG #{} is too large to render",
+                svg.index()
+            ));
+            continue;
+        };
+        if let Some(outcome) = by_tree.get(&tree.xml) {
+            match outcome {
+                Some(j) => owners.push((svg, *j)),
+                None => over_budget += 1,
             }
-            xml.map(|xml| (svg, xml))
-        })
-        .collect();
-    let parsed = scoped_map(&jobs, MAX_WORKERS, |(_, xml)| Image::from_svg_str(xml));
-    for ((node, _), image) in jobs.iter().zip(parsed) {
-        match image.flatten() {
+            continue;
+        }
+        let key = tree.xml.clone();
+        if total >= MAX_TOTAL_SVG_BYTES {
+            over_budget += 1;
+            by_tree.insert(key, None);
+            continue;
+        }
+        let Some(xml) = complete(doc, svg, tree, &mut ids) else {
+            console.push(format!(
+                "Inline SVG #{} is too large to render",
+                svg.index()
+            ));
+            by_tree.insert(key, None);
+            continue;
+        };
+        if total + xml.len() > MAX_TOTAL_SVG_BYTES {
+            over_budget += 1;
+            total = MAX_TOTAL_SVG_BYTES;
+            by_tree.insert(key, None);
+            continue;
+        }
+        total += xml.len();
+        by_tree.insert(key, Some(jobs.len()));
+        owners.push((svg, jobs.len()));
+        jobs.push(xml);
+    }
+    if over_budget > 0 {
+        console.push(format!(
+            "Inline SVG budget exceeded: {over_budget} element(s) not rendered"
+        ));
+    }
+    let parsed = scoped_map(&jobs, MAX_WORKERS, |xml| Image::from_svg_str(xml));
+    for (node, j) in owners {
+        match parsed.get(j).cloned().flatten().flatten() {
             Some(image) => {
                 let size = image.natural_size();
-                images.insert_node(*node, image, size);
+                images.insert_node(node, image, size);
             }
             None => console.push(format!("Could not render inline SVG #{}", node.index())),
         }
@@ -624,17 +719,14 @@ mod tests {
         let styles = StyleMap::default();
         let base = Url::parse("https://e.org/").unwrap();
         let mut console = Vec::new();
-        let c = Collector {
-            doc: &doc,
-            styles: &styles,
-            base: &base,
-            media: MediaContext::default(),
-            requests: Vec::new(),
-            by_url: HashMap::new(),
-            svgs: Vec::new(),
-            console: &mut console,
-            skipped: 0,
-        };
+        let c = Collector::new(
+            &doc,
+            &styles,
+            &base,
+            MediaContext::default(),
+            Policy::for_document(&base),
+            &mut console,
+        );
         let img = doc
             .descendants(doc.root())
             .find(|&n| doc.is_element_named(n, "img"))?;

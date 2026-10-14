@@ -5,8 +5,8 @@
 //!
 //! The builder follows CSS 2.1 Appendix E. Stacking contexts are created by
 //! the root, positioned boxes with `z-index` other than `auto`, flex items
-//! with a `z-index`, `position: fixed` boxes (as browsers do) and boxes with
-//! `opacity < 1`. Within a stacking context:
+//! with a `z-index`, `position: fixed` and `sticky` boxes (as browsers do)
+//! and boxes with `opacity < 1`. Within a stacking context:
 //!
 //! 1. the root's own background and border;
 //! 2. child stacking contexts with negative `z-index` (by z, then tree order);
@@ -21,12 +21,21 @@
 //!    `z-index: 0`-like stacking contexts, in tree order;
 //! 7. child stacking contexts with positive `z-index`.
 //!
+//! The boxes of steps 2, 6 and 7 are ordered by document position (node
+//! index, with `::before` after its element and `::after` after the
+//! element's subtree): layout moves absolutely positioned boxes under
+//! their containing block, so the box tree order alone would paint an
+//! overlay positioned before some content above it.
+//!
 //! "Atomically" means as if the box created a stacking context, except that
 //! its positioned descendants and real stacking contexts are painted by the
 //! enclosing stacking context (so `z-index` works across them).
 //!
 //! Simplifications: inline elements (`<span>`) are never stacking contexts or
-//! positioned layers (their fragments paint with the line); `overflow` clips
+//! positioned layers (their fragments paint with the line), but an inline
+//! element with `opacity < 1` groups the fragments it contains on each
+//! line in an opacity group, and its fragments only round the corners of
+//! its first and last fragment (`box-decoration-break: slice`); `overflow` clips
 //! apply to deferred positioned descendants according to their containing
 //! block within the stacking context, while clips of boxes outside the
 //! stacking context apply to all of its content; fixed content ignores all
@@ -223,7 +232,10 @@ pub enum DisplayItem {
 }
 
 /// Drawing commands of a page plus its canvas color.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// The default list is empty with a white canvas, like the list of an
+/// empty document.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DisplayList {
     /// Commands in paint order (later items paint over earlier ones).
     pub items: Vec<DisplayItem>,
@@ -269,6 +281,15 @@ pub fn build_display_list_full(
     images: &dyn ImageProvider,
 ) -> DisplayList {
     builder::build(tree, Some(fonts), images)
+}
+
+impl Default for DisplayList {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            background: Color::WHITE,
+        }
+    }
 }
 
 impl DisplayList {

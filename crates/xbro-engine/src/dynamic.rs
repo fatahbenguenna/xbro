@@ -10,11 +10,13 @@
 //! part of a compound containing `:hover`. Mouse moves over plain text thus
 //! skip the restyle on most pages.
 
+use std::collections::HashSet;
+
 use xbro_css::{AttrSelector, Compound, CssRule, PseudoClass, Selector, Stylesheet};
 use xbro_dom::{Document, NodeId};
 
 /// Static requirements of a compound selector that contains `:hover`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct HoverCompound {
     tag: Option<String>,
     ids: Vec<String>,
@@ -65,21 +67,19 @@ pub(crate) struct DynamicRules {
 /// Upper bound on the hover compounds kept (beyond it every hover change restyles).
 const MAX_HOVER_COMPOUNDS: usize = 4096;
 
-impl DynamicRules {
-    /// Scans every style rule of `sheets`, including rules inside `@media`
-    /// (whatever the current viewport) and supported `@supports` blocks.
-    pub(crate) fn scan(sheets: &[Stylesheet]) -> Self {
-        let mut rules = DynamicRules::default();
-        for sheet in sheets {
-            rules.scan_rules(&sheet.rules, 0);
-        }
-        if rules.hover.len() > MAX_HOVER_COMPOUNDS {
-            rules.hover = vec![HoverCompound::default()];
-        }
-        rules
-    }
+/// State of a stylesheet scan: the rules found so far plus what is needed
+/// to keep the scan linear (deduplication set, overflow flag).
+#[derive(Default)]
+struct Scan {
+    rules: DynamicRules,
+    seen: HashSet<HoverCompound>,
+    /// More than [`MAX_HOVER_COMPOUNDS`] distinct compounds: any hover
+    /// change may matter.
+    overflow: bool,
+}
 
-    fn scan_rules(&mut self, rules: &[CssRule], depth: usize) {
+impl Scan {
+    fn rules_in(&mut self, rules: &[CssRule], depth: usize) {
         if depth > 64 {
             return;
         }
@@ -87,15 +87,15 @@ impl DynamicRules {
             match rule {
                 CssRule::Style(style) => {
                     for selector in &style.selectors {
-                        self.scan_selector(selector, 0);
+                        self.selector(selector, 0);
                     }
                 }
                 CssRule::Media { rules, .. } | CssRule::Group { rules } => {
-                    self.scan_rules(rules, depth + 1)
+                    self.rules_in(rules, depth + 1)
                 }
                 CssRule::Supports { supported, rules } => {
                     if *supported {
-                        self.scan_rules(rules, depth + 1);
+                        self.rules_in(rules, depth + 1);
                     }
                 }
                 CssRule::Import { .. } => {}
@@ -103,45 +103,76 @@ impl DynamicRules {
         }
     }
 
-    fn scan_selector(&mut self, selector: &Selector, depth: usize) {
+    fn selector(&mut self, selector: &Selector, depth: usize) {
         if depth > 32 {
             return;
         }
-        self.scan_compound(&selector.subject, depth);
+        self.compound(&selector.subject, depth);
         for (_, compound) in &selector.ancestors {
-            self.scan_compound(compound, depth);
+            self.compound(compound, depth);
         }
     }
 
-    fn scan_compound(&mut self, compound: &Compound, depth: usize) {
+    fn compound(&mut self, compound: &Compound, depth: usize) {
         if compound.attrs.iter().any(|a| a.name == "value") {
-            self.value = true;
+            self.rules.value = true;
         }
         for pc in &compound.pseudo_classes {
             match pc {
-                PseudoClass::Hover => {
-                    let c = HoverCompound::from_compound(compound);
-                    if !self.hover.contains(&c) {
-                        self.hover.push(c);
-                    }
-                }
+                PseudoClass::Hover => self.hover(compound),
                 PseudoClass::Focus | PseudoClass::FocusWithin | PseudoClass::FocusVisible => {
-                    self.focus = true
+                    self.rules.focus = true
                 }
-                PseudoClass::PlaceholderShown => self.value = true,
+                PseudoClass::PlaceholderShown => self.rules.value = true,
                 PseudoClass::Not(list) | PseudoClass::Is(list) | PseudoClass::Where(list) => {
                     for s in list {
-                        self.scan_selector(s, depth + 1);
+                        self.selector(s, depth + 1);
                     }
                 }
                 PseudoClass::Has(list) => {
                     for (_, s) in list {
-                        self.scan_selector(s, depth + 1);
+                        self.selector(s, depth + 1);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Records a compound containing `:hover` (deduplicated in O(1)).
+    fn hover(&mut self, compound: &Compound) {
+        if self.overflow {
+            return;
+        }
+        let c = HoverCompound::from_compound(compound);
+        if self.seen.contains(&c) {
+            return;
+        }
+        if self.rules.hover.len() >= MAX_HOVER_COMPOUNDS {
+            self.overflow = true;
+            self.seen.clear();
+            return;
+        }
+        self.seen.insert(c.clone());
+        self.rules.hover.push(c);
+    }
+}
+
+impl DynamicRules {
+    /// Scans every style rule of `sheets`, including rules inside `@media`
+    /// (whatever the current viewport) and supported `@supports` blocks.
+    /// Linear in the size of the sheets.
+    pub(crate) fn scan(sheets: &[Stylesheet]) -> Self {
+        let mut scan = Scan::default();
+        for sheet in sheets {
+            scan.rules_in(&sheet.rules, 0);
+        }
+        let mut rules = scan.rules;
+        if scan.overflow {
+            // The empty compound matches every element.
+            rules.hover = vec![HoverCompound::default()];
+        }
+        rules
     }
 
     /// True when some stylesheet uses `:hover`.
@@ -203,6 +234,31 @@ mod tests {
         assert!(rules.value);
         let none = DynamicRules::scan(&[parse_stylesheet("a { color: red } p:first-child {}")]);
         assert!(!none.has_hover() && !none.focus && !none.value);
+    }
+
+    #[test]
+    fn scanning_many_hover_compounds_is_linear() {
+        let mut css = String::new();
+        for i in 0..100_000 {
+            css.push_str(&format!(".c{i}:hover, .c{i}:hover {{}}"));
+        }
+        let sheets = vec![parse_stylesheet(&css)];
+        let start = std::time::Instant::now();
+        let rules = DynamicRules::scan(&sheets);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        // Over the limit: one compound that matches everything.
+        assert_eq!(rules.hover, vec![HoverCompound::default()]);
+        let doc = xbro_html::parse_document("<p id=p>x</p><i id=i>y</i>");
+        let p = doc.get_element_by_id("p").unwrap();
+        let i = doc.get_element_by_id("i").unwrap();
+        assert!(rules.hover_change_matters(&doc, Some(p), Some(i)));
+        // Under the limit, duplicates are kept once.
+        let few = DynamicRules::scan(&[parse_stylesheet("a:hover{} a:hover{} b:hover{}")]);
+        assert_eq!(few.hover.len(), 2);
     }
 
     #[test]

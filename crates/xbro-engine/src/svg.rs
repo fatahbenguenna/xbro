@@ -143,11 +143,30 @@ fn references(name: &str, value: &str, out: &mut Vec<String>) {
 struct Writer<'a> {
     doc: &'a Document,
     out: String,
+    /// Bytes of the document already produced elsewhere (the main tree
+    /// while external references are copied), counted against the limit.
+    elsewhere: usize,
     /// `id`s defined inside the serialized subtrees.
     defined: HashSet<String>,
     /// `#id` references found so far.
     referenced: Vec<String>,
     overflow: bool,
+    /// Drop the root attributes that cannot change the rendering (see
+    /// [`inert_root_attribute`]); only when the tree has no `<style>`.
+    strip_root: bool,
+}
+
+/// Root attributes that do not change how a standalone SVG document
+/// without a `<style>` element renders: identity (`id`, `class`) and
+/// accessibility/scripting metadata. Dropping them lets repeated icons
+/// that only differ by them share one parsed document.
+fn inert_root_attribute(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "id" | "class" | "role" | "focusable" | "tabindex" | "title"
+    ) || lower.starts_with("aria-")
+        || lower.starts_with("data-")
 }
 
 impl Writer<'_> {
@@ -155,7 +174,7 @@ impl Writer<'_> {
         if depth > MAX_DEPTH || self.overflow {
             return;
         }
-        if self.out.len() > MAX_SVG_BYTES {
+        if self.elsewhere.saturating_add(self.out.len()) > MAX_SVG_BYTES {
             self.overflow = true;
             return;
         }
@@ -179,6 +198,9 @@ impl Writer<'_> {
             }
             if is_root && a.name.eq_ignore_ascii_case("color") {
                 continue; // Replaced by the computed color.
+            }
+            if is_root && self.strip_root && inert_root_attribute(&a.name) {
+                continue;
             }
             // Event handlers are meaningless here.
             if a.name.len() > 2
@@ -217,15 +239,35 @@ impl Writer<'_> {
     }
 }
 
+/// The serialization of an inline `<svg>` subtree, before the elements it
+/// references elsewhere in the document are copied in (see [`complete`]).
+pub(crate) struct SvgTree {
+    /// The `<svg>` element as XML.
+    pub xml: String,
+    /// `id`s defined inside the subtree.
+    defined: HashSet<String>,
+    /// `#id` references found in the subtree.
+    referenced: Vec<String>,
+}
+
 /// Serializes the inline `<svg>` element `svg` to an SVG document, with
 /// `color` as the value of `currentColor`. `None` when the element is not an
-/// `svg` or the document would be too large.
+/// `svg` or the document would be too large. (The loader uses the two steps,
+/// [`serialize_tree`] and [`complete`], to share identical documents.)
+#[cfg(test)]
 pub(crate) fn serialize_svg(
     doc: &Document,
     svg: NodeId,
     color: Color,
     ids: &mut IdIndex,
 ) -> Option<String> {
+    complete(doc, svg, serialize_tree(doc, svg, color)?, ids)
+}
+
+/// First step of [`serialize_svg`]: the `<svg>` subtree alone. Two `<svg>`
+/// elements with the same tree give the same document (the references are
+/// resolved in the same document), which lets callers reuse the result.
+pub(crate) fn serialize_tree(doc: &Document, svg: NodeId, color: Color) -> Option<SvgTree> {
     if !doc.is_element_named(svg, "svg") {
         return None;
     }
@@ -233,17 +275,44 @@ pub(crate) fn serialize_svg(
     root_extra.push_str(" color=\"");
     root_extra.push_str(&color_value(color));
     root_extra.push('"');
+    let styled = doc
+        .descendants(svg)
+        .any(|n| doc.is_element_named(n, "style"));
     let mut w = Writer {
         doc,
         out: String::with_capacity(1024),
+        elsewhere: 0,
         defined: HashSet::new(),
         referenced: Vec::new(),
         overflow: false,
+        strip_root: !styled,
     };
     w.element(svg, Some(&root_extra), 0);
-    if w.overflow {
-        return None;
-    }
+    (!w.overflow).then_some(SvgTree {
+        xml: w.out,
+        defined: w.defined,
+        referenced: w.referenced,
+    })
+}
+
+/// Second step of [`serialize_svg`]: copies the elements referenced by
+/// `tree` that live outside the `<svg>` (icon sprite sheets) into a
+/// `<defs>` block. `None` when the document would be too large.
+pub(crate) fn complete(
+    doc: &Document,
+    svg: NodeId,
+    tree: SvgTree,
+    ids: &mut IdIndex,
+) -> Option<String> {
+    let mut w = Writer {
+        doc,
+        out: tree.xml,
+        elsewhere: 0,
+        defined: tree.defined,
+        referenced: tree.referenced,
+        overflow: false,
+        strip_root: false,
+    };
     // Copy referenced elements defined elsewhere in the document.
     let mut external = String::new();
     let mut copied = 0usize;
@@ -263,11 +332,14 @@ pub(crate) fn serialize_svg(
             continue;
         }
         let before = std::mem::take(&mut w.out);
+        // The whole document (main tree + every copy) stays under the limit.
+        w.elsewhere = before.len() + external.len();
         w.element(target, None, 0);
         external.push_str(&std::mem::replace(&mut w.out, before));
+        w.elsewhere = 0;
         copied += 1;
     }
-    if w.overflow {
+    if w.overflow || w.out.len() + external.len() > MAX_SVG_BYTES {
         return None;
     }
     if !external.is_empty() {
@@ -350,6 +422,57 @@ mod tests {
         assert!(xml.contains("<symbol id=\"icon\""), "{xml}");
         assert!(xml.contains("<linearGradient id=\"grad\""), "{xml}");
         assert!(xbro_paint::Image::from_svg_str(&xml).is_some(), "{xml}");
+    }
+
+    #[test]
+    fn external_copies_count_against_the_size_limit() {
+        // A ~1.2 MB symbol referenced many times through distinct ids: each
+        // copy alone is under the limit, all of them together are not.
+        let rects = "<rect width='1' height='1'/>".repeat(40_000);
+        let mut html = String::from("<svg style='display:none'>");
+        for i in 0..8 {
+            html.push_str(&format!("<symbol id=s{i}>{rects}</symbol>"));
+        }
+        html.push_str("</svg><svg id=uses>");
+        for i in 0..8 {
+            html.push_str(&format!("<use href='#s{i}'/>"));
+        }
+        html.push_str("</svg>");
+        let doc = xbro_html::parse_document(&html);
+        let svg = doc.get_element_by_id("uses").unwrap();
+        assert_eq!(
+            serialize_svg(&doc, svg, Color::BLACK, &mut IdIndex::default()),
+            None
+        );
+        // One copy is fine.
+        let doc = xbro_html::parse_document(&format!(
+            "<svg style='display:none'><symbol id=s0>{rects}</symbol></svg>\
+             <svg id=uses><use href='#s0'/></svg>"
+        ));
+        let svg = doc.get_element_by_id("uses").unwrap();
+        let xml = serialize_svg(&doc, svg, Color::BLACK, &mut IdIndex::default()).unwrap();
+        assert!(xml.len() < MAX_SVG_BYTES);
+    }
+
+    #[test]
+    fn inert_root_attributes_are_dropped_without_style() {
+        let doc = xbro_html::parse_document(
+            "<svg id=a class='icon x' aria-hidden=true data-n=1 role=img width=4 height=4>\
+             <rect width=4 height=4 /></svg>\
+             <svg id=b class=other width=4 height=4><rect width=4 height=4 /></svg>\
+             <svg id=c class=s width=4 height=4><style>.s rect{fill:red}</style>\
+             <rect width=4 height=4 /></svg>",
+        );
+        let tree = |id: &str| {
+            let svg = doc.get_element_by_id(id).unwrap();
+            serialize_tree(&doc, svg, Color::BLACK).unwrap().xml
+        };
+        // Same rendering, same document.
+        assert_eq!(tree("a"), tree("b"));
+        assert!(!tree("a").contains("aria") && !tree("a").contains("icon"));
+        assert!(tree("a").contains("width=\"4\""));
+        // A `<style>` may select on them: kept.
+        assert!(tree("c").contains("class=\"s\"") && tree("c").contains("id=\"c\""));
     }
 
     #[test]

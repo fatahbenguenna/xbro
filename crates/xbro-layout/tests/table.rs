@@ -578,3 +578,32 @@ fn row_and_group_backgrounds_cover_their_cells() {
     assert_eq!((r.width, r.height), (50.0, 10.0));
     assert_eq!(g, r);
 }
+
+#[test]
+fn positioned_cells_contain_their_absolutely_positioned_boxes() {
+    // The cell is stretched to the row (100px) and its content centered:
+    // `bottom: 0` boxes sit at the bottom of the stretched cell, `top: 0`
+    // ones at its top, static-position ones move with the content.
+    let Some(l) = table(
+        "<table id=t style='border-spacing:0'><tr>
+           <td id=c style='position:relative;top:5px;vertical-align:middle;width:100px'>x<span
+             id=b style='position:absolute;bottom:0;right:0;width:10px;height:10px'></span><span
+             id=tl style='position:absolute;top:0;left:0;width:10px;height:10px'></span><div
+             id=s style='position:absolute;width:10px;height:10px'></div></td>
+           <td style='height:100px'>y</td>
+         </tr></table>",
+        400.0,
+    ) else {
+        return;
+    };
+    let c = l.rect("c");
+    assert_eq!((c.x, c.y, c.width, c.height), (0.0, 5.0, 100.0, 100.0));
+    let b = l.rect("b");
+    assert_eq!((b.x, b.y), (90.0, 95.0));
+    let tl = l.rect("tl");
+    assert_eq!((tl.x, tl.y), (0.0, 5.0));
+    // Static position: on the (centered) line of text, after the `x`.
+    let s = l.rect("s");
+    assert!(s.y > c.y + 30.0 && s.y < c.y + 60.0, "{s:?}");
+    assert!(s.x > 0.0 && s.x < 20.0, "{s:?}");
+}

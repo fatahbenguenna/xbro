@@ -147,3 +147,52 @@ fn modern_fixture_stats_grid() {
         }
     }
 }
+
+#[test]
+fn unknown_columns_cards_versus_stacks() {
+    // Cards sharing a class with very different text lengths: a card
+    // grid (auto-fill), whatever the spread of their widths.
+    let Some(l) = grid(
+        "<style>.card{padding:8px}</style>
+         <div id=g style='display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;width:976px'>
+           <div class=card>Some text in the first card.</div>
+           <div class='card wide'>Some more text, a bit longer than the first one, long enough to be much wider than the others.</div>
+           <div class=card>Short.</div><div class=card>Another card.</div><div class=card>Fifth.</div>
+         </div>",
+        1024.0,
+    ) else {
+        return;
+    };
+    let k = kids(&l, "g");
+    let first_row = k.iter().filter(|r| (r.y - k[0].y).abs() < 0.5).count();
+    assert!(first_row >= 3, "{k:?}");
+    for r in &k {
+        close(r.width, k[0].width, 0.05);
+    }
+    // Different elements (a stack of content), or text runs: one column.
+    for body in [
+        "<div id=g style='display:grid;gap:8px;width:600px'><h3 style='margin:0'>Hi</h3><p style='margin:0'>a</p><div>b</div></div>",
+        "<div id=g style='display:grid;gap:8px;width:600px'><span class=x>a</span>text<span class=x>b</span></div>",
+        "<div id=g style='display:grid;gap:8px;width:600px'><div class=a>a</div><div class=b>b</div></div>",
+    ] {
+        let Some(l) = grid(body, 800.0) else {
+            return;
+        };
+        let k = kids(&l, "g");
+        assert!(k.len() >= 2);
+        for w in k.windows(2) {
+            assert_eq!(w[0].x, w[1].x, "{body}");
+            assert!(w[1].y >= w[0].bottom(), "{body}");
+        }
+        assert_eq!(k[0].width, 600.0);
+    }
+    // Same element type without classes (a gallery, a list): a collection.
+    let Some(l) = grid(
+        "<ul id=g style='display:grid;gap:10px;width:300px;list-style:none;margin:0;padding:0'><li>a</li><li>b</li><li>c</li></ul>",
+        800.0,
+    ) else {
+        return;
+    };
+    let k = kids(&l, "g");
+    assert_eq!(k[0].y, k[2].y);
+}

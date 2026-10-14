@@ -32,7 +32,10 @@ use crate::float::FloatContext;
 use crate::geom::{Edges, Point, Rect};
 use crate::intrinsic::Intrinsic;
 use crate::sizing::{box_edges, lp, sane, sane_size, EPSILON};
-use crate::text::{continues_word, is_break_after_dash, is_cjk, is_cjk_closing, push_transformed};
+use crate::text::{
+    continues_word, is_break_after_dash, is_cjk, is_cjk_closing, no_break_after, no_break_before,
+    push_transformed,
+};
 use crate::{Fragment, InlineBoxFragment, LayoutBox, LineBox, TextFragment};
 
 /// Parent index meaning "the root inline box" (the IFC container).
@@ -172,6 +175,39 @@ struct Collector<'c, 't> {
 }
 
 impl<'t> Collector<'_, 't> {
+    /// The last item, looking through inline box starts and ends (which
+    /// do not separate content for line breaking).
+    fn last_through_boxes(&mut self) -> Option<&mut Item> {
+        self.out
+            .items
+            .iter_mut()
+            .rev()
+            .take(256)
+            .find(|it| !matches!(it.kind, ItemKind::Open(_) | ItemKind::Close(_)))
+    }
+
+    /// Last character of the word right before the next item (looking
+    /// through inline box starts and ends), if the previous item is a word.
+    fn last_word_char(&self) -> Option<char> {
+        let it = self
+            .out
+            .items
+            .iter()
+            .rev()
+            .take(256)
+            .find(|it| !matches!(it.kind, ItemKind::Open(_) | ItemKind::Close(_)))?;
+        let ItemKind::Word { run, start, end } = it.kind else {
+            return None;
+        };
+        let text = self
+            .out
+            .runs
+            .get(run as usize)?
+            .text
+            .get(start as usize..end as usize)?;
+        text.chars().next_back()
+    }
+
     /// Appends an item; the returned handle sets its break flags.
     fn push(&mut self, kind: ItemKind, width: f32, parent: u32) -> ItemFlags<'_> {
         self.out.items.push(Item {
@@ -256,9 +292,12 @@ impl<'t> Collector<'_, 't> {
                 _ => {
                     let idx = self.out.atomics.len() as u32;
                     self.out.atomics.push(k);
+                    // `(<img>`: no break between opening punctuation and
+                    // the atomic inline right after it.
+                    let after_opening = self.last_word_char().is_some_and(no_break_after);
                     let wraps = ws.wraps();
                     self.push(ItemKind::Atomic(idx), 0.0, parent)
-                        .before(wraps)
+                        .before(wraps && !after_opening)
                         .after(wraps);
                     self.prev_space = false;
                     self.prev_word = false;
@@ -471,6 +510,15 @@ impl Segmenter {
         match self.word_start.take() {
             Some(start) if start < self.text.len() => {
                 let word = self.text.get(start..).unwrap_or("");
+                if word.chars().next().is_some_and(no_break_before) {
+                    // `<img>,`: no break between an atomic inline and the
+                    // closing punctuation right after it.
+                    if let Some(it) = c.last_through_boxes() {
+                        if matches!(it.kind, ItemKind::Atomic(_)) {
+                            it.break_after = false;
+                        }
+                    }
+                }
                 let w =
                     c.cx.measure(self.font.id, self.font.size, word, self.ls, self.wsp);
                 c.push(
@@ -1025,7 +1073,13 @@ impl<'t> Ifc<'_, 't> {
                     });
                     width += w;
                     has_content = true;
-                    if item.break_after {
+                    // A soft hyphen opportunity is only usable when the
+                    // hyphen drawn there still fits (else an earlier
+                    // opportunity is kept, if any).
+                    let usable = !item.shy
+                        || last_break.is_none()
+                        || width + self.run_hyphen_width(run) <= avail + EPSILON;
+                    if item.break_after && usable {
                         last_break = Some((
                             pieces.len(),
                             Cursor {
@@ -1421,30 +1475,44 @@ impl<'t> Ifc<'_, 't> {
                 }
             }
         }
-        let (mut top, mut bottom) = ext.first().copied().unwrap_or((0.0, 0.0));
-        let mut max_group_h = bottom - top;
+        // Extent of the line relative to the root's baseline: the root
+        // group's, enlarged by the `top`/`bottom` groups taller than the
+        // line (CSS 2.1 §10.8.1). Like browsers, a taller `top` group
+        // extends the line downwards and a taller `bottom` group upwards,
+        // so the rest of the line then sits at the line's bottom.
+        let (t0, b0) = ext
+            .first()
+            .copied()
+            .filter(|(t, b)| t.is_finite() && b.is_finite())
+            .unwrap_or((0.0, 0.0));
+        let mut above = -t0;
+        let mut below = b0;
         for (i, n) in nodes.iter().enumerate().skip(1) {
-            if n.group == i {
-                if let Some(&(t, b)) = ext.get(i) {
-                    max_group_h = max_group_h.max(b - t);
+            if n.group != i {
+                continue;
+            }
+            if let Some(&(t, b)) = ext.get(i) {
+                let h = b - t;
+                if h.is_finite() && above + below < h {
+                    match n.align {
+                        VerticalAlign::Top => below = h - above,
+                        _ => above = h - below,
+                    }
                 }
             }
         }
-        bottom = top + max_group_h;
+        let top = sane(-above);
+        let bottom = sane(below).max(top);
         let mut shifts: Vec<f32> = vec![0.0; nodes.len()];
         for (i, n) in nodes.iter().enumerate().skip(1) {
             if n.group == i {
                 if let (Some(&(t, b)), Some(shift)) = (ext.get(i), shifts.get_mut(i)) {
-                    *shift = match n.align {
+                    *shift = sane(match n.align {
                         VerticalAlign::Top => top - t,
                         _ => bottom - b,
-                    };
+                    });
                 }
             }
-        }
-        if !top.is_finite() || !bottom.is_finite() {
-            top = 0.0;
-            bottom = 0.0;
         }
         let line_height = sane_size(bottom - top);
         let baseline = y - top;
@@ -1690,6 +1758,15 @@ impl<'t> Ifc<'_, 't> {
             *v = idx as u32;
             touched.push(b);
         }
+    }
+
+    /// Width of a hyphen in the font of run `run`.
+    fn run_hyphen_width(&mut self, run: u32) -> f32 {
+        let Some(r) = self.run_of(run) else {
+            return 0.0;
+        };
+        let (font, size, ls) = (r.font.id, r.font.size, r.letter_spacing);
+        self.cx.measure(font, size, "-", ls, 0.0)
     }
 
     /// Width of the hyphen drawn at a soft-hyphen break.

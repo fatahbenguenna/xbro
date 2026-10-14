@@ -289,7 +289,8 @@ fn nested_imports_are_bounded() {
     let css = format!("@import url('{css_url}'); p {{ color: rgb(1, 2, 3) }}");
     std::fs::write(css_url.to_file_path().unwrap(), css).unwrap();
     let html = format!("<link rel=stylesheet href='{css_url}'><p id=p>x</p>");
-    let page = load_html(&html);
+    // A local document (web pages may not load `file:` stylesheets).
+    let page = engine().load_html(&html, fixture_url("imports.html"), VIEWPORT);
     assert_eq!(
         page.styles().get(by_id(&page, "p")).unwrap().color,
         Color::rgb(1, 2, 3)

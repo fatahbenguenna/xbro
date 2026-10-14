@@ -1,5 +1,7 @@
 //! Images: scaled replaced content, tiled backgrounds and SVG rendering
-//! (with a bounded cache of rendered SVG pixmaps).
+//! (with a bounded cache of rendered SVG pixmaps), plus a bounded cache of
+//! box-filtered reductions for raster images drawn much smaller than their
+//! natural size.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -113,15 +115,125 @@ fn svg_render_size(w: f32, h: f32) -> Option<(u32, u32)> {
     Some((rw, rh))
 }
 
-/// A pixmap of `image` suitable for drawing at `w` × `h` device px.
+/// A pixmap of `image` suitable for drawing at `w` × `h` device px:
+/// raster images drawn at less than half their size use a box-filtered
+/// reduction (bilinear sampling alone skips most source pixels and
+/// shimmers with moiré), SVG images are rendered at that size.
 fn pixmap_for(image: &Image, w: f32, h: f32) -> Option<Arc<Pixmap>> {
     match image {
-        Image::Raster(p) => Some(p.clone()),
+        Image::Raster(p) => match mip_level(p.width(), p.height(), w, h) {
+            0 => Some(p.clone()),
+            level => Some(reduced(p, level).unwrap_or_else(|| p.clone())),
+        },
         Image::Svg(tree) => {
             let (rw, rh) = svg_render_size(w, h)?;
             render_svg(tree, rw, rh)
         }
     }
+}
+
+/// Maximum number of cached reductions of raster images.
+const MIP_CACHE_ENTRIES: usize = 32;
+/// Maximum memory held by cached reductions.
+const MIP_CACHE_BYTES: usize = 64 << 20;
+/// Deepest reduction (a 65536× smaller image).
+const MAX_MIP_LEVEL: u32 = 16;
+
+/// One cached reduction of a raster image (halved `level` times).
+struct MipEntry {
+    source: Weak<Pixmap>,
+    level: u32,
+    pixmap: Arc<Pixmap>,
+}
+
+/// Reductions of raster images, oldest first.
+static MIP_CACHE: Mutex<Vec<MipEntry>> = Mutex::new(Vec::new());
+
+/// How many times a `sw` × `sh` pixmap drawn at `w` × `h` device px
+/// should be halved first so that the remaining scale on the less reduced
+/// axis stays above one half (0 when it is not reduced that much).
+fn mip_level(sw: u32, sh: u32, w: f32, h: f32) -> u32 {
+    if sw == 0 || sh == 0 || !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+        return 0;
+    }
+    let scale = (w / sw as f32).max(h / sh as f32);
+    if !(scale > 0.0 && scale <= 0.5) {
+        return 0;
+    }
+    let mut level = 0;
+    let mut s = scale;
+    // Halving stops at 1 px on the smaller side.
+    while s <= 0.5 && level < MAX_MIP_LEVEL && (sw.min(sh) >> (level + 1)) >= 1 {
+        s *= 2.0;
+        level += 1;
+    }
+    level
+}
+
+/// `source` reduced `level` times, from the cache or built (from the
+/// deepest cached shallower reduction).
+fn reduced(source: &Arc<Pixmap>, level: u32) -> Option<Arc<Pixmap>> {
+    let mut cache = MIP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|e| e.source.strong_count() > 0);
+    let same = |e: &MipEntry| e.source.upgrade().is_some_and(|s| Arc::ptr_eq(&s, source));
+    if let Some(pos) = cache.iter().position(|e| e.level == level && same(e)) {
+        let entry = cache.remove(pos);
+        let pixmap = entry.pixmap.clone();
+        cache.push(entry);
+        return Some(pixmap);
+    }
+    let (mut current, mut done) = cache
+        .iter()
+        .filter(|e| e.level < level && same(e))
+        .max_by_key(|e| e.level)
+        .map_or((source.clone(), 0), |e| (e.pixmap.clone(), e.level));
+    drop(cache);
+    while done < level {
+        current = Arc::new(halve(&current)?);
+        done += 1;
+    }
+    let mut cache = MIP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.push(MipEntry {
+        source: Arc::downgrade(source),
+        level,
+        pixmap: current.clone(),
+    });
+    let bytes = |c: &Vec<MipEntry>| c.iter().map(|e| e.pixmap.data().len()).sum::<usize>();
+    while cache.len() > MIP_CACHE_ENTRIES || (cache.len() > 1 && bytes(&cache) > MIP_CACHE_BYTES) {
+        cache.remove(0);
+    }
+    Some(current)
+}
+
+/// Halves a premultiplied pixmap with a 2×2 box filter (an odd last
+/// row/column is averaged with itself).
+fn halve(src: &Pixmap) -> Option<Pixmap> {
+    let (sw, sh) = (src.width() as usize, src.height() as usize);
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let (dw, dh) = (sw.div_ceil(2), sh.div_ceil(2));
+    let mut dst = Pixmap::new(dw as u32, dh as u32)?;
+    let data = src.data();
+    let stride = sw * 4;
+    for (y, out_row) in dst.data_mut().chunks_exact_mut(dw * 4).enumerate() {
+        let (y0, y1) = (2 * y, (2 * y + 1).min(sh - 1));
+        let (Some(row0), Some(row1)) = (
+            data.get(y0 * stride..(y0 + 1) * stride),
+            data.get(y1 * stride..(y1 + 1) * stride),
+        ) else {
+            continue;
+        };
+        for (x, out) in out_row.chunks_exact_mut(4).enumerate() {
+            let (x0, x1) = (2 * x * 4, (2 * x + 1).min(sw - 1) * 4);
+            for (c, v) in out.iter_mut().enumerate() {
+                let at = |row: &[u8], i: usize| row.get(i + c).copied().map_or(0, u32::from);
+                let sum = at(row0, x0) + at(row0, x1) + at(row1, x0) + at(row1, x1);
+                *v = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+    Some(dst)
 }
 
 /// Filter quality: nearest when the pixmap maps 1:1 onto whole pixels
@@ -324,6 +436,63 @@ mod tests {
         // Wider viewport: fit the height, centre horizontally.
         let t = svg_fit(10.0, 10.0, 30.0, 10.0);
         assert_eq!((t.sx, t.sy, t.tx, t.ty), (1.0, 1.0, 10.0, 0.0));
+    }
+
+    #[test]
+    fn reduction_levels() {
+        // Drawn at half size or more: no reduction.
+        assert_eq!(mip_level(100, 100, 100.0, 100.0), 0);
+        assert_eq!(mip_level(100, 100, 51.0, 51.0), 0);
+        assert_eq!(mip_level(100, 100, 400.0, 10.0), 0, "one axis enlarged");
+        // Remaining scale above one half after halving.
+        assert_eq!(mip_level(100, 100, 50.0, 50.0), 1);
+        assert_eq!(mip_level(1000, 600, 100.0, 60.0), 3);
+        assert_eq!(mip_level(1000, 600, 250.0, 150.0), 2);
+        // Stops at one pixel on the smaller side, and on bad input.
+        assert_eq!(mip_level(4, 1000, 0.001, 0.001), 2);
+        assert_eq!(mip_level(1, 1, 0.01, 0.01), 0);
+        assert_eq!(mip_level(0, 10, 1.0, 1.0), 0);
+        assert_eq!(mip_level(100, 100, f32::NAN, 1.0), 0);
+        assert_eq!(mip_level(100, 100, 0.0, 0.0), 0);
+        assert!(mip_level(u32::MAX, u32::MAX, 1e-30, 1e-30) <= MAX_MIP_LEVEL);
+    }
+
+    #[test]
+    fn halving_averages_premultiplied_pixels() {
+        let mut src = Pixmap::new(3, 3).unwrap();
+        for (i, px) in src.data_mut().chunks_exact_mut(4).enumerate() {
+            let v = (i as u8) * 10;
+            px.copy_from_slice(&[v, 0, 0, 255]);
+        }
+        let half = halve(&src).unwrap();
+        assert_eq!((half.width(), half.height()), (2, 2));
+        let at = |x: usize, y: usize| half.data()[(y * 2 + x) * 4];
+        // (0,0): pixels 0, 1, 3, 4 → (0 + 10 + 30 + 40) / 4.
+        assert_eq!(at(0, 0), 20);
+        // Odd edge: the last column/row is averaged with itself.
+        assert_eq!(at(1, 0), 35, "(20 + 20 + 50 + 50) / 4");
+        assert_eq!(at(1, 1), 80, "pixel 8 alone");
+        assert_eq!(half.data()[3], 255);
+        let one = halve(&Pixmap::new(1, 1).unwrap()).unwrap();
+        assert_eq!((one.width(), one.height()), (1, 1));
+    }
+
+    #[test]
+    fn reductions_are_cached_per_image() {
+        let source = Arc::new(Pixmap::new(64, 64).unwrap());
+        let a = reduced(&source, 2).unwrap();
+        assert_eq!((a.width(), a.height()), (16, 16));
+        assert!(Arc::ptr_eq(&a, &reduced(&source, 2).unwrap()));
+        let deeper = reduced(&source, 3).unwrap();
+        assert_eq!(deeper.width(), 8);
+        // Entries die with their image.
+        let weak = Arc::downgrade(&source);
+        drop(source);
+        assert!(weak.upgrade().is_none());
+        let other = Arc::new(Pixmap::new(8, 8).unwrap());
+        assert_eq!(reduced(&other, 1).unwrap().width(), 4);
+        let cache = MIP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cache.iter().all(|e| e.source.strong_count() > 0));
     }
 
     #[test]

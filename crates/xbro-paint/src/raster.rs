@@ -10,7 +10,9 @@
 //! * borders per side (diagonal joins between differing colors), with
 //!   dashed/dotted/double/groove/ridge/inset/outset styles;
 //! * text from cached glyph coverage masks blended in a dedicated loop;
-//! * images with bilinear filtering, SVG rendered by resvg at the
+//! * images with bilinear filtering (raster images drawn at less than
+//!   half their size are first reduced with a box filter, from a bounded
+//!   cache, instead of shimmering with moiré), SVG rendered by resvg at the
 //!   destination size (bounded cache), uniformly fitted and centred as
 //!   with the default `preserveAspectRatio` (`none`/`slice` on the root
 //!   element are not honoured: usvg flattens the viewBox);

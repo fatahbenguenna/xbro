@@ -17,7 +17,7 @@ use crate::error_pages::percent_decode;
 use crate::forms::{self, FormDefaults, Submitter};
 use crate::images::PageImages;
 use crate::loader::{media_context, sanitize_viewport};
-use crate::{find, focus, image_map, meta, NavigationRequest};
+use crate::{boxes, find, focus, image_map, meta, NavigationRequest};
 
 /// A hover restyle slower than this disables hover restyling for the page.
 const HOVER_RESTYLE_BUDGET: Duration = Duration::from_millis(100);
@@ -101,6 +101,8 @@ pub struct Page {
     /// Load-time values of form controls (for reset buttons).
     pub(crate) form_defaults: FormDefaults,
     pub(crate) timings: LoadTimings,
+    /// Incremented each time a rebuild changes the display list.
+    pub(crate) generation: u64,
 }
 
 /// Maximum number of console messages kept per page.
@@ -113,9 +115,19 @@ pub(crate) fn log(console: &mut Vec<String>, message: String) {
     }
 }
 
+/// Bounds a console filled by loading stages to [`MAX_CONSOLE`] messages,
+/// the last one saying how many were dropped.
+pub(crate) fn cap_console(console: &mut Vec<String>) {
+    if console.len() > MAX_CONSOLE {
+        let dropped = console.len() - (MAX_CONSOLE - 1);
+        console.truncate(MAX_CONSOLE - 1);
+        console.push(format!("… {dropped} more message(s) not shown"));
+    }
+}
+
 /// Runs a pipeline stage, turning a panic in a dependency into a console
 /// message and a fallback value.
-fn guarded<T>(
+pub(crate) fn guarded<T>(
     stage: &str,
     console: &mut Vec<String>,
     f: impl FnOnce() -> T,
@@ -146,8 +158,10 @@ impl Page {
                     && !doc.ancestors(n).any(|a| doc.is_element_named(a, "svg"))
             })
             .map(|t| {
+                // "Strip and collapse ASCII whitespace": a no-break space
+                // or an ideographic space is part of the title.
                 doc.text_content(t)
-                    .split_whitespace()
+                    .split_ascii_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ")
             })
@@ -298,7 +312,12 @@ impl Page {
         if let Some(f) = self.focus.filter(|_| self.focus_painted()) {
             focus::decorate(&mut list, &self.layout, &self.document, f);
         }
-        self.display_list = list;
+        // Count visible changes only (a restyle for `:focus` rules that do
+        // not apply to the new focus changes nothing on screen).
+        if list != self.display_list {
+            self.display_list = list;
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     /// True when the focus indication is painted.
@@ -308,8 +327,9 @@ impl Page {
     }
 
     /// Moves the focus; updates styles or the display list as needed.
-    /// Returns true if the page must be repainted.
+    /// Returns true if the page must be repainted (the display list changed).
     fn set_focus(&mut self, node: Option<NodeId>, visible: bool) -> bool {
+        let generation = self.generation;
         let was_painted = self.focus_painted();
         let changed = self.focus != node;
         self.focus = node;
@@ -317,13 +337,10 @@ impl Page {
         let painted = self.focus_painted();
         if changed && self.dynamic.focus {
             self.restyle();
-            return true;
-        }
-        if (changed && (was_painted || painted)) || was_painted != painted {
+        } else if (changed && (was_painted || painted)) || was_painted != painted {
             self.rebuild_display_list();
-            return true;
         }
-        false
+        self.generation != generation
     }
 
     /// Re-renders after a DOM change made by an interaction.
@@ -377,9 +394,9 @@ impl Page {
         let node = self.node_at(point, scroll)?;
         let doc = &self.document;
         if doc.is_element_named(node, "img") && doc.attr(node, "usemap").is_some() {
-            let area = self
-                .layout
-                .node_rect(node)
+            // Area coordinates are relative to the image itself (its
+            // content box), not to its border or padding.
+            let area = boxes::content_rect(&self.layout, node, scroll)
                 .and_then(|rect| image_map::area_at(doc, node, rect, point));
             if let Some(area) = area {
                 return Some(area);
@@ -483,6 +500,7 @@ impl Page {
         if !self.hover_enabled || !self.dynamic.hover_change_matters(&self.document, old, new) {
             return false;
         }
+        let generation = self.generation;
         let start = Instant::now();
         self.restyle();
         let elapsed = start.elapsed();
@@ -498,17 +516,32 @@ impl Page {
             // Drop the hover styles just applied, so none stays stuck.
             self.restyle();
         }
-        true
+        // Only a visible change needs a repaint (and a new find pass in the
+        // UI): a `:hover` rule may match without changing anything painted.
+        self.generation != generation
     }
 
     /// Handles a primary-button click at a document point.
     pub fn click(&mut self, point: Point, scroll: Point) -> ClickAction {
+        let generation = self.generation;
         let target = self
             .hit(point, scroll)
             .and_then(|n| self.activation_target(n));
-        match target {
-            Some(el) => self.activate(el, Some(point), false),
+        let action = match target {
+            Some(el) => self.activate(el, Some((point, scroll)), false),
             None => self.nothing_activated(),
+        };
+        self.repaint_if_changed(action, generation)
+    }
+
+    /// `ClickAction::None` becomes `Repaint` when the display list changed
+    /// since `generation` (e.g. the caret and focus ring of a text field
+    /// went away when a button that does nothing else got the focus).
+    fn repaint_if_changed(&self, action: ClickAction, generation: u64) -> ClickAction {
+        if action == ClickAction::None && self.generation != generation {
+            ClickAction::Repaint
+        } else {
+            action
         }
     }
 
@@ -571,6 +604,10 @@ impl Page {
 
     /// Moves focus to the next (or previous) focusable element (links, form
     /// controls) and returns its rect so the UI can scroll it into view.
+    ///
+    /// An element in a `position: fixed` subtree is always in view and its
+    /// box is in viewport coordinates: the focus moves but no rect is
+    /// returned (scrolling to it would jump to the top of the document).
     pub fn focus_next(&mut self, backwards: bool) -> Option<Rect> {
         let list = focus::focusable_elements(&self.document, &self.styles);
         let len = list.len();
@@ -598,9 +635,9 @@ impl Page {
                 (first + k) % len
             };
             let Some(&node) = list.get(i) else { continue };
-            if let Some(rect) = self.layout.node_rect(node) {
+            if let Some((rect, fixed)) = boxes::node_rect_fixed(&self.layout, node) {
                 self.set_focus(Some(node), true);
-                return Some(rect);
+                return (!fixed).then_some(rect);
             }
         }
         None
@@ -608,6 +645,12 @@ impl Page {
 
     /// Activates the focused element (Enter on a focused link/button).
     pub fn activate_focused(&mut self) -> ClickAction {
+        let generation = self.generation;
+        let action = self.activate_focused_inner();
+        self.repaint_if_changed(action, generation)
+    }
+
+    fn activate_focused_inner(&mut self) -> ClickAction {
         let Some(f) = self.focus else {
             return ClickAction::None;
         };
@@ -662,7 +705,7 @@ impl Page {
     /// Case-insensitive find-in-page: rects (document coordinates) of every match,
     /// in document order. Matches spanning fragments of the same text node are supported.
     pub fn find(&self, query: &str) -> Vec<Rect> {
-        find::find(&self.layout, query)
+        find::find(&self.layout, &self.document, query)
     }
 
     /// `<meta http-equiv="refresh" content="N; url=…">`: delay in seconds and target URL
@@ -721,9 +764,14 @@ impl Page {
         doc.descendants(label).skip(1).find(|&n| labelable(n))
     }
 
-    /// Activates `el` (a click, or Enter when `keyboard`). `point` is the
-    /// click position, used for image buttons.
-    fn activate(&mut self, el: NodeId, point: Option<Point>, keyboard: bool) -> ClickAction {
+    /// Activates `el` (a click, or Enter when `keyboard`). `click` is the
+    /// click position and scroll offset, used for image buttons.
+    fn activate(
+        &mut self,
+        el: NodeId,
+        click: Option<(Point, Point)>,
+        keyboard: bool,
+    ) -> ClickAction {
         let tag = self.document.tag_name(el).unwrap_or("").to_string();
         if matches!(tag.as_str(), "input" | "button" | "select" | "textarea")
             && forms::is_disabled(&self.document, el)
@@ -743,7 +791,7 @@ impl Page {
                 Some(control) => self.activate(control, None, keyboard),
                 None => self.nothing_activated(),
             },
-            "input" => self.activate_input(el, point, keyboard),
+            "input" => self.activate_input(el, click, keyboard),
             "button" => match forms::button_type(&self.document, el) {
                 "submit" => {
                     self.set_focus(Some(el), keyboard);
@@ -788,7 +836,12 @@ impl Page {
         }
     }
 
-    fn activate_input(&mut self, el: NodeId, point: Option<Point>, keyboard: bool) -> ClickAction {
+    fn activate_input(
+        &mut self,
+        el: NodeId,
+        click: Option<(Point, Point)>,
+        keyboard: bool,
+    ) -> ClickAction {
         let ty = forms::input_type(&self.document, el);
         match ty.as_str() {
             "checkbox" => {
@@ -810,8 +863,11 @@ impl Page {
             }
             "image" => {
                 self.set_focus(Some(el), keyboard);
-                let coords = point
-                    .zip(self.layout.node_rect(el))
+                // Coordinates relative to the image (content box).
+                let coords = click
+                    .and_then(|(p, scroll)| {
+                        boxes::content_rect(&self.layout, el, scroll).map(|r| (p, r))
+                    })
                     .map(|(p, r)| {
                         let clamp = |v: f32| {
                             if v.is_finite() {

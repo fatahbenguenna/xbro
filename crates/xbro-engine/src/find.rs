@@ -6,11 +6,22 @@
 //! match yields one rectangle per fragment it touches, computed from the
 //! glyph positions (`ShapedGlyph::cluster` gives each glyph's byte offset in
 //! the fragment text).
+//!
+//! Generated text is attributed to its element, whose index precedes its
+//! children's: a run of an element's fragments that follows text of one of
+//! its descendants is its `::after` content and is ordered after the
+//! element's subtree (a `::before` run keeps the element's position), so
+//! results stay in document order and `::before`/`::after` texts are not
+//! searched as one string.
 
+use xbro_dom::{Document, NodeId};
 use xbro_layout::{LayoutTree, Rect, TextFragment};
 
 /// Upper bound on the number of reported rectangles.
 const MAX_RESULTS: usize = 10_000;
+
+/// U+00AD, ignored by the search.
+const SOFT_HYPHEN: char = '\u{ad}';
 
 /// One character of the searchable text.
 struct SourceChar {
@@ -113,6 +124,11 @@ fn search_group(group: &[&TextFragment], needle: &Needle, out: &mut Vec<Rect>) {
                 end: start + c.len_utf8(),
             });
             let idx = chars.len() - 1;
+            if c == SOFT_HYPHEN {
+                // Invisible unless the line breaks there: "hyphen\u{ad}ation"
+                // matches "hyphenation" (the match rect still covers it).
+                continue;
+            }
             if c.is_whitespace() {
                 folded.push(' ');
                 origin.push(idx);
@@ -161,10 +177,75 @@ fn search_group(group: &[&TextFragment], needle: &Needle, out: &mut Vec<Rect>) {
     });
 }
 
+/// A run of consecutive fragments (in layout order) from one source node.
+struct Run<'a> {
+    node: NodeId,
+    /// Document-order sort key: `(position, rank)`, where text nodes and
+    /// `::before` runs sit at their node index (rank 1 and 0) and `::after`
+    /// runs just before the first node following the element's subtree.
+    key: (usize, u8),
+    fragments: Vec<&'a TextFragment>,
+}
+
+/// Index of the first node after the subtree of `node` in tree order
+/// (`usize::MAX` when the subtree ends the document). Node indices follow
+/// tree order for parsed documents.
+fn subtree_end(doc: &Document, node: NodeId) -> usize {
+    std::iter::once(node)
+        .chain(doc.ancestors(node))
+        .find_map(|n| doc.next_sibling(n))
+        .map_or(usize::MAX, NodeId::index)
+}
+
+/// Groups the fragments of `tree` per source node, in document order.
+fn runs<'a>(tree: &'a LayoutTree, doc: &Document) -> Vec<Run<'a>> {
+    let mut runs: Vec<Run<'a>> = Vec::new();
+    for f in tree.text_fragments() {
+        if let Some(last) = runs.last_mut().filter(|r| r.node == f.node) {
+            last.fragments.push(f);
+            continue;
+        }
+        let in_document = f.node.index() < doc.len();
+        let key = if !in_document || doc.node(f.node).is_text() {
+            (f.node.index(), 1)
+        } else {
+            // Generated text (or a control's value, alt text…) of an element:
+            // `::after` content when it follows text of a descendant.
+            let after = runs.last().is_some_and(|prev| {
+                prev.node.index() < doc.len() && doc.ancestors(prev.node).any(|a| a == f.node)
+            });
+            if after {
+                (subtree_end(doc, f.node), 0)
+            } else {
+                (f.node.index(), 0)
+            }
+        };
+        runs.push(Run {
+            node: f.node,
+            key,
+            fragments: vec![f],
+        });
+    }
+    // Stable: runs with equal keys keep their layout order.
+    runs.sort_by_key(|r| r.key);
+    // Fragments of one text node separated in layout order become adjacent.
+    let mut merged: Vec<Run<'a>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match merged.last_mut() {
+            Some(last) if last.node == run.node && last.key == run.key => {
+                last.fragments.extend(run.fragments)
+            }
+            _ => merged.push(run),
+        }
+    }
+    merged
+}
+
 /// Case-insensitive search of `query` in the text of `tree` (see the module docs).
-pub(crate) fn find(tree: &LayoutTree, query: &str) -> Vec<Rect> {
+pub(crate) fn find(tree: &LayoutTree, doc: &Document, query: &str) -> Vec<Rect> {
     let needle: Vec<char> = query
         .chars()
+        .filter(|&c| c != SOFT_HYPHEN)
         .flat_map(|c| {
             let lower: Vec<char> = if c.is_whitespace() {
                 vec![' ']
@@ -179,23 +260,12 @@ pub(crate) fn find(tree: &LayoutTree, query: &str) -> Vec<Rect> {
         return out;
     }
     let needle = Needle::new(needle);
-    let mut fragments = tree.text_fragments();
-    // Document order: node ids follow tree order for parsed documents; the
-    // stable sort keeps the layout order of the fragments of one node.
-    fragments.sort_by_key(|f| f.node);
-    let mut start = 0;
-    while start < fragments.len() {
-        let node = fragments[start].node;
-        let end = fragments[start..]
-            .iter()
-            .position(|f| f.node != node)
-            .map_or(fragments.len(), |p| start + p);
-        search_group(&fragments[start..end], &needle, &mut out);
+    for run in runs(tree, doc) {
+        search_group(&run.fragments, &needle, &mut out);
         if out.len() >= MAX_RESULTS {
             out.truncate(MAX_RESULTS);
             break;
         }
-        start = end;
     }
     out
 }

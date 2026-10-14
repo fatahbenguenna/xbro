@@ -63,13 +63,14 @@ impl<'t> Builder<'_, 't> {
     ) {
         match kind {
             ControlKind::TextField | ControlKind::TextArea | ControlKind::Select => {
-                if visible && *kind == ControlKind::Select {
-                    self.select_arrow(b);
-                }
                 let radii = resolve_radii(&b.style.border_radius, sane_rect(b.border_box()));
                 self.push_clip(b.padding_box(), inner_radii(radii, b.border));
                 self.paint_lines(&b.lines, depth);
                 self.pop_clip();
+                // The arrow stays visible over a long selected option.
+                if visible && *kind == ControlKind::Select {
+                    self.select_arrow(b);
+                }
                 return;
             }
             ControlKind::Button => {}

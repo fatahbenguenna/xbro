@@ -2,11 +2,13 @@
 //! rel=stylesheet>` in tree order, external sheets fetched in parallel,
 //! `@import` rules inlined recursively, URLs made absolute.
 
+use std::collections::{HashMap, HashSet};
+
 use xbro_css::{parse_stylesheet, CssRule, MediaQueryList, Stylesheet};
 use xbro_dom::{Document, NodeId};
 use xbro_net::{decode_text, resolve, Fetcher, Response, Url};
 
-use crate::fetch::{scoped_map, MAX_WORKERS};
+use crate::fetch::{scoped_map, Policy, MAX_WORKERS};
 
 /// Maximum `@import` nesting (a sheet imported by an imported sheet is depth 2).
 const MAX_IMPORT_DEPTH: usize = 4;
@@ -60,8 +62,13 @@ fn media_attr(doc: &Document, node: NodeId) -> Option<String> {
 }
 
 /// Collects the stylesheet sources of `doc` in tree order (skipping
-/// `<template>` contents).
-fn collect_sources(doc: &Document, base: &Url, console: &mut Vec<String>) -> Vec<Source> {
+/// `<template>` contents and sheets the `policy` refuses).
+fn collect_sources(
+    doc: &Document,
+    base: &Url,
+    policy: Policy,
+    console: &mut Vec<String>,
+) -> Vec<Source> {
     let mut sources = Vec::new();
     let mut linked = 0usize;
     let mut stack = vec![doc.root()];
@@ -80,15 +87,22 @@ fn collect_sources(doc: &Document, base: &Url, console: &mut Vec<String>) -> Vec
                 }
                 "link" if is_stylesheet_link(doc, node) => {
                     let href = el.attr("href").unwrap_or("");
-                    match resolve(base, href) {
-                        Some(url) if linked < MAX_LINKED => {
+                    let resolved = resolve(base, href).map(|u| {
+                        let refusal = policy.refusal(&u);
+                        (u, refusal)
+                    });
+                    match resolved {
+                        Some((url, Some(why))) => {
+                            console.push(format!("Stylesheet blocked ({why}): {url}"));
+                        }
+                        Some((url, None)) if linked < MAX_LINKED => {
                             linked += 1;
                             sources.push(Source::External {
                                 url,
                                 media: media_attr(doc, node),
                             });
                         }
-                        Some(url) => console.push(format!(
+                        Some((url, None)) => console.push(format!(
                             "Stylesheet ignored (more than {MAX_LINKED} linked sheets): {url}"
                         )),
                         None => console.push(format!("Invalid stylesheet URL: {href}")),
@@ -150,9 +164,10 @@ pub(crate) fn load_stylesheets(
     fetcher: &Fetcher,
     doc: &Document,
     base: &Url,
+    policy: Policy,
     console: &mut Vec<String>,
 ) -> Vec<Stylesheet> {
-    let sources = collect_sources(doc, base, console);
+    let sources = collect_sources(doc, base, policy, console);
     let urls: Vec<Url> = sources
         .iter()
         .filter_map(|s| match s {
@@ -161,33 +176,38 @@ pub(crate) fn load_stylesheets(
         })
         .collect();
     let mut fetched = scoped_map(&urls, MAX_WORKERS, |u| fetcher.fetch(u)).into_iter();
-    let mut import_budget = MAX_IMPORTS;
-    let mut sheets = Vec::with_capacity(sources.len());
+    let mut parsed: Vec<(Stylesheet, Option<String>)> = Vec::with_capacity(sources.len());
     for source in sources {
-        let (sheet, media) = match source {
-            Source::Inline { css, media } => (parse_with_base(&css, base), media),
+        match source {
+            Source::Inline { css, media } => parsed.push((parse_with_base(&css, base), media)),
             Source::External { url, media } => match fetched.next().flatten() {
                 Some(Ok(response)) => match unusable(&response) {
-                    Some(why) => {
-                        console.push(format!("Failed to load stylesheet {url}: {why}"));
-                        continue;
-                    }
-                    None => (
+                    Some(why) => console.push(format!("Failed to load stylesheet {url}: {why}")),
+                    None => parsed.push((
                         parse_with_base(&decode_css(&response), &response.url),
                         media,
-                    ),
+                    )),
                 },
-                Some(Err(e)) => {
-                    console.push(format!("Failed to load stylesheet {url}: {e}"));
-                    continue;
-                }
-                None => {
-                    console.push(format!("Failed to load stylesheet {url}"));
-                    continue;
-                }
+                Some(Err(e)) => console.push(format!("Failed to load stylesheet {url}: {e}")),
+                None => console.push(format!("Failed to load stylesheet {url}")),
             },
-        };
-        let rules = resolve_imports(fetcher, sheet.rules, 1, &mut import_budget, console);
+        }
+    }
+    // Every sheet's imports, level by level, in parallel: one round trip
+    // per nesting level instead of one per importing sheet.
+    let roots: Vec<&[CssRule]> = parsed.iter().map(|(s, _)| s.rules.as_slice()).collect();
+    let cache = prefetch_imports(fetcher, policy, &roots);
+    let mut import_budget = MAX_IMPORTS;
+    let mut imports = Imports {
+        fetcher,
+        policy,
+        cache,
+        budget: &mut import_budget,
+        console,
+    };
+    let mut sheets = Vec::with_capacity(parsed.len());
+    for (sheet, media) in parsed {
+        let rules = imports.resolve(sheet.rules, 1);
         let rules = match media {
             Some(m) => vec![CssRule::Media {
                 query: MediaQueryList::parse_str(&m),
@@ -200,86 +220,171 @@ pub(crate) fn load_stylesheets(
     sheets
 }
 
-/// Replaces the top-level `@import` rules of a sheet by the rules of the
-/// imported sheets (wrapped in `@media` when the import has a media list).
-/// `depth` is the nesting level of the sheets being imported (1 for imports
-/// of a document's own sheets).
-fn resolve_imports(
-    fetcher: &Fetcher,
-    rules: Vec<CssRule>,
-    depth: usize,
-    budget: &mut usize,
-    console: &mut Vec<String>,
-) -> Vec<CssRule> {
-    if !rules.iter().any(|r| matches!(r, CssRule::Import { .. })) {
-        return rules;
+/// An imported sheet, parsed with its URLs made absolute, or why it could
+/// not be used.
+type Fetched = Result<Stylesheet, String>;
+
+/// Fetches and parses an imported stylesheet.
+fn fetch_sheet(fetcher: &Fetcher, url: &Url) -> Fetched {
+    let response = fetcher.fetch(url).map_err(|e| e.to_string())?;
+    match unusable(&response) {
+        Some(why) => Err(why),
+        None => Ok(parse_with_base(&decode_css(&response), &response.url)),
     }
-    // Fetch every import of this sheet in parallel.
-    let mut targets: Vec<Option<Url>> = Vec::new();
-    for rule in &rules {
+}
+
+/// The `@import` URLs of the top level of `rules`.
+fn import_urls(rules: &[CssRule], out: &mut Vec<String>) {
+    for rule in rules {
         if let CssRule::Import { url, .. } = rule {
-            let target = if depth > MAX_IMPORT_DEPTH {
-                console.push(format!("@import too deeply nested, ignored: {url}"));
-                None
-            } else if *budget == 0 {
-                console.push(format!("Too many @import rules, ignored: {url}"));
-                None
-            } else {
-                match Url::parse(url) {
-                    Ok(u) => {
-                        *budget -= 1;
-                        Some(u)
-                    }
-                    Err(_) => {
-                        console.push(format!("Invalid @import URL: {url}"));
-                        None
-                    }
+            out.push(url.clone());
+        }
+    }
+}
+
+/// Fetches the sheets imported by `roots` (and the sheets they import, up
+/// to [`MAX_IMPORT_DEPTH`] levels and [`MAX_IMPORTS`] sheets), each level
+/// in parallel. Keyed by absolute URL; what is not here is fetched by
+/// [`Imports::resolve`] on demand.
+fn prefetch_imports(
+    fetcher: &Fetcher,
+    policy: Policy,
+    roots: &[&[CssRule]],
+) -> HashMap<String, Fetched> {
+    let mut cache: HashMap<String, Fetched> = HashMap::new();
+    let mut level = Vec::new();
+    for rules in roots {
+        import_urls(rules, &mut level);
+    }
+    for _ in 0..MAX_IMPORT_DEPTH {
+        let mut jobs: Vec<Url> = Vec::new();
+        let mut queued: HashSet<String> = HashSet::new();
+        for raw in level.drain(..) {
+            if cache.len() + jobs.len() >= MAX_IMPORTS {
+                break;
+            }
+            let Ok(url) = Url::parse(&raw) else { continue };
+            let key = url.as_str().to_string();
+            if policy.refusal(&url).is_none() && !cache.contains_key(&key) && queued.insert(key) {
+                jobs.push(url);
+            }
+        }
+        if jobs.is_empty() {
+            break;
+        }
+        let results = scoped_map(&jobs, MAX_WORKERS, |u| fetch_sheet(fetcher, u));
+        for (url, result) in jobs.into_iter().zip(results) {
+            let fetched = result.unwrap_or_else(|| Err("internal error".to_string()));
+            if let Ok(sheet) = &fetched {
+                import_urls(&sheet.rules, &mut level);
+            }
+            cache.insert(url.as_str().to_string(), fetched);
+        }
+    }
+    cache
+}
+
+/// What `@import` resolution needs: the fetcher, the document's policy,
+/// the prefetched sheets, the remaining import budget of the page and the
+/// console.
+struct Imports<'a> {
+    fetcher: &'a Fetcher,
+    policy: Policy,
+    cache: HashMap<String, Fetched>,
+    budget: &'a mut usize,
+    console: &'a mut Vec<String>,
+}
+
+impl Imports<'_> {
+    /// Replaces the top-level `@import` rules of a sheet by the rules of the
+    /// imported sheets (wrapped in `@media` when the import has a media list).
+    /// `depth` is the nesting level of the sheets being imported (1 for imports
+    /// of a document's own sheets).
+    fn resolve(&mut self, rules: Vec<CssRule>, depth: usize) -> Vec<CssRule> {
+        if !rules.iter().any(|r| matches!(r, CssRule::Import { .. })) {
+            return rules;
+        }
+        let mut targets: Vec<Option<Url>> = Vec::new();
+        for rule in &rules {
+            if let CssRule::Import { url, .. } = rule {
+                targets.push(self.target(url, depth));
+            }
+        }
+        // Fetch what was not prefetched, in parallel.
+        let missing: Vec<Url> = targets
+            .iter()
+            .flatten()
+            .filter(|u| !self.cache.contains_key(u.as_str()))
+            .cloned()
+            .collect();
+        let fetcher = self.fetcher;
+        let results = scoped_map(&missing, MAX_WORKERS, |u| fetch_sheet(fetcher, u));
+        for (url, result) in missing.into_iter().zip(results) {
+            let fetched = result.unwrap_or_else(|| Err("internal error".to_string()));
+            self.cache.insert(url.as_str().to_string(), fetched);
+        }
+        let mut targets = targets.into_iter();
+        let mut out = Vec::with_capacity(rules.len());
+        for rule in rules {
+            let CssRule::Import { url, media } = rule else {
+                out.push(rule);
+                continue;
+            };
+            let Some(target) = targets.next().flatten() else {
+                continue;
+            };
+            let sheet = match self.cache.get(target.as_str()) {
+                Some(Ok(sheet)) => sheet.clone(),
+                Some(Err(why)) => {
+                    self.console.push(format!(
+                        "Failed to load imported stylesheet {target}: {why}"
+                    ));
+                    continue;
+                }
+                None => {
+                    self.console
+                        .push(format!("Failed to load imported stylesheet {url}"));
+                    continue;
                 }
             };
-            targets.push(target);
-        }
-    }
-    let jobs: Vec<Url> = targets.iter().flatten().cloned().collect();
-    let mut fetched = scoped_map(&jobs, MAX_WORKERS, |u| fetcher.fetch(u)).into_iter();
-    let mut targets = targets.into_iter();
-    let mut out = Vec::with_capacity(rules.len());
-    for rule in rules {
-        let CssRule::Import { url, media } = rule else {
-            out.push(rule);
-            continue;
-        };
-        let Some(target) = targets.next().flatten() else {
-            continue;
-        };
-        let response = match fetched.next().flatten() {
-            Some(Ok(r)) => r,
-            Some(Err(e)) => {
-                console.push(format!("Failed to load imported stylesheet {target}: {e}"));
-                continue;
+            let imported = self.resolve(sheet.rules, depth + 1);
+            if media.values.iter().all(|v| v.is_whitespace()) {
+                out.extend(imported);
+            } else {
+                out.push(CssRule::Media {
+                    query: media,
+                    rules: imported,
+                });
             }
-            None => {
-                console.push(format!("Failed to load imported stylesheet {url}"));
-                continue;
-            }
-        };
-        if let Some(why) = unusable(&response) {
-            console.push(format!(
-                "Failed to load imported stylesheet {target}: {why}"
-            ));
-            continue;
         }
-        let sheet = parse_with_base(&decode_css(&response), &response.url);
-        let imported = resolve_imports(fetcher, sheet.rules, depth + 1, budget, console);
-        if media.values.iter().all(|v| v.is_whitespace()) {
-            out.extend(imported);
-        } else {
-            out.push(CssRule::Media {
-                query: media,
-                rules: imported,
-            });
-        }
+        out
     }
-    out
+
+    /// The URL to fetch for an `@import` at `depth`, charging the budget;
+    /// `None` (with a console message) when it is not loaded.
+    fn target(&mut self, url: &str, depth: usize) -> Option<Url> {
+        if depth > MAX_IMPORT_DEPTH {
+            self.console
+                .push(format!("@import too deeply nested, ignored: {url}"));
+            return None;
+        }
+        if *self.budget == 0 {
+            self.console
+                .push(format!("Too many @import rules, ignored: {url}"));
+            return None;
+        }
+        let Ok(parsed) = Url::parse(url) else {
+            self.console.push(format!("Invalid @import URL: {url}"));
+            return None;
+        };
+        if let Some(why) = self.policy.refusal(&parsed) {
+            self.console
+                .push(format!("Imported stylesheet blocked ({why}): {parsed}"));
+            return None;
+        }
+        *self.budget -= 1;
+        Some(parsed)
+    }
 }
 
 #[cfg(test)]
@@ -317,7 +422,7 @@ mod tests {
         );
         let base = Url::parse("https://e.org/dir/page.html").unwrap();
         let mut console = Vec::new();
-        let sources = collect_sources(&doc, &base, &mut console);
+        let sources = collect_sources(&doc, &base, Policy::for_document(&base), &mut console);
         let summary: Vec<String> = sources
             .iter()
             .map(|s| match s {

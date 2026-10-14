@@ -331,3 +331,57 @@ fn wiki_page_columns_infobox_and_wikitable() {
         .unwrap();
     close(pib.margin_box().width, output.content.width, 0.5);
 }
+
+/// Every table cell box under `b`.
+fn cell_boxes<'a>(b: &'a LayoutBox, out: &mut Vec<&'a LayoutBox>) {
+    if b.kind == BoxKind::TableCell {
+        out.push(b);
+    }
+    for c in &b.children {
+        cell_boxes(c, out);
+    }
+}
+
+#[test]
+fn tables_fixture_at_phone_width() {
+    let Some(l) = load("tables.html", 360.0) else {
+        return;
+    };
+    let body = l.box_of(l.doc.body().unwrap()).unwrap().content;
+    let tables = l.doc.get_elements_by_tag_name("table");
+    // The 100% grid still fits: its columns shrink between their min and
+    // max-content widths (the numbers wrap), cells stay inside.
+    let grid = l.box_of(tables[0]).unwrap();
+    let gb = grid.border_box();
+    close(gb.width, body.width, 0.1);
+    let mut cells = Vec::new();
+    cell_boxes(grid, &mut cells);
+    assert_eq!(cells.len(), 5 + 5 + 5 + 4 + 3 + 5);
+    for c in &cells {
+        assert!(inside(c.border_box(), gb), "{:?}", c.border_box());
+        assert!(c.border_box().width > 20.0);
+    }
+    // Every table but the fixed-width one is within the body.
+    for (i, &t) in tables.iter().enumerate() {
+        let r = rect_of(&l, t);
+        assert!(
+            r.x >= body.x - 0.01 && r.right() <= body.right() + 0.01,
+            "table {i}: {r:?}"
+        );
+    }
+    // The long text cell of the separated table wraps onto several lines
+    // and its row is as tall as it.
+    let long = l.doc.get_elements_by_tag_name("td")[22];
+    let lc = l.box_of(long).unwrap();
+    assert!(lc.lines.len() >= 3, "{}", l.outline());
+    // The 60% table is centered and at least 60% wide.
+    let attr_table = rect_of(&l, tables[2]);
+    assert!(attr_table.width >= body.width * 0.6 - 0.1);
+    close(
+        attr_table.x - body.x,
+        body.right() - attr_table.right(),
+        0.1,
+    );
+    // The fixed layout table keeps its 300px.
+    assert_eq!(rect_of(&l, tables[4]).width, 300.0);
+}

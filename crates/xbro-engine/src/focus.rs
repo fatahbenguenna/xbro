@@ -4,7 +4,7 @@
 use xbro_dom::{Document, NodeId};
 use xbro_layout::{BoxKind, ControlKind, Edges, Fragment, LayoutBox, LayoutTree, Rect};
 use xbro_paint::{BorderSideItem, DisplayItem, DisplayList};
-use xbro_style::{BorderStyle, Color, StyleMap};
+use xbro_style::{BorderStyle, Color, StyleMap, Visibility};
 
 use crate::forms;
 
@@ -40,10 +40,16 @@ fn is_control(name: &str) -> bool {
     matches!(name, "input" | "select" | "textarea" | "button")
 }
 
-/// Focusable elements that are rendered, in tree order.
+/// Focusable elements that are rendered and visible, in tree order
+/// (`visibility: hidden` menus and dialogs are skipped, as in browsers).
 pub(crate) fn focusable_elements(doc: &Document, styles: &StyleMap) -> Vec<NodeId> {
     doc.descendants(doc.root())
-        .filter(|&n| styles.get(n).is_some() && is_focusable(doc, n))
+        .filter(|&n| {
+            styles
+                .get(n)
+                .is_some_and(|s| s.visibility == Visibility::Visible)
+                && is_focusable(doc, n)
+        })
         .collect()
 }
 
@@ -162,6 +168,14 @@ fn caret(doc: &Document, b: &LayoutBox, node: NodeId) -> Option<DisplayItem> {
         }
     };
     let x = x.min(content.right()).max(content.x);
+    // The control clips its text: keep the caret inside the content box
+    // (the end of a long textarea value lies below its visible rows).
+    let h = if content.height >= 1.0 {
+        h.min(content.height)
+    } else {
+        h
+    };
+    let y = y.min(content.bottom() - h).max(content.y);
     let rect = Rect::new(x, y, 1.0, h.max(1.0));
     (rect.x.is_finite() && rect.y.is_finite() && rect.height.is_finite()).then(|| {
         let color = if b.style.color.is_transparent() {

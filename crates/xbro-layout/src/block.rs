@@ -22,7 +22,7 @@
 use xbro_style::{Clear, Display, Float, Overflow};
 
 use crate::box_tree::{BoxNode, Kind, Replaced};
-use crate::cx::LayoutCx;
+use crate::cx::{LayoutCx, PendingAbs};
 use crate::float::{FloatContext, Side};
 use crate::geom::{Point, Rect};
 use crate::inline::{layout_ifc, AtomicBox};
@@ -149,6 +149,7 @@ pub(crate) fn establishes_bfc(b: &BoxNode) -> bool {
         || s.position.is_out_of_flow()
         || b.inline_level
         || b.flex_item
+        || b.button
         || matches!(s.display, Display::TableCaption)
 }
 
@@ -397,7 +398,8 @@ impl<'t> LayoutCx<'t> {
                     // starts there, not above.
                     let rest = b.children.get(i + 1..).unwrap_or(&[]);
                     let mut budget = LOOKAHEAD_BUDGET;
-                    upcoming_margins(rest, cb.width, &mut m, &mut budget, 0);
+                    let side = c.style.float;
+                    upcoming_margins(rest, cb.width, side, &mut m, &mut budget, 0);
                 }
                 let min_y = flow.y + m.resolve();
                 let lb = self.place_float(laid, flow.floats, min_y, cb);
@@ -468,6 +470,11 @@ impl<'t> LayoutCx<'t> {
                 .or_else(|| self.ratio_width_of(b, edges, cb))
             {
                 Some(w) => WidthMode::Fixed(clamp_size(w, min_w, max_w)),
+                None if b.button => {
+                    // A block-level `<button>` is as wide as its content.
+                    let i = self.content_intrinsic(b);
+                    WidthMode::Shrink(i.min, i.max)
+                }
                 None => WidthMode::Fill,
             },
         };
@@ -485,14 +492,19 @@ impl<'t> LayoutCx<'t> {
                 let spec = match mode {
                     WidthMode::Fill => None,
                     WidthMode::Fixed(w) => Some(w),
-                    WidthMode::Shrink(lo, hi) => Some(
-                        clamp_size(
+                    WidthMode::Shrink(lo, hi) => {
+                        let w = clamp_size(
                             shrink_to_fit(lo, hi, cb.width - edges.margin.horizontal() - pb_h),
                             min_w,
                             max_w,
-                        )
-                        .max(lo),
-                    ),
+                        );
+                        // Tables never get narrower than their min-content.
+                        Some(if matches!(b.kind, Kind::Table) {
+                            w.max(lo)
+                        } else {
+                            w
+                        })
+                    }
                 };
                 let (w, ml, mr) = block_width(style, edges, cb.width, cb.width, spec);
                 content_w = w;
@@ -512,7 +524,12 @@ impl<'t> LayoutCx<'t> {
                 }
                 WidthMode::Fixed(w) => (w, w + pb_h <= space + EPSILON),
                 WidthMode::Shrink(lo, hi) => {
-                    let w = clamp_size(shrink_to_fit(lo, hi, space - pb_h), min_w, max_w).max(lo);
+                    let w = clamp_size(shrink_to_fit(lo, hi, space - pb_h), min_w, max_w);
+                    let w = if matches!(b.kind, Kind::Table) {
+                        w.max(lo)
+                    } else {
+                        w
+                    };
                     (w, w + pb_h <= space + EPSILON)
                 }
             };
@@ -566,6 +583,29 @@ impl<'t> LayoutCx<'t> {
         cb: Cb,
         forced_h: Option<f32>,
     ) -> LayoutBox {
+        self.layout_independent_deferring(b, bx, by, content_w, edges, cb, forced_h, false)
+            .0
+    }
+
+    /// Like [`layout_independent`](Self::layout_independent); with
+    /// `defer_abs`, the absolutely positioned boxes whose containing block
+    /// is `b` (when positioned) are not laid out but returned, for the
+    /// caller to lay out with [`finish_deferred_abs`](Self::finish_deferred_abs)
+    /// once the box has its final size (table cells are stretched to their
+    /// rows after their layout). Moving the box before that must move their
+    /// static positions too ([`translate_deferred`](crate::cx::translate_deferred)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_independent_deferring(
+        &mut self,
+        b: &'t BoxNode,
+        bx: f32,
+        by: f32,
+        content_w: f32,
+        edges: &BoxEdges,
+        cb: Cb,
+        forced_h: Option<f32>,
+        defer_abs: bool,
+    ) -> (LayoutBox, Vec<PendingAbs<'t>>) {
         let style = &b.style;
         let content_x = bx + edges.border.left + edges.padding.left;
         let content_y = by + edges.border.top + edges.padding.top;
@@ -588,6 +628,7 @@ impl<'t> LayoutCx<'t> {
             (None, _) => ratio_height(style, content_w, edges.pb_h(), pb_v),
         };
         let frame = style.position.is_positioned().then(|| self.push_frame());
+        let content_mark = self.pending_mark();
         let content = self.independent_contents(
             b,
             content_x,
@@ -631,9 +672,47 @@ impl<'t> LayoutCx<'t> {
                     crate::tree::translate_lines(&mut lb.lines, 0.0, dy);
                 }
             }
+        } else if self.is_button(b) {
+            // `<button>` centers its content vertically in a taller box
+            // (its anonymous content box is centered, like browsers do).
+            let dy = (h - content.height) / 2.0;
+            if dy > EPSILON {
+                crate::tree::translate_lines(&mut lb.lines, 0.0, dy);
+                for c in &mut lb.children {
+                    crate::tree::translate_box(c, 0.0, dy);
+                }
+                self.translate_pending(content_mark, 0.0, dy);
+            }
         }
-        self.finish_box(b, &mut lb, frame);
-        lb
+        let deferred = match frame {
+            Some(f) if defer_abs => {
+                let pending = self.pop_frame(f);
+                self.finish_box(b, &mut lb, None);
+                pending
+            }
+            _ => {
+                self.finish_box(b, &mut lb, frame);
+                Vec::new()
+            }
+        };
+        (lb, deferred)
+    }
+
+    /// True for the block container box of a `<button>` element.
+    fn is_button(&self, b: &BoxNode) -> bool {
+        matches!(b.kind, Kind::Block) && b.button
+    }
+
+    /// Lays out the absolutely positioned boxes deferred by
+    /// [`layout_independent_deferring`](Self::layout_independent_deferring)
+    /// against the padding box of `lb` (their containing block), as its
+    /// children.
+    pub fn finish_deferred_abs(&mut self, lb: &mut LayoutBox, deferred: Vec<PendingAbs<'t>>) {
+        let pad = lb.padding_box();
+        for p in deferred {
+            let abs = self.layout_abspos(p, pad);
+            lb.children.push(abs);
+        }
     }
 
     /// Lays out the contents of an independent formatting context root
@@ -1003,9 +1082,14 @@ const LOOKAHEAD_BUDGET: usize = 64;
 /// margins: those of the next in-flow block, of its first in-flow child
 /// (when they collapse), and of empty boxes collapsing through. Returns
 /// true when in-flow content (or a margin-collapsing barrier) was reached.
+///
+/// `float` is the side of the float being placed: a box that clears it
+/// gets clearance, so its margins do not collapse with the pending ones
+/// (the float then stays above them, like browsers place it).
 fn upcoming_margins(
     siblings: &[BoxNode],
     cb_width: f32,
+    float: Float,
     m: &mut Margins,
     budget: &mut usize,
     depth: usize,
@@ -1019,6 +1103,15 @@ fn upcoming_margins(
             continue;
         }
         if s.is_text_like() || matches!(s.kind, Kind::Inline) {
+            return true;
+        }
+        let clears_float = match s.style.clear {
+            Clear::None => false,
+            Clear::Both => true,
+            Clear::Left => float == Float::Left,
+            Clear::Right => float == Float::Right,
+        };
+        if clears_float {
             return true;
         }
         let e = box_edges(&s.style, cb_width);
@@ -1038,7 +1131,7 @@ fn upcoming_margins(
             {
                 return true;
             }
-        } else if upcoming_margins(&s.children, cb_width, m, budget, depth + 1) {
+        } else if upcoming_margins(&s.children, cb_width, float, m, budget, depth + 1) {
             return true;
         }
         // Empty box: its margins collapse through unless it has a height.

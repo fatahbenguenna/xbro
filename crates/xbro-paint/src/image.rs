@@ -16,7 +16,7 @@
 //! caught) and expands entities eagerly. Nested SVG documents in `data:`
 //! URLs (`<image href>`) go through the same scan. As a second line of
 //! defence, parsing and rendering run on a worker thread with a large
-//! stack (see [`with_svg_stack`]).
+//! stack (see `with_svg_stack`).
 //!
 //! SVG limitations: `resvg`/`usvg` are built without their `text` feature
 //! (see the workspace manifest; enabling it would pull in a text shaping
@@ -77,7 +77,9 @@ impl Image {
     ///
     /// Raster images larger than 100 megapixels are rejected as well; both
     /// checks happen on the header, before pixels are allocated. Animated
-    /// GIF/WebP images decode to their first frame. SVG documents nesting
+    /// GIF/WebP images decode to their first frame. JPEG/PNG/WebP images
+    /// are rotated or flipped according to their EXIF orientation, as
+    /// browsers do (`image-orientation: from-image`). SVG documents nesting
     /// elements deeper than 256 levels, chaining clip paths/masks or
     /// expanding DTD entities beyond 1 MiB are rejected (see the module
     /// documentation).
@@ -213,7 +215,8 @@ pub(crate) fn dimensions_allowed(width: u32, height: u32) -> bool {
         && u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS
 }
 
-/// Decodes a raster image (first frame) into a premultiplied pixmap.
+/// Decodes a raster image (first frame) into a premultiplied pixmap,
+/// rotated/flipped as its EXIF orientation says.
 fn decode_raster(bytes: &[u8]) -> Option<tiny_skia::Pixmap> {
     catch_unwind(AssertUnwindSafe(|| decode_raster_inner(bytes)))
         .ok()
@@ -233,12 +236,19 @@ fn decode_raster_inner(bytes: &[u8]) -> Option<tiny_skia::Pixmap> {
     if !dimensions_allowed(width, height) {
         return None;
     }
-    let mut decoder = reader()?;
+    let mut reader = reader()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_SIDE);
     limits.max_image_height = Some(MAX_IMAGE_SIDE);
-    decoder.limits(limits);
-    let rgba = decoder.decode().ok()?.into_rgba8();
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().ok()?;
+    // Browsers honour the EXIF orientation of photos (`image-orientation:
+    // from-image`); unreadable metadata just means "as stored".
+    let orientation = image::ImageDecoder::orientation(&mut decoder)
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
+    decoded.apply_orientation(orientation);
+    let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
     if !dimensions_allowed(width, height) {
         return None;

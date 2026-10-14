@@ -277,6 +277,17 @@ pub(crate) fn undecodable_image(url: &Url, content_type: &str, size: usize) -> S
     )
 }
 
+/// Longest title generated for an image document (in characters).
+const MAX_TITLE_CHARS: usize = 100;
+
+/// `text` cut to at most `max` characters (an ellipsis marks the cut).
+pub(crate) fn shorten(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
 /// Last path segment of a URL (percent-decoded), used as a document title.
 pub(crate) fn file_name(url: &Url) -> Option<String> {
     let segment = url.path_segments()?.rev().find(|s| !s.is_empty())?;
@@ -330,7 +341,8 @@ pub(crate) fn plain_text(url: &Url, text: &str) -> String {
 
 /// A centered image document. `size` is the decoded natural size, if known.
 pub(crate) fn image_document(url: &Url, size: Option<(f32, f32)>) -> String {
-    let name = file_name(url).unwrap_or_else(|| url.as_str().to_string());
+    // `data:` URLs have no file name, and can be megabytes long.
+    let name = file_name(url).unwrap_or_else(|| shorten(url.as_str(), MAX_TITLE_CHARS));
     let title = match size {
         Some((w, h)) => format!("{name} ({} × {})", w.round(), h.round()),
         None => name,
@@ -396,6 +408,19 @@ mod tests {
         let html = image_document(&url("https://e.org/i.png?\"x"), Some((64.0, 32.0)));
         assert!(html.contains("i.png (64 × 32)"));
         assert!(html.contains("src=\"https://e.org/i.png?%22x\""));
+        let long = url(&format!("data:image/png;base64,{}", "A".repeat(5000)));
+        let html = image_document(&long, Some((1.0, 1.0)));
+        let title = html
+            .split("<title>")
+            .nth(1)
+            .unwrap()
+            .split("</title>")
+            .next()
+            .unwrap();
+        assert!(title.chars().count() < 120, "{title}");
+        assert!(title.starts_with("data:image/png;base64,AAA") && title.contains('…'));
+        assert_eq!(shorten("héllo", 2), "hé…");
+        assert_eq!(shorten("hé", 2), "hé");
         let html = unsupported_content(&url("https://e.org/f.pdf"), "application/pdf", 2048);
         assert!(html.contains("application/pdf (2.0 KB)"));
         let html = http_error(&url("https://e.org/x"), 404);

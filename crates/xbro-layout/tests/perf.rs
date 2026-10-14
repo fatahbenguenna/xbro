@@ -161,3 +161,101 @@ fn nested_flex_and_grid_containers_lay_out_quickly() {
     let best = best_layout_time(&l, fonts, viewport);
     assert!(best.as_millis() < budget(50), "nested flex: {best:?}");
 }
+
+#[test]
+fn nested_positioned_cells_lay_out_once() {
+    let Some(fonts) = fonts() else {
+        return;
+    };
+    // Positioned cells with free space below their content, 40 levels
+    // deep: each cell must be laid out once (its absolutely positioned
+    // boxes wait for its final height) or the cost doubles per level.
+    let mut html = String::from("<style>td{position:relative}</style>");
+    for i in 0..40 {
+        html.push_str(&format!(
+            "<table><tr><td><div style='height:{}px'></div></td><td>",
+            2000 - i * 10
+        ));
+    }
+    html.push_str("leaf<span style='position:absolute;bottom:0'>abs</span>");
+    for _ in 0..40 {
+        html.push_str("</td></tr></table>");
+    }
+    let viewport = Size::new(1024.0, 768.0);
+    let l = lay_full(&html, viewport, fonts, None);
+    let best = best_layout_time(&l, fonts, viewport);
+    assert!(
+        best.as_millis() < budget(50),
+        "nested positioned cells: {best:?}"
+    );
+}
+
+#[test]
+fn wide_row_spans_stay_linear() {
+    let Some(fonts) = fonts() else {
+        return;
+    };
+    // 30 rows of 1000 cells spanning two rows, and a cell spanning 999
+    // columns down 10,000 rows (each row has one more cell in the last
+    // column): the grid bookkeeping must not be quadratic in rows ×
+    // columns.
+    let mut html = String::from("<table>");
+    for _ in 0..30 {
+        html.push_str("<tr>");
+        for _ in 0..1000 {
+            html.push_str("<td rowspan=2>x");
+        }
+        html.push_str("<tr><td>y");
+    }
+    html.push_str("</table><table><tr><td colspan=999 rowspan=0>x");
+    for _ in 0..10_000 {
+        html.push_str("<tr><td>y");
+    }
+    html.push_str("</table>");
+    let viewport = Size::new(1024.0, 768.0);
+    let l = lay_full(&html, viewport, fonts, None);
+    assert!(l.tree.document_size.height > 10_000.0 * 15.0);
+    let best = best_layout_time(&l, fonts, viewport);
+    assert!(best.as_millis() < budget(300), "wide spans: {best:?}");
+}
+
+#[test]
+fn positioned_boxes_stay_linear_with_many_pending_abspos() {
+    let Some(fonts) = fonts() else {
+        return;
+    };
+    // 40,000 absolutely positioned boxes wait for the initial containing
+    // block while 40,000 relatively positioned boxes are laid out: ending
+    // each positioned box must not scan every waiting box.
+    let n = 40_000;
+    let html = format!(
+        "{}{}",
+        "<div style='position:absolute'>a</div>".repeat(n),
+        "<div style='position:relative'>b</div>".repeat(n)
+    );
+    let viewport = Size::new(1024.0, 768.0);
+    let l = lay_full(&html, viewport, fonts, None);
+    assert!(l.tree.document_size.height > n as f32 * 15.0);
+    let best = best_layout_time(&l, fonts, viewport);
+    assert!(best.as_millis() < budget(500), "positioned boxes: {best:?}");
+}
+
+#[test]
+fn many_floats_beside_a_tall_float_stay_linear() {
+    let Some(fonts) = fonts() else {
+        return;
+    };
+    // One very tall float, then thousands of small ones in rows and many
+    // lines: band queries must not visit every earlier float.
+    let n = 40_000;
+    let html = format!(
+        "<div style='float:right;width:10px;height:1000000px'></div>{}<p>{}</p>",
+        "<div style='float:left;width:30px;height:10px'></div>".repeat(n),
+        "word ".repeat(n)
+    );
+    let viewport = Size::new(1024.0, 768.0);
+    let l = lay_full(&html, viewport, fonts, None);
+    assert!(l.tree.document_size.height >= 1_000_000.0);
+    let best = best_layout_time(&l, fonts, viewport);
+    assert!(best.as_millis() < budget(300), "floats: {best:?}");
+}

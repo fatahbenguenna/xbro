@@ -140,6 +140,18 @@ pub(crate) struct PendingAbs<'t> {
     pub seq: u64,
 }
 
+/// Moves the static positions of absolutely positioned boxes taken out of
+/// the pending list (see [`LayoutCx::layout_independent_deferring`]).
+pub(crate) fn translate_deferred(boxes: &mut [PendingAbs<'_>], dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    for p in boxes {
+        p.static_pos.x += dx;
+        p.static_pos.y += dy;
+    }
+}
+
 /// Font lookup key: family list identity + weight + italic.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -183,7 +195,9 @@ pub(crate) struct LayoutCx<'t> {
     /// Absolutely positioned boxes waiting for their containing block.
     pub pending_abs: Vec<PendingAbs<'t>>,
     next_seq: u64,
-    frames: Vec<u32>,
+    /// Positioned boxes being laid out: frame id and the sequence number
+    /// of the first box that may register with it.
+    frames: Vec<(u32, u64)>,
     next_frame: u32,
     /// Auto-height measurements of flex/grid items (see `flex::item`), so
     /// that nested containers measure each item once per width.
@@ -292,16 +306,31 @@ impl<'t> LayoutCx<'t> {
     pub fn push_frame(&mut self) -> u32 {
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
-        self.frames.push(id);
+        self.frames.push((id, self.next_seq));
         id
     }
 
     /// Ends a positioned box's layout and returns the boxes waiting for it.
     pub fn pop_frame(&mut self, id: u32) -> Vec<PendingAbs<'t>> {
-        if let Some(pos) = self.frames.iter().rposition(|&f| f == id) {
-            self.frames.truncate(pos);
+        let Some(pos) = self.frames.iter().rposition(|&(f, _)| f == id) else {
+            return self.take_pending(|cb| cb == AbsCb::Frame(id));
+        };
+        let first_seq = self.frames.get(pos).map_or(0, |&(_, s)| s);
+        self.frames.truncate(pos);
+        // Boxes waiting for this frame registered after it was pushed:
+        // only the tail of the (seq-sorted) pending list is examined, so
+        // many positioned boxes stay linear however many boxes wait for
+        // outer containing blocks.
+        let lo = self.pending_abs.partition_point(|p| p.seq < first_seq);
+        let target = AbsCb::Frame(id);
+        let tail = self.pending_abs.get(lo..).unwrap_or(&[]);
+        if !tail.iter().any(|p| p.cb == target) {
+            return Vec::new();
         }
-        self.take_pending(|cb| cb == AbsCb::Frame(id))
+        let rest: Vec<PendingAbs<'t>> = self.pending_abs.drain(lo..).collect();
+        let (taken, kept): (Vec<_>, Vec<_>) = rest.into_iter().partition(|p| p.cb == target);
+        self.pending_abs.extend(kept);
+        taken
     }
 
     /// Registers an absolutely positioned box at its static position.
@@ -309,7 +338,9 @@ impl<'t> LayoutCx<'t> {
         let cb = if b.style.position == xbro_style::Position::Fixed {
             AbsCb::Viewport
         } else {
-            self.frames.last().map_or(AbsCb::Icb, |&f| AbsCb::Frame(f))
+            self.frames
+                .last()
+                .map_or(AbsCb::Icb, |&(f, _)| AbsCb::Frame(f))
         };
         let seq = self.next_seq;
         self.next_seq += 1;

@@ -49,6 +49,11 @@
 //!   containing block, or of the root box for the initial containing block
 //!   and the viewport); `content: url()` images are node-less
 //!   [`BoxKind::Image`] boxes whose style's `content` holds the URL.
+//! * `overflow` on the root element (or, when it is `visible`, on
+//!   `<body>`) applies to the viewport (CSS Overflow 3 §3.3): that element
+//!   gets a used `overflow: visible` (it neither clips nor establishes a
+//!   formatting context because of it), and a `hidden`/`clip` viewport
+//!   axis does not scroll ([`LayoutTree::document_size`]).
 //! * `aspect-ratio` sizes non-replaced boxes with an auto width or height
 //!   (the content still fits with `min-height: auto`).
 //! * Left-to-right horizontal text only; one glyph per character.
@@ -314,7 +319,10 @@ pub struct LayoutTree {
     /// Viewport used for this layout.
     pub viewport: Size,
     /// Scrollable size of the document: at least the viewport, extended to
-    /// include all in-flow and positioned content (not `fixed` boxes).
+    /// include all in-flow and positioned content (not `fixed` boxes). In
+    /// an axis where the `overflow` propagated to the viewport (from the
+    /// root element, else from `<body>`) is `hidden` or `clip`, the page
+    /// does not scroll and the size is the viewport's.
     pub document_size: Size,
 }
 
@@ -375,7 +383,8 @@ pub fn layout(ctx: &LayoutContext<'_>) -> LayoutTree {
     };
     let mut cx = cx::LayoutCx::new(ctx.document, ctx.fonts, ctx.replaced, viewport);
     let root = cx.layout_root(&root_node);
-    let document_size = query::document_size(&root, viewport);
+    let (_, overflow) = box_tree::viewport_overflow(ctx.document, ctx.styles);
+    let document_size = query::document_size(&root, viewport, overflow);
     LayoutTree {
         root: Some(root),
         viewport,

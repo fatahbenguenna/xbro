@@ -20,15 +20,22 @@ struct PlacedFloat {
     side: Side,
 }
 
+/// Number of consecutive floats summarised by one entry of
+/// [`FloatContext::block_bottom`].
+const BLOCK: usize = 32;
+
 /// Floats placed so far in one block formatting context.
 ///
 /// Floats are recorded in placement order, which is also the order of
 /// their (non-decreasing) top edges since a float may not be placed above
-/// an earlier one; band queries binary-search that order, so documents
-/// with thousands of floats stay fast.
+/// an earlier one; band queries binary-search that order and skip whole
+/// blocks of floats that end above the band, so documents with thousands
+/// of floats stay fast (even next to one very tall float).
 #[derive(Clone, Debug)]
 pub(crate) struct FloatContext {
     floats: Vec<PlacedFloat>,
+    /// Lowest bottom edge of each block of [`BLOCK`] consecutive floats.
+    block_bottom: Vec<f32>,
     /// A float may not be placed above an earlier float's top.
     min_top: f32,
     /// Tallest float margin box so far (bounds the band search).
@@ -48,6 +55,7 @@ impl FloatContext {
     pub fn new() -> Self {
         FloatContext {
             floats: Vec::new(),
+            block_bottom: Vec::new(),
             min_top: f32::NEG_INFINITY,
             max_height: 0.0,
             bottom_left: None,
@@ -67,11 +75,14 @@ impl FloatContext {
         let lo = self
             .floats
             .partition_point(|f| f.rect.y + self.max_height <= y);
-        let hi = self.floats.partition_point(|f| f.rect.y < y + h);
-        self.floats
-            .get(lo..hi.max(lo))
-            .unwrap_or(&[])
-            .iter()
+        let hi = self.floats.partition_point(|f| f.rect.y < y + h).max(lo);
+        (lo / BLOCK..hi.div_ceil(BLOCK))
+            .filter(move |&blk| self.block_bottom.get(blk).is_some_and(|&b| b > y))
+            .flat_map(move |blk| {
+                let start = (blk * BLOCK).max(lo);
+                let end = ((blk + 1) * BLOCK).min(hi).max(start);
+                self.floats.get(start..end).unwrap_or(&[]).iter()
+            })
             .filter(move |f| f.rect.y < y + h && f.rect.bottom() > y && f.rect.height > 0.0)
     }
 
@@ -148,6 +159,11 @@ impl FloatContext {
         };
         let rect = Rect::new(x, y, w.max(0.0), h.max(0.0));
         self.floats.push(PlacedFloat { rect, side });
+        let blk = (self.floats.len() - 1) / BLOCK;
+        match self.block_bottom.get_mut(blk) {
+            Some(b) => *b = b.max(rect.bottom()),
+            None => self.block_bottom.push(rect.bottom()),
+        }
         self.min_top = self.min_top.max(y);
         self.max_height = self.max_height.max(rect.height);
         let slot = match side {
@@ -208,6 +224,22 @@ mod tests {
         let q = fc.place(Side::Right, 10.0, 10.0, 0.0, 0.0, 500.0);
         assert_eq!(q.y, 50.0);
         assert_eq!(fc.next_bottom(0.0, 10.0), Some(50.0));
+    }
+
+    #[test]
+    fn band_queries_skip_blocks_of_floats_above() {
+        let mut fc = FloatContext::new();
+        // One very tall right float, then many short left floats in rows.
+        fc.place(Side::Right, 10.0, 1.0e6, 0.0, 0.0, 500.0);
+        for _ in 0..200 {
+            fc.place(Side::Left, 100.0, 10.0, 0.0, 0.0, 500.0);
+        }
+        // Four short floats per 490px row: 50 rows of 10px.
+        assert_eq!(fc.bottom(), Some(1.0e6));
+        assert_eq!(fc.available(495.0, 1.0, 0.0, 500.0), (400.0, 490.0));
+        assert_eq!(fc.available(505.0, 1.0, 0.0, 500.0), (0.0, 490.0));
+        assert_eq!(fc.next_bottom(495.0, 1.0), Some(500.0));
+        assert_eq!(fc.len(), 201);
     }
 
     #[test]

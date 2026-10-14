@@ -8,16 +8,18 @@
 use std::time::{Duration, Instant};
 
 use xbro_css::MediaContext;
+use xbro_dom::Document;
 use xbro_layout::Size;
 use xbro_net::{NetError, Response, Url};
 use xbro_paint::Image;
-use xbro_style::{compute_styles, StyleContext};
+use xbro_style::{compute_styles, StyleContext, StyleMap};
 
 use crate::dynamic::DynamicRules;
 use crate::error_pages;
+use crate::fetch::Policy;
 use crate::forms::FormDefaults;
-use crate::images::load_images;
-use crate::page::{LoadTimings, Page};
+use crate::images::{load_images, ImageContext, PageImages};
+use crate::page::{cap_console, guarded, LoadTimings, Page};
 use crate::stylesheets::load_stylesheets;
 use crate::{meta, Engine, NavigationRequest};
 
@@ -54,11 +56,72 @@ enum Kind {
     Unsupported,
 }
 
-/// True for XML documents that are really XHTML.
+/// How many leading bytes of an XML document are inspected to find its root element.
+const XML_SNIFF_BYTES: usize = 64 * 1024;
+
+/// True for XML documents that are really XHTML: the root element is
+/// `html` (in any namespace prefix), or the prolog has an HTML doctype.
+/// An XML document that merely mentions the XHTML namespace somewhere
+/// (an Atom feed with `type="xhtml"` content) is not XHTML.
 fn looks_like_xhtml(body: &[u8]) -> bool {
-    let head = &body[..body.len().min(4096)];
-    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
-    text.contains("http://www.w3.org/1999/xhtml") || text.contains("<!doctype html")
+    let head = String::from_utf8_lossy(body.get(..XML_SNIFF_BYTES).unwrap_or(body));
+    let mut rest = head.trim_start_matches('\u{feff}');
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(after) = rest.strip_prefix("<?") {
+            // Processing instruction or XML declaration.
+            let Some(end) = after.find("?>") else {
+                return false;
+            };
+            rest = &after[end + 2..];
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            let Some(end) = after.find("-->") else {
+                return false;
+            };
+            rest = &after[end + 3..];
+        } else if let Some(after) = rest.strip_prefix("<!") {
+            // DOCTYPE, possibly with an internal subset in brackets.
+            let doctype = after
+                .get(..7)
+                .is_some_and(|d| d.eq_ignore_ascii_case("doctype"));
+            if doctype {
+                let name = after[7..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let is_html = name
+                    .get(..4)
+                    .is_some_and(|n| n.eq_ignore_ascii_case("html"))
+                    && !name[4..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-');
+                if is_html {
+                    return true;
+                }
+            }
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in after.char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth = depth.saturating_sub(1),
+                    '>' if depth == 0 => {
+                        end = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                return false;
+            };
+            rest = &after[end + 1..];
+        } else if let Some(after) = rest.strip_prefix('<') {
+            let name_end = after
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '/' | '>'))
+                .unwrap_or(after.len());
+            let name = &after[..name_end];
+            let local = name.rsplit(':').next().unwrap_or(name);
+            return local.eq_ignore_ascii_case("html");
+        } else {
+            return false;
+        }
+    }
 }
 
 fn classify(response: &Response) -> Kind {
@@ -67,12 +130,16 @@ fn classify(response: &Response) -> Kind {
     }
     let ty = response.content_type.as_deref().unwrap_or("");
     let (top, sub) = ty.split_once('/').unwrap_or((ty, ""));
+    // Images first: an SVG image is XML but must be shown as an image,
+    // even when it embeds XHTML in a `<foreignObject>`.
+    if top == "image" {
+        return Kind::Image;
+    }
     let xml = sub == "xml" || sub.ends_with("+xml");
     if xml && looks_like_xhtml(&response.body) {
         return Kind::Html;
     }
     match top {
-        "image" => Kind::Image,
         "text" => Kind::Text,
         "application"
             if xml
@@ -190,31 +257,58 @@ pub(crate) fn build_page(
         stage = now;
     };
 
-    let document = xbro_html::parse_document(html);
+    let document = guarded(
+        "HTML parsing",
+        &mut console,
+        || xbro_html::parse_document(html),
+        Document::new,
+    );
     lap(&mut timings.parse);
 
     let base_url = meta::base_url(&document, &url);
-    let sheets = load_stylesheets(&engine.fetcher, &document, &base_url, &mut console);
+    let policy = Policy::for_document(&url);
+    // Stages that report into the console use a local log, merged afterwards
+    // (the guard itself needs the page console for its own message).
+    let mut log = Vec::new();
+    let sheets = guarded(
+        "stylesheet loading",
+        &mut console,
+        || load_stylesheets(&engine.fetcher, &document, &base_url, policy, &mut log),
+        Vec::new,
+    );
+    console.append(&mut log);
     lap(&mut timings.stylesheets);
 
     let ctx = StyleContext {
         media: media_context(viewport),
         ..StyleContext::default()
     };
-    let styles = compute_styles(&document, &sheets, &ctx);
+    let styles = guarded(
+        "style computation",
+        &mut console,
+        || compute_styles(&document, &sheets, &ctx),
+        StyleMap::default,
+    );
     lap(&mut timings.style);
 
-    let images = load_images(
-        &engine.fetcher,
-        &document,
-        &styles,
-        &base_url,
-        media_context(viewport),
-        preloaded,
+    let images = guarded(
+        "image loading",
         &mut console,
+        || {
+            let cx = ImageContext {
+                base: &base_url,
+                media: media_context(viewport),
+                policy,
+                preloaded,
+            };
+            load_images(&engine.fetcher, &document, &styles, &cx, &mut log)
+        },
+        PageImages::default,
     );
+    console.append(&mut log);
     lap(&mut timings.images);
 
+    cap_console(&mut console);
     let dynamic = DynamicRules::scan(&sheets);
     let form_defaults = FormDefaults::snapshot(&document);
     let mut page = Page {
@@ -240,6 +334,7 @@ pub(crate) fn build_page(
         focus_visible: false,
         form_defaults,
         timings,
+        generation: 0,
     };
     page.relayout_timed();
     page
@@ -286,6 +381,46 @@ mod tests {
         assert_eq!(kind(Some("image/png"), b""), "image");
         assert_eq!(kind(Some("application/pdf"), b""), "unsupported");
         assert_eq!(kind(Some("video/mp4"), b""), "unsupported");
+    }
+
+    #[test]
+    fn xhtml_sniffing_looks_at_the_root_element() {
+        assert!(looks_like_xhtml(
+            b"<html xmlns='http://www.w3.org/1999/xhtml'/>"
+        ));
+        assert!(looks_like_xhtml(
+            b"\xef\xbb\xbf<?xml version='1.0'?>\n<!-- note -->\n<?pi x?><h:html xmlns:h='x'/>"
+        ));
+        assert!(looks_like_xhtml(b"<!DOCTYPE html><p>"));
+        assert!(looks_like_xhtml(
+            b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"x\"><html>"
+        ));
+        // A DOCTYPE with an internal subset is skipped as a whole.
+        assert!(looks_like_xhtml(b"<!DOCTYPE x [ <!ENTITY a '>'> ]><html/>"));
+        assert!(!looks_like_xhtml(b"<!DOCTYPE htmlx><htmlx/>"));
+        // Mentions of the XHTML namespace below another root do not count.
+        assert!(!looks_like_xhtml(
+            b"<feed><content><div xmlns='http://www.w3.org/1999/xhtml'/></content></feed>"
+        ));
+        assert!(!looks_like_xhtml(b"<rss version='2.0'><channel/></rss>"));
+        assert!(!looks_like_xhtml(b"<!-- unterminated"));
+        assert!(!looks_like_xhtml(b"plain text"));
+        assert!(!looks_like_xhtml(b""));
+        assert!(!looks_like_xhtml("<?xml?><é/>".as_bytes()));
+    }
+
+    #[test]
+    fn images_are_never_sniffed_as_xhtml() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject>
+            <html xmlns="http://www.w3.org/1999/xhtml"/></foreignObject></svg>"#;
+        assert!(matches!(
+            classify(&response(Some("image/svg+xml"), svg)),
+            Kind::Image
+        ));
+        assert!(matches!(
+            classify(&response(Some("text/xml"), b"<html><body/></html>")),
+            Kind::Html
+        ));
     }
 
     #[test]

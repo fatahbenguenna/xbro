@@ -20,6 +20,29 @@ use std::time::Instant;
 /// Maximum number of concurrent subresource loads per page.
 pub(crate) const MAX_WORKERS: usize = 8;
 
+/// Which subresources a document may load: like browsers, only `file:`
+/// documents may load `file:` subresources (a web page must not read local
+/// files, even as images or stylesheets).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Policy {
+    allow_file: bool,
+}
+
+impl Policy {
+    /// The policy of a document loaded from `document_url`.
+    pub(crate) fn for_document(document_url: &url::Url) -> Self {
+        Self {
+            allow_file: document_url.scheme() == "file",
+        }
+    }
+
+    /// Why loading `url` is refused, if it is.
+    pub(crate) fn refusal(&self, url: &url::Url) -> Option<&'static str> {
+        (url.scheme() == "file" && !self.allow_file)
+            .then_some("local files cannot be loaded by a web page")
+    }
+}
+
 /// Maps `f` over `jobs` on up to `workers` threads (the calling thread
 /// included) and returns the results in job order.
 pub(crate) fn scoped_map<T, R, F>(jobs: &[T], workers: usize, f: F) -> Vec<Option<R>>
@@ -155,6 +178,20 @@ fn run_queue<T, R>(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn file_subresources_need_a_file_document() {
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        let web = Policy::for_document(&url("https://e.org/"));
+        let local = Policy::for_document(&url("file:///tmp/a.html"));
+        let data = Policy::for_document(&url("data:text/html,x"));
+        let file = url("file:///etc/passwd");
+        assert!(web.refusal(&file).is_some());
+        assert!(data.refusal(&file).is_some());
+        assert_eq!(local.refusal(&file), None);
+        assert_eq!(web.refusal(&url("https://e.org/a.css")), None);
+        assert_eq!(local.refusal(&url("https://e.org/a.png")), None);
+    }
 
     #[test]
     fn scoped_map_keeps_order_and_survives_panics() {

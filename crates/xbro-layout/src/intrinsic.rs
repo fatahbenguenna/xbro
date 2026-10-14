@@ -80,7 +80,12 @@ impl<'t> LayoutCx<'t> {
     }
 
     /// Intrinsic widths of a block container with block-level children.
-    /// Consecutive floats are counted side by side for the max-content width.
+    /// Consecutive floats are counted side by side for the max-content
+    /// width, together with a following box that establishes a formatting
+    /// context (it is placed beside them); the content of an ordinary
+    /// block does not add to them (it goes below the floats in a
+    /// shrink-to-fit container, as in browsers). Any in-flow block ends
+    /// the row of floats.
     fn block_children_intrinsic(&mut self, b: &'t BoxNode) -> Intrinsic {
         let mut min = 0.0f32;
         let mut max = 0.0f32;
@@ -91,17 +96,20 @@ impl<'t> LayoutCx<'t> {
             }
             let o = self.outer_intrinsic(c);
             min = min.max(o.min);
+            if c.style.clear != Clear::None {
+                float_line = 0.0;
+            }
             if c.is_float() {
-                if c.style.clear != Clear::None {
-                    float_line = 0.0;
-                }
                 float_line += o.max;
                 max = max.max(float_line);
             } else {
-                if c.style.clear != Clear::None {
-                    float_line = 0.0;
-                }
-                max = max.max(o.max);
+                let beside = if crate::block::establishes_bfc(c) {
+                    float_line
+                } else {
+                    0.0
+                };
+                max = max.max(beside + o.max);
+                float_line = 0.0;
             }
         }
         Intrinsic::new(min, max)

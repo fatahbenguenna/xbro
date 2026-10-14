@@ -8,9 +8,13 @@
 //! # Loading
 //!
 //! Subresources are fetched in parallel (at most 8 at a time): stylesheets
-//! on scoped threads (the cascade needs all of them), images on detached
-//! workers with a per-page budget of 400 URLs, 20 s and 512 MiB of decoded
-//! pixels (what does not fit is reported in [`Page::console`]). Pipeline
+//! on scoped threads (the cascade needs all of them; `@import`s of all the
+//! sheets level by level), images on detached workers with a per-page
+//! budget of 400 URLs, 20 s and 512 MiB of decoded pixels (what does not
+//! fit is reported in [`Page::console`], itself bounded to 1000 messages).
+//! Inline `<svg>` elements with identical trees share one parsed document,
+//! and the distinct ones are bounded to 8 MiB of SVG per page. As in
+//! browsers, only `file:` documents may load `file:` subresources. Pipeline
 //! stages run under `catch_unwind`, so a bug in a dependency degrades the
 //! page instead of taking the browser down.
 //!
@@ -22,7 +26,8 @@
 //! focus ring and a text caret are appended. `:hover` restyles are skipped
 //! when no compound selector containing `:hover` can match an element whose
 //! hover state changed, and disabled for the page after one takes more than
-//! 100 ms.
+//! 100 ms. Hover and focus changes report a repaint when (and only when)
+//! they changed the display list.
 //!
 //! # Approximations
 //!
@@ -39,6 +44,7 @@
 //! * Without namespaces in the DOM, `<title>` elements inside `<svg>` are
 //!   recognized by ancestry only.
 
+mod boxes;
 mod dynamic;
 mod error_pages;
 mod fetch;
