@@ -48,12 +48,16 @@ pub use background::{background_tile, resolve_radii};
 /// Glyphs of one text fragment, positioned absolutely.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphRun {
+    /// Font the run was shaped with (each glyph names its own face, which
+    /// may differ after fallback).
     pub font: FontId,
+    /// Font size in CSS px.
     pub font_size: f32,
     /// Pen position of the run's first glyph on the baseline.
     pub origin: Point,
     /// Glyphs with `x` relative to `origin.x`.
     pub glyphs: Vec<ShapedGlyph>,
+    /// Text color (never fully transparent in built lists).
     pub color: Color,
 }
 
@@ -70,8 +74,11 @@ impl GlyphRun {
 /// One side of a [`DisplayItem::Border`].
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BorderSideItem {
+    /// Used width in CSS px (0 for a missing side).
     pub width: f32,
+    /// Line style.
     pub style: BorderStyle,
+    /// Line color.
     pub color: Color,
 }
 
@@ -82,31 +89,47 @@ impl BorderSideItem {
     }
 }
 
+/// One drawing command. Coordinates are CSS px in the document (in the
+/// viewport between [`DisplayItem::PushFixed`] and [`DisplayItem::PopFixed`]);
+/// corner radii are ordered top-left, top-right, bottom-right, bottom-left.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisplayItem {
     /// Filled rectangle with optional corner radii (tl, tr, br, bl).
     Rect {
+        /// Area to fill.
         rect: Rect,
+        /// Fill color.
         color: Color,
+        /// Corner radii.
         radii: [f32; 4],
     },
     /// Border of `rect` (the border box). Sides: top, right, bottom, left.
     Border {
+        /// Border box (outer edge of the border).
         rect: Rect,
+        /// Top, right, bottom and left sides.
         sides: [BorderSideItem; 4],
+        /// Outer corner radii.
         radii: [f32; 4],
     },
     /// Linear gradient filling `rect` (CSS angle convention, stops in 0..=1).
     LinearGradient {
+        /// Area to fill (the gradient box).
         rect: Rect,
+        /// Direction of the gradient line: 0 = to top, 90 = to right.
         angle_deg: f32,
+        /// Colors and their positions along the gradient line.
         stops: Vec<(Color, f32)>,
+        /// Corner radii of the filled area.
         radii: [f32; 4],
     },
+    /// A run of glyphs.
     Text(GlyphRun),
     /// Image keyed by node (replaced elements), drawn scaled into `rect`.
     NodeImage {
+        /// Destination (the content box).
         rect: Rect,
+        /// Replaced element, passed to [`ImageProvider::node_image`].
         node: NodeId,
     },
     /// Image keyed by URL drawn as a background: tiled per `repeat` starting at
@@ -114,47 +137,68 @@ pub enum DisplayItem {
     ///
     /// A zero `tile` means "the image's natural size".
     BackgroundImage {
+        /// Absolute image URL, passed to [`ImageProvider::url_image`].
         url: String,
+        /// Painting area (the border box).
         clip: Rect,
+        /// Top-left corner of one tile; the others follow from `repeat`.
         origin: Point,
+        /// Size of one tile.
         tile: xbro_layout::Size,
+        /// Tiling axes.
         repeat: BackgroundRepeat,
     },
     /// Image keyed by URL drawn once, scaled into `rect` (list-style-image, `content: url()`).
     UrlImage {
+        /// Destination.
         rect: Rect,
+        /// Absolute image URL, passed to [`ImageProvider::url_image`].
         url: String,
     },
     /// Clip subsequent items to `rect` (with optional radii) until the matching `PopClip`.
     PushClip {
+        /// Clip rectangle (a padding box).
         rect: Rect,
+        /// Corner radii of the clip shape.
         radii: [f32; 4],
     },
+    /// Ends the innermost [`DisplayItem::PushClip`].
     PopClip,
     /// Composite subsequent items with `opacity` until the matching `PopOpacity`.
     PushOpacity(f32),
+    /// Ends the innermost [`DisplayItem::PushOpacity`] group.
     PopOpacity,
     /// Subsequent items (until `PopFixed`) are in viewport coordinates and ignore scrolling.
     PushFixed,
+    /// Ends the innermost [`DisplayItem::PushFixed`] section.
     PopFixed,
     /// Ellipse inscribed in `rect`: filled when `fill`, else stroked with
     /// `stroke_width` (the stroke is centred on the ellipse). Used for list
     /// markers, radio buttons and range thumbs.
     Ellipse {
+        /// Bounding box of the ellipse.
         rect: Rect,
+        /// Fill or stroke color.
         color: Color,
+        /// Filled (`true`) or stroked.
         fill: bool,
+        /// Stroke width in CSS px (ignored when filled).
         stroke_width: f32,
     },
     /// Open polyline stroked with round caps and joins (check marks).
     Polyline {
+        /// Vertices, at least two to draw anything.
         points: Vec<Point>,
+        /// Stroke width in CSS px.
         width: f32,
+        /// Stroke color.
         color: Color,
     },
     /// Filled polygon (`<select>` arrows).
     Polygon {
+        /// Vertices (closed implicitly), at least three to draw anything.
         points: Vec<Point>,
+        /// Fill color.
         color: Color,
     },
     /// Background image whose tile geometry depends on the image's natural
@@ -163,17 +207,25 @@ pub enum DisplayItem {
     /// with [`background_tile`]: `size` and `position` against the
     /// positioning `area`, painted within `clip`.
     DeferredBackgroundImage {
+        /// Absolute image URL, passed to [`ImageProvider::url_image`].
         url: String,
+        /// Background positioning area (the padding box).
         area: Rect,
+        /// Painting area (the border box).
         clip: Rect,
+        /// `background-size`.
         size: BackgroundSize,
+        /// `background-position` (x, y).
         position: (LengthPercentage, LengthPercentage),
+        /// `background-repeat`.
         repeat: BackgroundRepeat,
     },
 }
 
+/// Drawing commands of a page plus its canvas color.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayList {
+    /// Commands in paint order (later items paint over earlier ones).
     pub items: Vec<DisplayItem>,
     /// Canvas background (propagated from the root element, or from `<body>` when
     /// the root's background is transparent; white when both are transparent).

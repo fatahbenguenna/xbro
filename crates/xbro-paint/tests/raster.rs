@@ -951,7 +951,12 @@ fn culled_items_and_huge_geometry() {
     let p = render(&l, 50, 50);
     // The gradient covers x 0..10; the huge rect fills the rest.
     assert_px(&p, 30, 30, BLUE);
-    assert_px(&p, 30, 6, BLACK);
+    // The huge dashed border's top side runs along y = 5..7: dashes and
+    // gaps (their phase follows the whole 2e7 px side, not the viewport).
+    let black = (12..50)
+        .filter(|&x| close(px(&p, x, 6), rgb(BLACK), 40))
+        .count();
+    assert!((10..=28).contains(&black), "dashed top side: {black}");
 }
 
 #[test]
@@ -1023,4 +1028,251 @@ fn transparent_and_arc_shared_images() {
         "{:?}",
         px(&p, 5, 5)
     );
+}
+
+#[test]
+fn reused_opacity_layers_leave_no_stale_pixels() {
+    // Consecutive groups share one pooled layer: a later group must not
+    // composite an earlier group's pixels again. (Groups hold two items:
+    // single-item groups are drawn without a layer.)
+    let tiny = |x: f32| rect(x, 19.0, 1.0, 1.0, Color::rgba(0, 0, 0, 1));
+    let items = vec![
+        DisplayItem::PushOpacity(0.5),
+        rect(0.0, 0.0, 10.0, 10.0, RED),
+        tiny(0.0),
+        DisplayItem::PopOpacity,
+        DisplayItem::PushOpacity(0.5),
+        rect(20.0, 0.0, 10.0, 10.0, BLUE),
+        tiny(20.0),
+        DisplayItem::PopOpacity,
+        DisplayItem::PushOpacity(0.5),
+        DisplayItem::Ellipse {
+            rect: r(0.0, 11.0, 8.0, 8.0),
+            color: BLUE,
+            fill: true,
+            stroke_width: 0.0,
+        },
+        tiny(30.0),
+        DisplayItem::PopOpacity,
+        // Dirty over the whole area: stale pixels would be composited again.
+        DisplayItem::PushOpacity(0.5),
+        rect(0.0, 0.0, 40.0, 20.0, Color::rgba(0, 0, 0, 1)),
+        tiny(39.0),
+        DisplayItem::PopOpacity,
+    ];
+    let p = render(&list(WHITE, items), 40, 20);
+    assert!(
+        close(px(&p, 5, 5), (255, 127, 127, 255), 2),
+        "{:?}",
+        px(&p, 5, 5)
+    );
+    assert!(
+        close(px(&p, 25, 5), (127, 127, 255, 255), 2),
+        "{:?}",
+        px(&p, 25, 5)
+    );
+    assert!(
+        close(px(&p, 4, 15), (127, 127, 255, 255), 3),
+        "{:?}",
+        px(&p, 4, 15)
+    );
+    assert_px(&p, 15, 5, WHITE);
+}
+
+#[test]
+fn single_item_groups_match_layered_groups() {
+    let Some(fonts) = fonts() else { return };
+    let t = text(fonts, 1, "Hg", 4.0, 30.0, 24.0, style(|_| {}));
+    let run = DisplayItem::Text(GlyphRun {
+        font: t.font,
+        font_size: t.font_size,
+        origin: Point::new(4.0, 30.0),
+        glyphs: t.glyphs,
+        color: BLUE,
+    });
+    let shapes = [
+        rect(2.0, 2.0, 30.0, 10.0, RED),
+        DisplayItem::Rect {
+            rect: r(2.0, 2.0, 30.0, 30.0),
+            color: Color::rgba(0, 128, 0, 200),
+            radii: [8.0; 4],
+        },
+        DisplayItem::Ellipse {
+            rect: r(2.0, 2.0, 30.0, 30.0),
+            color: BLUE,
+            fill: false,
+            stroke_width: 3.0,
+        },
+        DisplayItem::Polyline {
+            points: vec![
+                Point::new(2.0, 2.0),
+                Point::new(30.0, 30.0),
+                Point::new(30.0, 2.0),
+            ],
+            width: 4.0,
+            color: RED,
+        },
+        DisplayItem::Polygon {
+            points: vec![
+                Point::new(2.0, 2.0),
+                Point::new(30.0, 30.0),
+                Point::new(2.0, 30.0),
+            ],
+            color: BLUE,
+        },
+        run,
+    ];
+    for shape in shapes {
+        let fast = list(
+            WHITE,
+            vec![
+                DisplayItem::PushOpacity(0.4),
+                shape.clone(),
+                DisplayItem::PopOpacity,
+            ],
+        );
+        // An empty clip pair forces the layered path.
+        let layered = list(
+            WHITE,
+            vec![
+                DisplayItem::PushOpacity(0.4),
+                shape.clone(),
+                DisplayItem::PushClip {
+                    rect: r(0.0, 0.0, 1.0, 1.0),
+                    radii: [0.0; 4],
+                },
+                DisplayItem::PopClip,
+                DisplayItem::PopOpacity,
+            ],
+        );
+        let (a, b) = (render(&fast, 40, 40), render(&layered, 40, 40));
+        let worst = a
+            .data()
+            .iter()
+            .zip(b.data())
+            .map(|(x, y)| x.abs_diff(*y))
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= 3, "{shape:?}: max channel difference {worst}");
+        assert!(a.data().iter().any(|&v| v < 250), "{shape:?} drew nothing");
+    }
+}
+
+#[test]
+fn text_in_reused_layers_is_not_duplicated() {
+    let Some(fonts) = fonts() else { return };
+    let run = |x: f32| {
+        let t = text(fonts, 1, "Hg", x, 30.0, 24.0, style(|_| {}));
+        DisplayItem::Text(GlyphRun {
+            font: t.font,
+            font_size: t.font_size,
+            origin: Point::new(x, 30.0),
+            glyphs: t.glyphs,
+            color: BLACK,
+        })
+    };
+    // Two items per group: single-item groups are drawn without a layer.
+    let tiny = rect(119.0, 39.0, 1.0, 1.0, Color::rgba(0, 0, 0, 1));
+    let items = vec![
+        DisplayItem::PushOpacity(0.5),
+        run(0.0),
+        tiny.clone(),
+        DisplayItem::PopOpacity,
+        DisplayItem::PushOpacity(0.5),
+        run(60.0),
+        tiny,
+        DisplayItem::PopOpacity,
+    ];
+    let p = render(&list(WHITE, items), 120, 40);
+    // Half-opaque black text never gets darker than ~50% grey.
+    let darkest = (0..120)
+        .flat_map(|x| (0..40).map(move |y| (x, y)))
+        .map(|(x, y)| px(&p, x, y).0)
+        .min()
+        .unwrap_or(255);
+    assert!((120..=135).contains(&darkest), "darkest {darkest}");
+}
+
+#[test]
+fn deeply_nested_opacity_is_bounded() {
+    // 300 nested groups on a 2000×2000 area would need 4.8 GB of layers;
+    // the budget caps live layers and the drawing still happens.
+    let mut items = Vec::new();
+    for _ in 0..300 {
+        items.push(DisplayItem::PushOpacity(0.999));
+    }
+    items.push(rect(0.0, 0.0, 10.0, 10.0, RED));
+    for _ in 0..300 {
+        items.push(DisplayItem::PopOpacity);
+    }
+    let start = std::time::Instant::now();
+    let p = render(&list(WHITE, items), 2000, 2000);
+    let (r_, g, b, _) = px(&p, 5, 5);
+    assert!(r_ > 200 && g < 100 && b < 100, "{:?}", (r_, g, b));
+    assert_px(&p, 50, 50, WHITE);
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn rounded_clip_inside_and_across_corners() {
+    let Some(fonts) = fonts() else { return };
+    let t = text(fonts, 1, "Wide text", 20.0, 50.0, 16.0, style(|_| {}));
+    let items = vec![
+        DisplayItem::PushClip {
+            rect: r(0.0, 0.0, 100.0, 100.0),
+            radii: [30.0; 4],
+        },
+        // Fully inside the cross between the corners: drawn without a mask.
+        DisplayItem::Text(GlyphRun {
+            font: t.font,
+            font_size: t.font_size,
+            origin: Point::new(20.0, 50.0),
+            glyphs: t.glyphs,
+            color: BLACK,
+        }),
+        rect(40.0, 0.0, 20.0, 100.0, BLUE),
+        // Across every corner: masked.
+        rect(0.0, 0.0, 100.0, 10.0, RED),
+        rect(0.0, 90.0, 100.0, 10.0, RED),
+        DisplayItem::PopClip,
+    ];
+    let p = render(&list(WHITE, items), 110, 110);
+    assert!(dark_pixels(&p, 20, 35, 100, 55, 100) > 30);
+    assert_px(&p, 50, 50, BLUE);
+    assert_px(&p, 50, 5, RED);
+    assert_px(&p, 50, 95, RED);
+    for (x, y) in [(1, 1), (98, 1), (98, 98), (1, 98), (5, 5)] {
+        assert_px(&p, x, y, WHITE);
+    }
+    assert_px(&p, 105, 50, WHITE);
+}
+
+#[test]
+fn deepest_accepted_svg_renders_on_small_stacks() {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let mut s =
+                String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#);
+            s.push_str(&"<g opacity='0.999'>".repeat(255));
+            s.push_str(r#"<rect width="10" height="10" fill="lime"/>"#);
+            s.push_str(&"</g>".repeat(255));
+            s.push_str("</svg>");
+            let image = Image::from_svg_str(&s).expect("256 levels are accepted");
+            let mut images = MapImages::default();
+            images.nodes.insert(1, image);
+            let l = list(
+                WHITE,
+                vec![DisplayItem::NodeImage {
+                    rect: r(0.0, 0.0, 20.0, 20.0),
+                    node: NodeId(1),
+                }],
+            );
+            let p = render_with(&l, 20, 20, &RasterOptions::default(), &images);
+            let (r_, g, b, _) = px(&p, 10, 10);
+            assert!(g > 200 && r_ < 100 && b < 100, "{:?}", (r_, g, b));
+        })
+        .expect("thread")
+        .join()
+        .expect("no stack overflow");
 }

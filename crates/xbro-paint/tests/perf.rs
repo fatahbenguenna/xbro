@@ -2,8 +2,10 @@
 //!
 //! `cargo test -p xbro-paint --release --test perf -- --ignored --nocapture`
 //! prints the timings and checks the 15 ms budget for a 1280×800 viewport
-//! with ~3,000 glyphs and ~500 rects; the non-ignored test runs a lighter
-//! check suitable for debug builds.
+//! of a text-heavy page (~12,000 glyphs and ~500 rects, more than the
+//! ~3,000 glyphs the budget is specified for), plus a "modern" page of
+//! rounded, clipped, translucent cards; the non-ignored test runs lighter
+//! checks suitable for debug builds.
 
 mod common;
 
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use xbro_layout::{Fragment, LayoutBox, LayoutTree, Rect, Size};
 use xbro_paint::{build_display_list_full, rasterize, DisplayList, NoImageProvider, RasterOptions};
-use xbro_style::{Color, LengthPercentage, TextDecorationLine};
+use xbro_style::{Color, LengthPercentage, Overflow, TextDecorationLine};
 use xbro_text::FontSystem;
 
 const WORDS: &[&str] = &[
@@ -92,9 +94,91 @@ fn scene(fonts: &FontSystem, lines: usize, rects: usize) -> LayoutTree {
     page(Size::new(1280.0, 800.0), children)
 }
 
+/// A "modern" page: 48 rounded `overflow: hidden` cards (header band
+/// crossing the rounded corners, text, a translucent badge), half of them
+/// translucent as a whole.
+fn cards(fonts: &FontSystem) -> LayoutTree {
+    let mut children = Vec::new();
+    for i in 0..48 {
+        let x = 16.0 + (i % 4) as f32 * 314.0;
+        let y = 16.0 + (i / 4) as f32 * 190.0;
+        let card_rect = Rect::new(x, y, 300.0, 176.0);
+        let mut card = bordered(
+            100 + i,
+            card_rect,
+            style(|s| {
+                s.background_color = Color::rgb(250, 250, 250);
+                s.border = solid(1.0, Color::rgb(220, 220, 220));
+                s.border_radius = [LengthPercentage::px(12.0); 4];
+                s.overflow_x = Overflow::Hidden;
+                s.overflow_y = Overflow::Hidden;
+                if i % 2 == 0 {
+                    s.opacity = 0.9;
+                }
+            }),
+        );
+        let header = block(
+            1000 + i,
+            Rect::new(x, y, 300.0, 60.0),
+            style(|s| {
+                s.background_image = Some(xbro_style::BackgroundImage::LinearGradient {
+                    angle_deg: 135.0,
+                    stops: vec![
+                        (Color::rgb(80, 120, 220), 0.0),
+                        (Color::rgb(160, 80, 200), 1.0),
+                    ],
+                });
+            }),
+        );
+        let badge = block(
+            2000 + i,
+            Rect::new(x + 230.0, y + 70.0, 56.0, 20.0),
+            style(|s| {
+                s.background_color = Color::rgb(30, 160, 90);
+                s.border_radius = [LengthPercentage::px(10.0); 4];
+                s.opacity = 0.7;
+            }),
+        );
+        let mut body = block(
+            3000 + i,
+            Rect::new(x + 12.0, y + 70.0, 210.0, 90.0),
+            style(|_| {}),
+        );
+        body.lines = (0..6)
+            .map(|l| {
+                let base = y + 84.0 + l as f32 * 15.0;
+                let words =
+                    WORDS[(i + l) % WORDS.len()].to_string() + " sit amet consectetur adipiscing";
+                let f = text(fonts, 3000 + i, &words, x + 12.0, base, 12.0, style(|_| {}));
+                line(
+                    Rect::new(x + 12.0, base - 12.0, 210.0, 15.0),
+                    base,
+                    vec![Fragment::Text(f)],
+                )
+            })
+            .collect();
+        card.children = vec![header, badge, body];
+        children.push(card);
+    }
+    page(Size::new(1280.0, 800.0), children)
+}
+
 fn time_frames(list: &DisplayList, fonts: &FontSystem, frames: usize) -> (Duration, Duration) {
-    let mut target = tiny_skia::Pixmap::new(1280, 800).expect("pixmap");
-    let options = RasterOptions::default();
+    time_frames_at(list, fonts, frames, 1.0)
+}
+
+fn time_frames_at(
+    list: &DisplayList,
+    fonts: &FontSystem,
+    frames: usize,
+    scale: f32,
+) -> (Duration, Duration) {
+    let mut target =
+        tiny_skia::Pixmap::new((1280.0 * scale) as u32, (800.0 * scale) as u32).expect("pixmap");
+    let options = RasterOptions {
+        scale,
+        ..RasterOptions::default()
+    };
     let start = Instant::now();
     rasterize(list, fonts, &NoImageProvider, &mut target, &options);
     let cold = start.elapsed();
@@ -130,6 +214,12 @@ fn raster_perf_light() {
         warm < Duration::from_secs(2),
         "cold {cold:?}, warm {warm:?}"
     );
+    let list = build_display_list_full(&cards(fonts), fonts, &NoImageProvider);
+    let (cold, warm) = time_frames(&list, fonts, 2);
+    assert!(
+        warm < Duration::from_secs(2),
+        "cards: cold {cold:?}, warm {warm:?}"
+    );
 }
 
 #[test]
@@ -158,5 +248,23 @@ fn raster_bench() {
     println!("raster 2560x1600 @2x (warm): {:?}", start.elapsed());
     if !cfg!(debug_assertions) {
         assert!(warm < Duration::from_millis(15), "warm frame took {warm:?}");
+    }
+
+    // Rounded overflow clips, gradients and opacity groups.
+    let list = build_display_list_full(&cards(fonts), fonts, &NoImageProvider);
+    for scale in [1.0, 2.0] {
+        let (cold, warm) = time_frames_at(&list, fonts, 15, scale);
+        println!(
+            "cards ({} items) @{scale}x: cold {cold:?}, warm median {warm:?}",
+            list.items.len()
+        );
+        // A stress case (most of the viewport in translucent groups):
+        // loose bound, the machine may be busy.
+        if !cfg!(debug_assertions) && scale == 1.0 {
+            assert!(
+                warm < Duration::from_millis(40),
+                "cards frame took {warm:?}"
+            );
+        }
     }
 }

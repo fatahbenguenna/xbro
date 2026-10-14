@@ -11,12 +11,19 @@
 //!   dashed/dotted/double/groove/ridge/inset/outset styles;
 //! * text from cached glyph coverage masks blended in a dedicated loop;
 //! * images with bilinear filtering, SVG rendered by resvg at the
-//!   destination size (bounded cache);
+//!   destination size (bounded cache), uniformly fitted and centred as
+//!   with the default `preserveAspectRatio` (`none`/`slice` on the root
+//!   element are not honoured: usvg flattens the viewBox);
 //! * clips as device rects (geometric clipping) plus lazily built masks
-//!   for rounded clips; `PushFixed` starts a fresh clip stack because fixed
-//!   boxes are not clipped by their ancestors' overflow;
+//!   for rounded clips, used only by shapes that reach a rounded corner;
+//!   `PushFixed` starts a fresh clip stack because fixed boxes are not
+//!   clipped by their ancestors' overflow;
 //! * opacity groups in transparent layers composited on `PopOpacity`
-//!   (only their dirty region).
+//!   (only their dirty region); a group holding a single solid-color item
+//!   draws it with a faded color instead. Layers are reused within a call
+//!   (cleared over their dirty region only); at most 256 MiB of layers are
+//!   live at once, and deeper nested groups are drawn without their own
+//!   opacity (the enclosing groups' opacity still applies).
 
 mod border;
 mod clip;
@@ -33,7 +40,7 @@ use xbro_text::{FontId, FontSystem};
 
 use crate::display_list::{DisplayItem, DisplayList};
 use crate::image::ImageProvider;
-use clip::{ClipState, DevRect};
+use clip::{ClipState, DevRect, MaskPool};
 
 /// Where and how to rasterise.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -63,6 +70,13 @@ impl Default for RasterOptions {
 
 /// Largest accepted scale factor.
 const MAX_SCALE: f32 = 64.0;
+
+/// Memory budget for the opacity layers live at the same time (each is a
+/// pixmap of the whole drawing area).
+const MAX_LAYER_BYTES: usize = 256 << 20;
+
+/// Upper bound on live opacity layers, whatever the area size.
+const MAX_LAYERS: usize = 64;
 
 /// `x / 255` rounded, exact for `x <= 255 * 255`.
 #[inline]
@@ -121,6 +135,7 @@ pub fn rasterize(
         off_x - finite(options.scroll.x) * scale,
         off_y - finite(options.scroll.y) * scale,
     );
+    let layer_bytes = (width as usize * height as usize * 4).max(1);
     let mut painter = Painter {
         fonts,
         images,
@@ -134,13 +149,76 @@ pub fn rasterize(
         clips: Vec::new(),
         saved_clips: Vec::new(),
         layers: Vec::new(),
+        pool: Vec::new(),
+        masks: MaskPool::default(),
+        max_layers: (MAX_LAYER_BYTES / layer_bytes).clamp(1, MAX_LAYERS),
         skip: 0,
         full: ClipState::full(width, height),
     };
-    for item in &list.items {
+    let items = &list.items;
+    let mut i = 0;
+    while let Some(item) = items.get(i) {
+        // A group holding a single solid-color item needs no layer: its
+        // opacity is applied to the item's color instead.
+        if let (DisplayItem::PushOpacity(opacity), Some(inner), Some(DisplayItem::PopOpacity)) =
+            (item, items.get(i + 1), items.get(i + 2))
+        {
+            if let Some(faded) = fade(inner, *opacity) {
+                painter.item(&faded);
+                i += 3;
+                continue;
+            }
+        }
         painter.item(item);
+        i += 1;
     }
     painter.finish();
+}
+
+/// `item` with its color's alpha multiplied by `opacity`, for the single
+/// solid-color items whose group opacity equals per-item alpha (`None`
+/// for other items and for opacities handled otherwise: 0, 1, NaN).
+fn fade(item: &DisplayItem, opacity: f32) -> Option<DisplayItem> {
+    if !(opacity > 0.0 && opacity < 1.0) {
+        return None;
+    }
+    let f = |c: Color| Color::rgba(c.r, c.g, c.b, (f32::from(c.a) * opacity).round() as u8);
+    Some(match item {
+        DisplayItem::Rect { rect, color, radii } => DisplayItem::Rect {
+            rect: *rect,
+            color: f(*color),
+            radii: *radii,
+        },
+        DisplayItem::Ellipse {
+            rect,
+            color,
+            fill,
+            stroke_width,
+        } => DisplayItem::Ellipse {
+            rect: *rect,
+            color: f(*color),
+            fill: *fill,
+            stroke_width: *stroke_width,
+        },
+        DisplayItem::Polygon { points, color } => DisplayItem::Polygon {
+            points: points.clone(),
+            color: f(*color),
+        },
+        DisplayItem::Polyline {
+            points,
+            width,
+            color,
+        } => DisplayItem::Polyline {
+            points: points.clone(),
+            width: *width,
+            color: f(*color),
+        },
+        DisplayItem::Text(run) => DisplayItem::Text(crate::display_list::GlyphRun {
+            color: f(run.color),
+            ..run.clone()
+        }),
+        _ => return None,
+    })
 }
 
 /// Draws `text` with the given font on `target` at device-pixel position
@@ -165,16 +243,21 @@ pub fn draw_text(
         return run.width;
     }
     let (w, h) = (target.width(), target.height());
+    // Glyph ink stays within a few ems of the baseline: runs far above or
+    // below the target draw nothing (and keep the integer maths in range).
+    if baseline < -4.0 * size_px || baseline > h as f32 + 4.0 * size_px {
+        return run.width;
+    }
     let clip = text::IntClip {
         x0: 0,
         y0: 0,
         x1: w as i32,
         y1: h as i32,
     };
-    let base_y = baseline.round();
+    let base_y = baseline.round() as i32;
     for glyph in &run.glyphs {
         let pen = x + glyph.x;
-        if pen > w as f32 + size_px || pen < -4.0 * size_px {
+        if !pen.is_finite() || pen > w as f32 + size_px || pen < -4.0 * size_px {
             continue;
         }
         if let Some(bitmap) =
@@ -184,8 +267,8 @@ pub fn draw_text(
                 target.data_mut(),
                 w,
                 &bitmap,
-                pen.floor() as i32 + bitmap.left,
-                base_y as i32 + bitmap.top,
+                (pen.floor() as i32).saturating_add(bitmap.left),
+                base_y.saturating_add(bitmap.top),
                 color,
                 clip,
                 None,
@@ -221,8 +304,14 @@ pub(crate) struct Painter<'a> {
     clips: Vec<ClipState>,
     /// Clip stacks suspended by `PushFixed`.
     saved_clips: Vec<Vec<ClipState>>,
-    /// Opacity groups (`None` for groups that need no layer).
+    /// Opacity groups (`None` for groups drawn without a layer).
     layers: Vec<Option<Layer>>,
+    /// Cleared layer pixmaps ready for reuse.
+    pool: Vec<Pixmap>,
+    /// Recycled clip/ring masks.
+    masks: MaskPool,
+    /// Most layers live at once (memory budget).
+    max_layers: usize,
     /// Nesting depth of invisible (opacity 0) groups being skipped.
     skip: usize,
     /// The "no clip" state.
@@ -249,7 +338,9 @@ impl<'a> Painter<'a> {
                 self.clips.push(next);
             }
             DisplayItem::PopClip => {
-                self.clips.pop();
+                if let Some(state) = self.clips.pop() {
+                    state.recycle(&self.masks);
+                }
             }
             DisplayItem::PushOpacity(opacity) => self.push_opacity(*opacity),
             DisplayItem::PopOpacity => self.pop_opacity(),
@@ -260,7 +351,10 @@ impl<'a> Painter<'a> {
             DisplayItem::PopFixed => {
                 if self.fixed_depth > 0 {
                     self.fixed_depth -= 1;
-                    self.clips = self.saved_clips.pop().unwrap_or_default();
+                    let restored = self.saved_clips.pop().unwrap_or_default();
+                    for state in std::mem::replace(&mut self.clips, restored) {
+                        state.recycle(&self.masks);
+                    }
                 }
             }
             _ if self.skip > 0 => {}
@@ -275,14 +369,20 @@ impl<'a> Painter<'a> {
                 radii,
             } => shapes::draw_linear_gradient(self, *rect, *angle_deg, stops, *radii),
             DisplayItem::Text(run) => text::draw_run(self, run),
+            // Cull before asking the provider: pages hold many off-screen
+            // images and a lookup may lock or clone.
             DisplayItem::NodeImage { rect, node } => {
-                if let Some(image) = self.images.node_image(*node) {
-                    images::draw_image(self, *rect, &image);
+                if self.rect_clip(self.to_dev(*rect)).is_some() {
+                    if let Some(image) = self.images.node_image(*node) {
+                        images::draw_image(self, *rect, &image);
+                    }
                 }
             }
             DisplayItem::UrlImage { rect, url } => {
-                if let Some(image) = self.images.url_image(url) {
-                    images::draw_image(self, *rect, &image);
+                if self.rect_clip(self.to_dev(*rect)).is_some() {
+                    if let Some(image) = self.images.url_image(url) {
+                        images::draw_image(self, *rect, &image);
+                    }
                 }
             }
             DisplayItem::BackgroundImage {
@@ -373,6 +473,10 @@ impl<'a> Painter<'a> {
         self.images
     }
 
+    pub(crate) fn masks(&self) -> &MaskPool {
+        &self.masks
+    }
+
     // ---------------------------------------------------------------
     // Clipping
     // ---------------------------------------------------------------
@@ -388,8 +492,8 @@ impl<'a> Painter<'a> {
         if visible.is_empty() || !visible.intersects(&clip.rect) {
             return ClipUse::Skip;
         }
-        if clip.has_rounded() || !clip.rect.contains(&visible) {
-            match clip.mask(self.width, self.height) {
+        if !clip.rect.contains(&visible) || clip.needs_mask_within(&visible) {
+            match clip.mask(self.width, self.height, &self.masks) {
                 Some(mask) => ClipUse::Mask(mask),
                 None => ClipUse::Skip,
             }
@@ -407,8 +511,8 @@ impl<'a> Painter<'a> {
         if visible.is_empty() {
             return None;
         }
-        let mask = if clip.has_rounded() {
-            Some(clip.mask(self.width, self.height)?)
+        let mask = if clip.needs_mask_within(&visible) {
+            Some(clip.mask(self.width, self.height, &self.masks)?)
         } else {
             None
         };
@@ -427,15 +531,17 @@ impl<'a> Painter<'a> {
         PixmapMut::from_bytes(self.base, self.width, self.height)
     }
 
-    /// Records that `r` (device) was drawn into the current target.
+    /// Records that `r` (device) was drawn into the current target. Every
+    /// drawing must stay inside the rects it marks: layers are composited
+    /// and cleared over their dirty region only. A one-pixel margin absorbs
+    /// anti-aliasing.
     pub(crate) fn mark_dirty(&mut self, r: DevRect) {
+        if r.is_empty() {
+            return;
+        }
+        let area = self.area();
         if let Some(layer) = self.layers.iter_mut().rev().flatten().next() {
-            layer.dirty = layer.dirty.union(&r.intersect(&DevRect::new(
-                0.0,
-                0.0,
-                self.width as f32,
-                self.height as f32,
-            )));
+            layer.dirty = layer.dirty.union(&r.outset(1.0).intersect(&area));
         }
     }
 
@@ -453,16 +559,20 @@ impl<'a> Painter<'a> {
             self.skip = 1;
             return;
         }
-        if opacity >= 1.0 {
+        let live = self.layers.iter().flatten().count();
+        if opacity >= 1.0 || live >= self.max_layers {
             self.layers.push(None);
             return;
         }
-        let layer = Pixmap::new(self.width, self.height).map(|pixmap| Layer {
+        let pixmap = self
+            .pool
+            .pop()
+            .or_else(|| Pixmap::new(self.width, self.height));
+        self.layers.push(pixmap.map(|pixmap| Layer {
             pixmap,
             opacity,
             dirty: DevRect::EMPTY,
-        });
-        self.layers.push(layer);
+        }));
     }
 
     fn pop_opacity(&mut self) {
@@ -470,24 +580,25 @@ impl<'a> Painter<'a> {
             self.skip -= 1;
             return;
         }
-        let Some(Some(layer)) = self.layers.pop() else {
+        let Some(Some(mut layer)) = self.layers.pop() else {
             return;
         };
         let dirty = layer.dirty.round_out().intersect(&self.area());
-        if dirty.is_empty() {
-            return;
+        if !dirty.is_empty() {
+            let width = self.width;
+            if let Some(mut target) = self.target() {
+                composite(
+                    target.data_mut(),
+                    layer.pixmap.data(),
+                    width,
+                    dirty,
+                    layer.opacity,
+                );
+            }
+            self.mark_dirty(dirty);
+            clear(layer.pixmap.data_mut(), width, dirty);
         }
-        let width = self.width;
-        if let Some(mut target) = self.target() {
-            composite(
-                target.data_mut(),
-                layer.pixmap.data(),
-                width,
-                dirty,
-                layer.opacity,
-            );
-        }
-        self.mark_dirty(dirty);
+        self.pool.push(layer.pixmap);
     }
 
     // ---------------------------------------------------------------
@@ -528,8 +639,22 @@ impl<'a> Painter<'a> {
     }
 }
 
+/// `px × f / 255` on each 8-bit channel of a packed pixel (`f` ≤ 255),
+/// rounded exactly like [`div255`]: two channels are processed at once in
+/// 16-bit lanes (`c × f + 128` stays below 2¹⁶, so lanes never carry).
+#[inline]
+pub(crate) fn mul_px(px: u32, f: u32) -> u32 {
+    let rb = (px & 0x00ff_00ff) * f + 0x0080_0080;
+    let rb = ((rb + ((rb >> 8) & 0x00ff_00ff)) >> 8) & 0x00ff_00ff;
+    let ag = ((px >> 8) & 0x00ff_00ff) * f + 0x0080_0080;
+    let ag = (ag + ((ag >> 8) & 0x00ff_00ff)) & 0xff00_ff00;
+    rb | ag
+}
+
 /// Source-over composites `layer` (premultiplied, same size as `dst`) with
 /// `opacity` over `dst`, within `rect` (integer-aligned, inside the area).
+/// Pixels are processed as packed words (channel sums of valid
+/// premultiplied colors never exceed 255, so they cannot carry).
 fn composite(dst: &mut [u8], layer: &[u8], width: u32, rect: DevRect, opacity: f32) {
     let op = (opacity * 255.0).round() as u32;
     if op == 0 {
@@ -542,18 +667,31 @@ fn composite(dst: &mut [u8], layer: &[u8], width: u32, rect: DevRect, opacity: f
         let (Some(d), Some(s)) = (dst.get_mut(range.clone()), layer.get(range)) else {
             continue;
         };
-        for (d, s) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
-            let sa = u32::from(s[3]);
-            if sa == 0 {
-                continue;
-            }
-            let a = div255(sa * op);
-            let inv = 255 - a;
-            for i in 0..3 {
-                d[i] =
-                    (div255(u32::from(s[i]) * op) + div255(u32::from(d[i]) * inv)).min(255) as u8;
-            }
-            d[3] = (a + div255(u32::from(d[3]) * inv)).min(255) as u8;
+        composite_row(d, s, op);
+    }
+}
+
+/// One row of [`composite`] (whole pixels of `dst` and `src`).
+#[inline]
+fn composite_row(dst: &mut [u8], src: &[u8], op: u32) {
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let s = mul_px(u32::from_le_bytes([s[0], s[1], s[2], s[3]]), op);
+        let out = s + mul_px(
+            u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+            255 - (s >> 24),
+        );
+        d.copy_from_slice(&out.to_le_bytes());
+    }
+}
+
+/// Zeroes `rect` (integer-aligned, inside the pixmap) of premultiplied
+/// RGBA `data` of width `width`.
+fn clear(data: &mut [u8], width: u32, rect: DevRect) {
+    let (x0, x1) = (rect.x0 as usize, rect.x1 as usize);
+    let stride = width as usize * 4;
+    for y in rect.y0 as usize..rect.y1 as usize {
+        if let Some(row) = data.get_mut(y * stride + x0 * 4..y * stride + x1 * 4) {
+            row.fill(0);
         }
     }
 }
@@ -563,9 +701,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clearing_a_region() {
+        let mut data = vec![9u8; 3 * 2 * 4];
+        clear(&mut data, 3, DevRect::new(1.0, 1.0, 3.0, 2.0));
+        assert_eq!(&data[..12], &[9; 12]);
+        assert_eq!(&data[12..16], &[9; 4]);
+        assert_eq!(&data[16..], &[0; 8]);
+    }
+
+    #[test]
     fn div255_is_exact() {
         for x in 0..=255u32 * 255 {
             assert_eq!(div255(x), (x as f32 / 255.0).round() as u32, "{x}");
+        }
+    }
+
+    #[test]
+    fn packed_multiply_matches_div255() {
+        for c in 0..=255u32 {
+            for f in [0u32, 1, 77, 128, 200, 254, 255] {
+                let px = c | ((255 - c) << 8) | (c << 16) | (c / 2) << 24;
+                let out = mul_px(px, f);
+                assert_eq!(out & 0xff, div255(c * f));
+                assert_eq!((out >> 8) & 0xff, div255((255 - c) * f));
+                assert_eq!((out >> 16) & 0xff, div255(c * f));
+                assert_eq!(out >> 24, div255(c / 2 * f));
+            }
         }
     }
 

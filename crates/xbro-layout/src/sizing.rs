@@ -34,16 +34,6 @@ pub(crate) fn lp(v: &LengthPercentage, reference: f32) -> f32 {
     sane(v.resolve(sane(reference)))
 }
 
-/// Resolves a length-percentage whose reference may be indefinite
-/// (percentages then resolve to 0).
-#[inline]
-pub(crate) fn lp_opt(v: &LengthPercentage, reference: Option<f32>) -> f32 {
-    match reference {
-        Some(r) => lp(v, r),
-        None => sane(v.px),
-    }
-}
-
 /// `None` for `auto`, else the resolved value.
 #[inline]
 pub(crate) fn lpa(v: &LengthPercentageAuto, reference: f32) -> Option<f32> {
@@ -131,11 +121,7 @@ pub(crate) fn specified_width(style: &ComputedStyle, cb_w: Option<f32>, pb_h: f3
 }
 
 /// Specified content height, `None` for `auto` or a percentage of an indefinite height.
-pub(crate) fn specified_height(
-    style: &ComputedStyle,
-    cb_h: Option<f32>,
-    pb_v: f32,
-) -> Option<f32> {
+pub(crate) fn specified_height(style: &ComputedStyle, cb_h: Option<f32>, pb_v: f32) -> Option<f32> {
     lpa_definite(&style.height, cb_h).map(|h| to_content(style, h, pb_v))
 }
 
@@ -184,18 +170,12 @@ pub(crate) fn clamp_size(v: f32, min: f32, max: f32) -> f32 {
 
 /// Width constraints of a box: min/max in content-box px.
 pub(crate) fn width_limits(style: &ComputedStyle, cb_w: Option<f32>, pb_h: f32) -> (f32, f32) {
-    (
-        min_width(style, cb_w, pb_h),
-        max_width(style, cb_w, pb_h),
-    )
+    (min_width(style, cb_w, pb_h), max_width(style, cb_w, pb_h))
 }
 
 /// Height constraints of a box: min/max in content-box px.
 pub(crate) fn height_limits(style: &ComputedStyle, cb_h: Option<f32>, pb_v: f32) -> (f32, f32) {
-    (
-        min_height(style, cb_h, pb_v),
-        max_height(style, cb_h, pb_v),
-    )
+    (min_height(style, cb_h, pb_v), max_height(style, cb_h, pb_v))
 }
 
 /// Width and horizontal margins of a block-level, non-replaced box in normal
@@ -247,6 +227,52 @@ pub(crate) fn block_width(
         solve(Some(clamped))
     } else {
         (w, ml, mr)
+    }
+}
+
+/// Sanitised `aspect-ratio` (width / height) of a box, if any.
+pub(crate) fn aspect_ratio(style: &ComputedStyle) -> Option<f32> {
+    style
+        .aspect_ratio
+        .filter(|r| r.is_finite() && (1.0e-6..=1.0e6).contains(r))
+}
+
+/// Content height that `aspect-ratio` gives a box of content width `w`
+/// (the ratio applies to the box selected by `box-sizing`).
+pub(crate) fn ratio_height(style: &ComputedStyle, w: f32, pb_h: f32, pb_v: f32) -> Option<f32> {
+    let r = aspect_ratio(style)?;
+    Some(match style.box_sizing {
+        BoxSizing::ContentBox => sane_size(w / r),
+        BoxSizing::BorderBox => sane_size((w + pb_h) / r - pb_v),
+    })
+}
+
+/// Content width that `aspect-ratio` gives a box of content height `h`.
+pub(crate) fn ratio_width(style: &ComputedStyle, h: f32, pb_h: f32, pb_v: f32) -> Option<f32> {
+    let r = aspect_ratio(style)?;
+    Some(match style.box_sizing {
+        BoxSizing::ContentBox => sane_size(h * r),
+        BoxSizing::BorderBox => sane_size((h + pb_v) * r - pb_h),
+    })
+}
+
+/// Used content height of a non-replaced box whose height comes from its
+/// `aspect-ratio` (`ratio_h`) rather than from `height`, given its auto
+/// (content) height: `min-height`/`max-height` apply, and with `min-height:
+/// auto` the box still grows to fit its content unless it is a scroll
+/// container (CSS Sizing 4 §5.1, automatic minimum size).
+pub(crate) fn ratio_used_height(
+    style: &ComputedStyle,
+    ratio_h: f32,
+    auto_h: f32,
+    (min_h, max_h): (f32, f32),
+) -> f32 {
+    let h = clamp_size(ratio_h, min_h, max_h);
+    let clips = style.overflow_x.clips() || style.overflow_y.clips();
+    if style.min_height.is_auto() && !clips {
+        h.max(sane_size(auto_h).min(max_h))
+    } else {
+        h
     }
 }
 

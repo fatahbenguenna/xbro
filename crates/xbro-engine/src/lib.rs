@@ -4,15 +4,60 @@
 //!
 //! A [`Page`] is `Send`, so it can be built on a loader thread and handed to
 //! the UI thread.
+//!
+//! # Loading
+//!
+//! Subresources are fetched in parallel (at most 8 at a time): stylesheets
+//! on scoped threads (the cascade needs all of them), images on detached
+//! workers with a per-page budget of 400 URLs, 20 s and 512 MiB of decoded
+//! pixels (what does not fit is reported in [`Page::console`]). Pipeline
+//! stages run under `catch_unwind`, so a bug in a dependency degrades the
+//! page instead of taking the browser down.
+//!
+//! # Interaction
+//!
+//! Interactions mutate the DOM where layout reads control state (`value`,
+//! `checked`, `selected`, textarea text, `details[open]`), then restyle (or
+//! only relayout for plain typing) and rebuild the display list, to which a
+//! focus ring and a text caret are appended. `:hover` restyles are skipped
+//! when no compound selector containing `:hover` can match an element whose
+//! hover state changed, and disabled for the page after one takes more than
+//! 100 ms.
+//!
+//! # Approximations
+//!
+//! * Images are chosen and loaded once: `srcset`/`<picture>` choices are not
+//!   revisited after [`Page::set_viewport`], and CSS images that only appear
+//!   after a restyle (`:hover` backgrounds, media-query changes) are not loaded.
+//! * Form data is always encoded as UTF-8; `multipart/form-data` forms are
+//!   submitted as `application/x-www-form-urlencoded`; no constraint validation.
+//! * Text editing only appends or deletes at the end of the value (no caret
+//!   movement or selection).
+//! * Inline SVG is rendered from a serialization of its DOM subtree: author
+//!   CSS rules targeting SVG descendants are not applied (presentation
+//!   attributes and `currentColor` are).
+//! * Without namespaces in the DOM, `<title>` elements inside `<svg>` are
+//!   recognized by ancestry only.
 
+mod dynamic;
 mod error_pages;
+mod fetch;
+mod find;
+mod focus;
 mod forms;
+mod image_map;
+mod images;
 mod loader;
+mod meta;
 mod page;
+mod srcset;
+mod stylesheets;
+mod svg;
 
 use std::sync::Arc;
 
-pub use page::{ClickAction, Page};
+pub use images::PageImages;
+pub use page::{ClickAction, LoadTimings, Page};
 pub use xbro_layout::{Point, Rect, Size};
 pub use xbro_net::{Fetcher, Url};
 pub use xbro_paint::RasterOptions;

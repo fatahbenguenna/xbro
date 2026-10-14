@@ -7,7 +7,8 @@ use xbro_layout::{
     MarkerContent, Rect, Size,
 };
 use xbro_style::{
-    BackgroundImage, BackgroundSize, BorderStyle, Color, ComputedStyle, Float, Position, Visibility,
+    BackgroundImage, BackgroundSize, BorderStyle, Color, ComputedStyle, Content, ContentItem,
+    Float, Position, Visibility,
 };
 use xbro_text::{FontId, FontSystem};
 
@@ -545,11 +546,19 @@ impl<'a, 't> Builder<'a, 't> {
         }
         match &b.kind {
             BoxKind::Image => {
-                if visible {
-                    if let Some(node) = b.node {
-                        let rect = sane_rect(b.content);
-                        if !rect.is_empty() {
-                            self.items.push(DisplayItem::NodeImage { rect, node });
+                let rect = sane_rect(b.content);
+                if visible && !rect.is_empty() {
+                    match b.node {
+                        Some(node) => self.items.push(DisplayItem::NodeImage { rect, node }),
+                        // Node-less image boxes are `content: url()` images
+                        // and inside `list-style-image` markers.
+                        None => {
+                            if let Some(url) = url_image_of(&b.style) {
+                                self.items.push(DisplayItem::UrlImage {
+                                    rect,
+                                    url: url.to_string(),
+                                });
+                            }
                         }
                     }
                 }
@@ -894,6 +903,22 @@ impl<'a, 't> Builder<'a, 't> {
             }
         }
     }
+}
+
+/// URL of a node-less image box: the single `url()` item of its `content`
+/// (`::before`/`::after` images), else its `list-style-image` (inside
+/// list markers drawn as images). `None` when neither names a URL.
+fn url_image_of(style: &ComputedStyle) -> Option<&str> {
+    if let Content::Items(items) = &style.content {
+        let url = items.iter().find_map(|item| match item {
+            ContentItem::Image(url) => Some(url.as_str()),
+            _ => None,
+        });
+        if let Some(url) = url.filter(|u| !u.is_empty()) {
+            return Some(url);
+        }
+    }
+    style.list_style_image.as_deref().filter(|u| !u.is_empty())
 }
 
 /// Composites a (possibly translucent) canvas color over white.

@@ -9,10 +9,22 @@
 //! every decoder call is wrapped in [`std::panic::catch_unwind`] as a last
 //! resort against decoder bugs on malformed input.
 //!
+//! SVG documents are pre-scanned before parsing (see `svg_scan`): element
+//! nesting deeper than 256 levels, chains of clip-path/mask references and
+//! DTD entities expanding to more than 1 MiB are rejected, because usvg
+//! recurses over the tree and its references (a stack overflow cannot be
+//! caught) and expands entities eagerly. Nested SVG documents in `data:`
+//! URLs (`<image href>`) go through the same scan. As a second line of
+//! defence, parsing and rendering run on a worker thread with a large
+//! stack (see [`with_svg_stack`]).
+//!
 //! SVG limitations: `resvg`/`usvg` are built without their `text` feature
-//! (see the workspace manifest), so SVG `<text>` elements are not rendered;
-//! `<image>` elements only resolve `data:` URLs (never local files), and
-//! embedded raster images are not drawn (no `raster-images` feature).
+//! (see the workspace manifest; enabling it would pull in a text shaping
+//! stack for a rarely needed feature), so SVG `<text>` elements are not
+//! rendered; `<image>` elements only resolve `data:` URLs (never local
+//! files), and embedded raster images are not drawn (no `raster-images`
+//! feature). Gzip-compressed SVG (`.svgz` bytes) is not decoded (no `svgz`
+//! feature; HTTP `Content-Encoding: gzip` is undone by the network layer).
 
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -21,14 +33,22 @@ use std::sync::Arc;
 use xbro_dom::NodeId;
 use xbro_layout::Size;
 
+mod svg_scan;
+
+use svg_scan::structure_ok;
+
+/// Stack size of the threads that parse and render SVG documents. usvg
+/// and resvg recurse over the element tree and its references; the
+/// pre-scan bounds that recursion, and this generous stack (reserved, only
+/// touched pages are committed) keeps the bounded worst case far from an
+/// overflow whatever stack the calling thread has.
+const SVG_STACK_BYTES: usize = 64 << 20;
+
 /// Largest accepted raster image side, in pixels.
 pub const MAX_IMAGE_SIDE: u32 = 16_384;
 
 /// Largest accepted raster image area, in pixels (100 megapixels).
 pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
-
-/// How many leading bytes are searched for an `<svg` tag when sniffing XML.
-const SVG_SNIFF_BYTES: usize = 4096;
 
 /// A decoded image ready to be drawn.
 #[derive(Clone)]
@@ -57,7 +77,10 @@ impl Image {
     ///
     /// Raster images larger than 100 megapixels are rejected as well; both
     /// checks happen on the header, before pixels are allocated. Animated
-    /// GIF/WebP images decode to their first frame.
+    /// GIF/WebP images decode to their first frame. SVG documents nesting
+    /// elements deeper than 256 levels, chaining clip paths/masks or
+    /// expanding DTD entities beyond 1 MiB are rejected (see the module
+    /// documentation).
     pub fn decode(bytes: &[u8], content_type: Option<&str>) -> Option<Image> {
         if bytes.is_empty() {
             return None;
@@ -72,13 +95,14 @@ impl Image {
     }
 
     /// Parses SVG markup (used for inline `<svg>` elements serialized by the engine).
+    ///
+    /// The same structural limits as for [`Image::decode`] apply.
     pub fn from_svg_str(svg: &str) -> Option<Image> {
         let svg = svg.trim_start_matches('\u{feff}').trim_start();
-        let tree = catch_unwind(AssertUnwindSafe(|| {
-            resvg::usvg::Tree::from_str(svg, &svg_options()).ok()
-        }))
-        .ok()
-        .flatten()?;
+        if !structure_ok(svg.as_bytes()) {
+            return None;
+        }
+        let tree = with_svg_stack(|| resvg::usvg::Tree::from_str(svg, &svg_options()).ok())??;
         svg_image(tree)
     }
 
@@ -104,33 +128,49 @@ fn is_svg_content_type(content_type: &str) -> bool {
 }
 
 /// Content sniffing: after an optional UTF-8 BOM and whitespace, the data
-/// starts with `<svg`, or with `<?xml` / `<!--` / `<!DOCTYPE` and contains
-/// `<svg` near the start.
+/// starts with `<svg`, or with an XML prolog (`<?xml …?>`, comments, a
+/// DOCTYPE) whose first element is `<svg>` (any namespace prefix), however
+/// long the prolog is.
 pub(crate) fn looks_like_svg(bytes: &[u8]) -> bool {
-    let data = trim_xml_start(bytes);
-    let starts = |prefix: &[u8]| {
-        data.len() >= prefix.len()
-            && data
-                .iter()
-                .zip(prefix)
-                .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    };
-    if starts(b"<svg") {
-        return true;
-    }
-    if starts(b"<?xml") || starts(b"<!--") || starts(b"<!doctype") {
-        let head = &data[..data.len().min(SVG_SNIFF_BYTES)];
-        return head.windows(4).any(|w| w.eq_ignore_ascii_case(b"<svg"));
-    }
-    false
+    svg_scan::root_is_svg(trim_xml_start(bytes))
 }
 
 /// usvg options: defaults, except that `<image href>` strings are never
-/// resolved against the local file system (web content must not read files).
+/// resolved against the local file system (web content must not read
+/// files) and that nested SVG documents in `data:` URLs must pass the same
+/// structural pre-scan as top-level documents.
 fn svg_options() -> resvg::usvg::Options<'static> {
     let mut options = resvg::usvg::Options::default();
     options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    let default_data = resvg::usvg::ImageHrefResolver::default_data_resolver();
+    options.image_href_resolver.resolve_data = Box::new(move |mime, data, opts| {
+        let raster = matches!(
+            mime,
+            "image/jpg" | "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        );
+        // Everything else may be parsed as a nested SVG document.
+        if raster || structure_ok(trim_xml_start(&data)) {
+            default_data(mime, data, opts)
+        } else {
+            None
+        }
+    });
     options
+}
+
+/// Runs `f` (SVG parsing or rendering) on a scoped worker thread with a
+/// [`SVG_STACK_BYTES`] stack. `None` when the thread cannot be spawned or
+/// `f` panics (the panic is contained like with `catch_unwind`).
+pub(crate) fn with_svg_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("xbro-svg".into())
+            .stack_size(SVG_STACK_BYTES)
+            .spawn_scoped(scope, f)
+            .ok()?
+            .join()
+            .ok()
+    })
 }
 
 /// Strips a UTF-8 BOM and leading whitespace (an XML declaration must
@@ -147,13 +187,13 @@ fn trim_xml_start(bytes: &[u8]) -> &[u8] {
     data
 }
 
+/// Parses SVG bytes after the structural pre-scan.
 fn parse_svg_data(bytes: &[u8]) -> Option<Image> {
-    let bytes = trim_xml_start(bytes);
-    let tree = catch_unwind(AssertUnwindSafe(|| {
-        resvg::usvg::Tree::from_data(bytes, &svg_options()).ok()
-    }))
-    .ok()
-    .flatten()?;
+    let data = trim_xml_start(bytes);
+    if !structure_ok(data) {
+        return None;
+    }
+    let tree = with_svg_stack(|| resvg::usvg::Tree::from_data(data, &svg_options()).ok())??;
     svg_image(tree)
 }
 
@@ -263,6 +303,22 @@ mod tests {
         assert!(!looks_like_svg(b"\x89PNG\r\n"));
         assert!(!looks_like_svg(b""));
         assert!(!looks_like_svg(b"   "));
+        // However long the prolog is.
+        let licensed = format!(
+            "<?xml version='1.0'?>\n<!-- {} -->\n<!DOCTYPE svg [ <!ENTITY a 'b'> ]>\n<svg/>",
+            "license text ".repeat(1000)
+        );
+        assert!(looks_like_svg(licensed.as_bytes()));
+        assert!(looks_like_svg(
+            b"<?xml version='1.0'?><svg:svg xmlns:svg='x'/>"
+        ));
+        // The root element must be `svg`, not merely contain one.
+        assert!(!looks_like_svg(b"<svgx/>"));
+        assert!(!looks_like_svg(
+            b"<?xml version='1.0'?><html><body><svg/></body></html>"
+        ));
+        assert!(!looks_like_svg(b"<?xml version='1.0'?> text <svg/>"));
+        assert!(!looks_like_svg(b"<!-- unterminated"));
     }
 
     #[test]

@@ -1,4 +1,7 @@
-//! TEMPORARY: dumps PNGs for visual inspection.
+//! Visual inspection aid: with `XBRO_DUMP=<dir>` set, renders border
+//! styles, rounded borders, gradients, text with decorations, form
+//! controls and list markers at 1x and 2x into PNGs in `<dir>` (does
+//! nothing otherwise).
 mod common;
 
 use common::*;

@@ -28,7 +28,7 @@ use xbro_style::{
 
 use crate::geom::Size;
 use crate::intrinsic::Intrinsic;
-use crate::{list, table, ControlKind, Pseudo};
+use crate::{list, table, ControlKind, Pseudo, ReplacedSizes};
 
 /// Defensive recursion limit (the parser already limits DOM depth to 256).
 const MAX_BUILD_DEPTH: usize = 1024;
@@ -75,7 +75,8 @@ pub(crate) enum Replaced {
     UrlImage(String),
     /// `<iframe>`, `<video>`, `<canvas>`, `<embed>`, `<object>`, `<audio>`:
     /// an image when the engine has one for the node, else a placeholder.
-    Media { default: Size },
+    /// `keep_ratio`: the default size also defines an aspect ratio (video, canvas).
+    Media { default: Size, keep_ratio: bool },
     /// Form control; its text (value, placeholder, label, selected option)
     /// is the text child.
     Control(Control),
@@ -103,6 +104,19 @@ pub(crate) enum ControlSizing {
     TextArea { cols: f32, rows: f32 },
 }
 
+/// A table column (`<col>`, or a `<colgroup>` without `<col>` children):
+/// how many grid columns it covers and the width hint it gives them.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct ColSpec {
+    /// Number of columns (`span`, clamped to `1..=1000`).
+    pub span: u32,
+    /// The column's computed `width` (from CSS or the `width` attribute).
+    pub width: xbro_style::LengthPercentageAuto,
+}
+
+/// Largest `span` of a column and number of columns described by `<col>`s.
+const MAX_COL_SPAN: u32 = 1000;
+
 /// A node of the box tree.
 #[derive(Debug)]
 pub(crate) struct BoxNode {
@@ -117,12 +131,17 @@ pub(crate) struct BoxNode {
     pub inline_content: bool,
     /// For inline boxes: some descendant is block-level (needs splitting).
     pub has_block_desc: bool,
+    /// Child of a flex (or grid) container: establishes a formatting context.
+    pub flex_item: bool,
     pub children: Vec<BoxNode>,
     /// List item ordinal value (for `display: list-item`).
     pub ordinal: Option<i64>,
     /// Intrinsic (min/max-content) widths of the content box, cached for the
     /// duration of one layout pass.
     pub intrinsic: Cell<Option<Intrinsic>>,
+    /// For tables: the columns declared by `<col>`/`<colgroup>` children
+    /// (which generate no boxes), in order.
+    pub cols: Vec<ColSpec>,
 }
 
 impl BoxNode {
@@ -140,9 +159,11 @@ impl BoxNode {
             inline_level: false,
             inline_content: false,
             has_block_desc: false,
+            flex_item: false,
             children: Vec::new(),
             ordinal: None,
             intrinsic: Cell::new(None),
+            cols: Vec::new(),
         }
     }
 
@@ -180,11 +201,6 @@ impl BoxNode {
             && !matches!(self.kind, Kind::Inline)
     }
 
-    /// Atomic inline-level box (inline-block, inline replaced, inline-flex/table).
-    pub(crate) fn is_atomic_inline(&self) -> bool {
-        self.inline_level && !self.is_text_like() && !matches!(self.kind, Kind::Inline)
-    }
-
     /// Replaced element or control.
     pub(crate) fn is_replaced(&self) -> bool {
         matches!(self.kind, Kind::Replaced(_))
@@ -194,8 +210,12 @@ impl BoxNode {
     fn is_collapsible_whitespace(&self) -> bool {
         match &self.kind {
             Kind::Text(t) => {
-                matches!(self.style.white_space, WhiteSpace::Normal | WhiteSpace::Nowrap)
-                    && t.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C'))
+                matches!(
+                    self.style.white_space,
+                    WhiteSpace::Normal | WhiteSpace::Nowrap
+                ) && t
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C'))
             }
             Kind::Inline => {
                 let s = &self.style;
@@ -215,13 +235,25 @@ impl BoxNode {
 
 /// Builds the box tree for `doc`. Returns `None` when the document element
 /// is missing or not rendered.
-pub(crate) fn build(doc: &Document, styles: &StyleMap) -> Option<BoxNode> {
+pub(crate) fn build(
+    doc: &Document,
+    styles: &StyleMap,
+    replaced: &dyn ReplacedSizes,
+) -> Option<BoxNode> {
     let root = doc.document_element()?;
     let root_style = styles.get(root)?.clone();
-    let builder = Builder { doc, styles };
+    let builder = Builder {
+        doc,
+        styles,
+        replaced,
+    };
     let mut out = Vec::new();
     builder.element(root, None, &mut out, 0);
-    if out.len() == 1 && out.first().is_some_and(|b| !b.inline_level && !b.is_text_like()) {
+    if out.len() == 1
+        && out
+            .first()
+            .is_some_and(|b| !b.inline_level && !b.is_text_like())
+    {
         return out.pop();
     }
     if out.is_empty() {
@@ -237,6 +269,7 @@ pub(crate) fn build(doc: &Document, styles: &StyleMap) -> Option<BoxNode> {
 struct Builder<'a> {
     doc: &'a Document,
     styles: &'a StyleMap,
+    replaced: &'a dyn ReplacedSizes,
 }
 
 impl Builder<'_> {
@@ -283,23 +316,127 @@ impl Builder<'_> {
         let mut children = Vec::new();
         if style.display == Display::ListItem
             && style.list_style_position == ListStylePosition::Inside
-            && style.list_style_image.is_none()
         {
-            if let Some(text) = list::inside_marker_text(style.list_style_type, ordinal.unwrap_or(1))
-            {
-                children.push(BoxNode::new(
-                    Some(el),
-                    None,
-                    style.clone(),
-                    Kind::Text(text.into()),
-                ));
-            }
+            self.inside_marker(el, style, ordinal.unwrap_or(1), &mut children);
         }
         self.pseudo(el, Pseudo::Before, &mut children);
         self.children(el, &mut children, depth + 1);
         self.pseudo(el, Pseudo::After, &mut children);
-        if let Some(b) = make_box(Some(el), None, style.clone(), children, ordinal) {
+        if let Some(mut b) = make_box(Some(el), None, style.clone(), children, ordinal) {
+            if matches!(b.kind, Kind::Table) {
+                b.cols = self.table_columns(el);
+            }
             out.push(b);
+        }
+    }
+
+    /// Columns declared by the `display: table-column(-group)` children of
+    /// table element `el`. A column group with `<col>` children is described
+    /// by them (a `<col>` without width takes the group's); an empty group
+    /// covers `span` columns.
+    fn table_columns(&self, el: NodeId) -> Vec<ColSpec> {
+        let mut out = Vec::new();
+        let mut total = 0u32;
+        let display = |n: NodeId| self.styles.get(n).map(|s| s.display);
+        let span = |n: NodeId| {
+            self.doc
+                .attr(n, "span")
+                .and_then(parse_int)
+                .map_or(1, |v| v.clamp(1, i64::from(MAX_COL_SPAN)) as u32)
+        };
+        let mut push = |out: &mut Vec<ColSpec>, spec: ColSpec| {
+            if total < MAX_COL_SPAN {
+                let span = spec.span.min(MAX_COL_SPAN - total);
+                total += span;
+                out.push(ColSpec { span, ..spec });
+            }
+        };
+        for c in self.doc.element_children(el) {
+            let Some(style) = self.styles.get(c) else {
+                continue;
+            };
+            match style.display {
+                Display::TableColumn => push(
+                    &mut out,
+                    ColSpec {
+                        span: span(c),
+                        width: style.width,
+                    },
+                ),
+                Display::TableColumnGroup => {
+                    let cols: Vec<NodeId> = self
+                        .doc
+                        .element_children(c)
+                        .filter(|&k| display(k) == Some(Display::TableColumn))
+                        .collect();
+                    if cols.is_empty() {
+                        push(
+                            &mut out,
+                            ColSpec {
+                                span: span(c),
+                                width: style.width,
+                            },
+                        );
+                    }
+                    for k in cols {
+                        let width = self
+                            .styles
+                            .get(k)
+                            .map(|s| s.width)
+                            .filter(|w| !w.is_auto())
+                            .unwrap_or(style.width);
+                        push(
+                            &mut out,
+                            ColSpec {
+                                span: span(k),
+                                width,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Inline content of an `inside` list marker: the `list-style-image` when
+    /// its size is known, else the marker text followed by a space.
+    fn inside_marker(
+        &self,
+        el: NodeId,
+        style: &Arc<ComputedStyle>,
+        ordinal: i64,
+        out: &mut Vec<BoxNode>,
+    ) {
+        if let Some(url) = &style.list_style_image {
+            if self.replaced.url_size(url).is_some() {
+                let mut s = ComputedStyle::inherit_from(style);
+                s.display = Display::Inline;
+                let mut img = BoxNode::new(
+                    None,
+                    None,
+                    Arc::new(s),
+                    Kind::Replaced(Replaced::UrlImage(url.to_string())),
+                );
+                img.inline_level = true;
+                out.push(img);
+                out.push(BoxNode::new(
+                    Some(el),
+                    None,
+                    style.clone(),
+                    Kind::Text("\u{A0}".into()),
+                ));
+                return;
+            }
+        }
+        if let Some(text) = list::inside_marker_text(style.list_style_type, ordinal) {
+            out.push(BoxNode::new(
+                Some(el),
+                None,
+                style.clone(),
+                Kind::Text(text.into()),
+            ));
         }
     }
 
@@ -391,11 +528,13 @@ impl Builder<'_> {
                 ContentItem::OpenQuote => "\u{201C}",
                 ContentItem::CloseQuote => "\u{201D}",
                 ContentItem::Image(url) => {
-                    let mut s = (**style).clone();
+                    // An anonymous inline replaced box inside the
+                    // pseudo-element: inherited properties only (the
+                    // pseudo-element's own width etc. size the wrapper).
+                    // `content` carries the URL for the painter.
+                    let mut s = ComputedStyle::inherit_from(style);
                     s.content = Content::Items(vec![ContentItem::Image(url.clone())]);
                     s.display = Display::Inline;
-                    s.float = Float::None;
-                    s.position = xbro_style::Position::Static;
                     let mut img = BoxNode::new(
                         None,
                         Some(which),
@@ -426,14 +565,18 @@ impl Builder<'_> {
 
     /// Classifies replaced elements.
     fn replaced_kind(&self, el: NodeId, name: &str) -> Option<Replaced> {
-        let media = |w: f32, h: f32| Some(Replaced::Media {
-            default: Size::new(w, h),
-        });
+        let media = |w: f32, h: f32, keep_ratio: bool| {
+            Some(Replaced::Media {
+                default: Size::new(w, h),
+                keep_ratio,
+            })
+        };
         match name {
             "img" => Some(Replaced::Image),
             "svg" => Some(Replaced::Svg),
-            "iframe" | "video" | "canvas" | "embed" | "object" => media(300.0, 150.0),
-            "audio" => media(300.0, 54.0),
+            "video" | "canvas" => media(300.0, 150.0, true),
+            "iframe" | "embed" | "object" => media(300.0, 150.0, false),
+            "audio" => media(300.0, 54.0, false),
             "input" => {
                 let ty = self
                     .doc
@@ -450,7 +593,11 @@ impl Builder<'_> {
             "select" => Some(Replaced::Control(Control {
                 kind: ControlKind::Select,
                 sizing: ControlSizing::Select {
-                    options: self.select_options(el).into_iter().map(|(t, _)| t).collect(),
+                    options: self
+                        .select_options(el)
+                        .into_iter()
+                        .map(|(t, _)| t)
+                        .collect(),
                 },
             })),
             "textarea" => {
@@ -644,9 +791,12 @@ impl Builder<'_> {
                         };
                         Some((shown, single_line(None)))
                     }
-                    None => attr("placeholder")
-                        .filter(|p| !p.is_empty())
-                        .map(|p| (p.replace(['\n', '\r'], ""), single_line(Some(PLACEHOLDER_COLOR)))),
+                    None => attr("placeholder").filter(|p| !p.is_empty()).map(|p| {
+                        (
+                            p.replace(['\n', '\r'], ""),
+                            single_line(Some(PLACEHOLDER_COLOR)),
+                        )
+                    }),
                 }
             }
             ControlKind::Button => {
@@ -712,16 +862,13 @@ fn make_box(
         Display::Inline | Display::Contents => {
             let mut b = BoxNode::new(node, pseudo, style.clone(), Kind::Inline);
             b.inline_level = true;
-            b.has_block_desc = children
-                .iter()
-                .any(|c| c.is_block_level() || (matches!(c.kind, Kind::Inline) && c.has_block_desc));
+            b.has_block_desc = children.iter().any(|c| {
+                c.is_block_level() || (matches!(c.kind, Kind::Inline) && c.has_block_desc)
+            });
             b.children = children;
             return Some(b);
         }
-        Display::Block
-        | Display::ListItem
-        | Display::InlineBlock
-        | Display::TableCaption => {
+        Display::Block | Display::ListItem | Display::InlineBlock | Display::TableCaption => {
             let mut b = BoxNode::new(node, pseudo, style.clone(), Kind::Block);
             b.inline_level = display == Display::InlineBlock;
             let kids = finish_block_children(children, &style, &mut b);
@@ -733,6 +880,9 @@ fn make_box(
             b.inline_level = matches!(display, Display::InlineFlex | Display::InlineGrid);
             let flat = split_block_in_inline(children);
             b.children = wrap_inline_runs(flat, &style);
+            for c in &mut b.children {
+                c.flex_item = true;
+            }
             b
         }
         Display::Table | Display::InlineTable => {
@@ -849,12 +999,20 @@ fn split_inline(b: BoxNode, out: &mut Vec<BoxNode>) {
 
 /// Wraps every run of inline-level boxes into an anonymous block box
 /// (runs of collapsible whitespace are dropped). Out-of-flow boxes join the
-/// current run if there is one.
-pub(crate) fn wrap_inline_runs(flat: Vec<BoxNode>, parent_style: &Arc<ComputedStyle>) -> Vec<BoxNode> {
+/// current run if there is one. `text-indent` only applies to an anonymous
+/// block that comes before any block-level sibling (CSS 2.1 §16.1: the
+/// first line of an anonymous block box is only indented if it is the
+/// first child of its parent element).
+pub(crate) fn wrap_inline_runs(
+    flat: Vec<BoxNode>,
+    parent_style: &Arc<ComputedStyle>,
+) -> Vec<BoxNode> {
     let mut anon_style: Option<Arc<ComputedStyle>> = None;
+    let mut unindented_style: Option<Arc<ComputedStyle>> = None;
+    let mut seen_block = false;
     let mut out = Vec::with_capacity(flat.len());
     let mut run: Vec<BoxNode> = Vec::new();
-    let mut flush = |run: &mut Vec<BoxNode>, out: &mut Vec<BoxNode>| {
+    let mut flush = |run: &mut Vec<BoxNode>, out: &mut Vec<BoxNode>, seen_block: bool| {
         if run.is_empty() {
             return;
         }
@@ -865,14 +1023,25 @@ pub(crate) fn wrap_inline_runs(flat: Vec<BoxNode>, parent_style: &Arc<ComputedSt
             out.extend(run.drain(..).filter(BoxNode::is_out_of_flow));
             return;
         }
-        let style = anon_style
-            .get_or_insert_with(|| anonymous_style(parent_style))
-            .clone();
+        let style = if seen_block && !parent_style.text_indent.is_zero() {
+            unindented_style
+                .get_or_insert_with(|| {
+                    let mut s = (*anonymous_style(parent_style)).clone();
+                    s.text_indent = xbro_style::LengthPercentage::ZERO;
+                    Arc::new(s)
+                })
+                .clone()
+        } else {
+            anon_style
+                .get_or_insert_with(|| anonymous_style(parent_style))
+                .clone()
+        };
         out.push(BoxNode::anonymous_block(style, std::mem::take(run)));
     };
     for c in flat {
         if c.is_block_level() {
-            flush(&mut run, &mut out);
+            flush(&mut run, &mut out, seen_block);
+            seen_block = true;
             out.push(c);
         } else if c.is_out_of_flow() && run.is_empty() {
             out.push(c);
@@ -880,7 +1049,7 @@ pub(crate) fn wrap_inline_runs(flat: Vec<BoxNode>, parent_style: &Arc<ComputedSt
             run.push(c);
         }
     }
-    flush(&mut run, &mut out);
+    flush(&mut run, &mut out, seen_block);
     out
 }
 
@@ -939,7 +1108,10 @@ mod tests {
         assert_eq!(parse_int("-3"), Some(-3));
         assert_eq!(parse_int("+7px"), Some(7));
         assert_eq!(parse_int("x"), None);
-        assert_eq!(parse_int("99999999999999999999999"), Some(999_999_999_999_999));
+        assert_eq!(
+            parse_int("99999999999999999999999"),
+            Some(999_999_999_999_999)
+        );
         assert_eq!(parse_positive("0"), None);
         assert_eq!(parse_float("NaN"), None);
         assert_eq!(collapse_ws("  a \n b "), "a b");

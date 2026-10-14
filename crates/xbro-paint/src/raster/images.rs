@@ -1,7 +1,6 @@
 //! Images: scaled replaced content, tiled backgrounds and SVG rendering
 //! (with a bounded cache of rendered SVG pixmaps).
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, Weak};
 
 use tiny_skia::{FilterQuality, Paint, Pixmap, SpreadMode, Transform};
@@ -11,7 +10,7 @@ use xbro_style::{BackgroundRepeat, BackgroundSize, LengthPercentage};
 use super::clip::DevRect;
 use super::Painter;
 use crate::display_list::background_tile;
-use crate::image::Image;
+use crate::image::{with_svg_stack, Image};
 
 /// Largest side of an SVG rendering, in device px (larger destinations
 /// are rendered at this resolution and scaled up).
@@ -72,14 +71,29 @@ fn render_svg_uncached(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Opt
         return None;
     }
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
-    let transform = resvg::tiny_skia::Transform::from_scale(width as f32 / sw, height as f32 / sh);
-    catch_unwind(AssertUnwindSafe(|| {
-        resvg::render(tree, transform, &mut pixmap.as_mut());
-    }))
-    .ok()?;
+    let transform = svg_fit(sw, sh, width as f32, height as f32);
+    // resvg recurses like usvg does: render on the large SVG stack (which
+    // also contains panics).
+    let target = &mut pixmap;
+    with_svg_stack(move || resvg::render(tree, transform, &mut target.as_mut()))?;
     // resvg uses its own tiny-skia version; both store premultiplied RGBA8.
     let size = tiny_skia::IntSize::from_wh(width, height)?;
     Pixmap::from_vec(pixmap.take(), size)
+}
+
+/// Maps an SVG of size `sw` × `sh` into a `w` × `h` viewport the way
+/// browsers draw SVG images with the default `preserveAspectRatio`
+/// (`xMidYMid meet`): uniformly scaled to fit and centred. A mismatch of
+/// less than two pixels (from rounding device sizes) is absorbed by
+/// stretching instead, so no transparent hairline appears at the edges.
+fn svg_fit(sw: f32, sh: f32, w: f32, h: f32) -> resvg::tiny_skia::Transform {
+    let (sx, sy) = (w / sw, h / sh);
+    let s = sx.min(sy);
+    let (cw, ch) = (sw * s, sh * s);
+    if (w - cw).abs() < 2.0 && (h - ch).abs() < 2.0 {
+        return resvg::tiny_skia::Transform::from_scale(sx, sy);
+    }
+    resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, (w - cw) / 2.0, (h - ch) / 2.0)
 }
 
 /// Pixel size at which to render an SVG drawn into `w` × `h` device px.
@@ -295,6 +309,21 @@ mod tests {
         let (w, h) = svg_render_size(100_000.0, 50_000.0).unwrap();
         assert!(w <= 4096 && h <= 4096 && (w as f32 * h as f32) <= MAX_SVG_AREA);
         assert_eq!(svg_render_size(0.2, 0.2), Some((1, 1)));
+    }
+
+    #[test]
+    fn svg_fitting() {
+        // Same aspect ratio (or within a pixel): plain scaling.
+        let t = svg_fit(20.0, 10.0, 40.0, 20.0);
+        assert_eq!((t.sx, t.sy, t.tx, t.ty), (2.0, 2.0, 0.0, 0.0));
+        let t = svg_fit(20.0, 10.0, 41.0, 20.0);
+        assert_eq!((t.sx, t.sy), (2.05, 2.0));
+        // Taller viewport: fit the width, centre vertically.
+        let t = svg_fit(20.0, 10.0, 20.0, 20.0);
+        assert_eq!((t.sx, t.sy, t.tx, t.ty), (1.0, 1.0, 0.0, 5.0));
+        // Wider viewport: fit the height, centre horizontally.
+        let t = svg_fit(10.0, 10.0, 30.0, 10.0);
+        assert_eq!((t.sx, t.sy, t.tx, t.ty), (1.0, 1.0, 10.0, 0.0));
     }
 
     #[test]

@@ -101,23 +101,24 @@ pub(crate) fn draw_run(p: &mut Painter<'_>, run: &GlyphRun) {
         return;
     }
     let (ox, oy) = p.to_dev_point(run.origin);
-    // Generous ink bounds: accents, descenders and fallback glyphs overflow the em box.
+    // Cheap vertical culling first (most off-screen runs of a long page are
+    // above or below the area): the width below walks every glyph.
+    let area = p.area();
+    if oy - 2.0 * size >= area.y1 || oy + size <= area.y0 {
+        return;
+    }
+    // Generous ink bounds: accents, descenders and fallback glyphs overflow
+    // the em box. Blending is restricted to them (they are the dirty region).
     let width = run.width() * scale;
-    let bounds = DevRect::new(
-        ox - size,
-        oy - 1.5 * size,
-        ox + width + size,
-        oy + 0.75 * size,
-    );
+    let bounds = DevRect::new(ox - size, oy - 2.0 * size, ox + width + size, oy + size);
     let Some((visible, mask)) = p.rect_clip(bounds) else {
         return;
     };
-    let clip_rect = p.clip().rect.intersect(&p.area());
     let clip = IntClip {
-        x0: clip_rect.x0.round() as i32,
-        y0: clip_rect.y0.round() as i32,
-        x1: clip_rect.x1.round() as i32,
-        y1: clip_rect.y1.round() as i32,
+        x0: visible.x0.round() as i32,
+        y0: visible.y0.round() as i32,
+        x1: visible.x1.round() as i32,
+        y1: visible.y1.round() as i32,
     };
     let fonts = p.fonts();
     let (area_w, _) = p.size();
@@ -140,8 +141,8 @@ pub(crate) fn draw_run(p: &mut Painter<'_>, run: &GlyphRun) {
             data,
             area_w,
             &bitmap,
-            floor as i32 + bitmap.left,
-            baseline + bitmap.top,
+            (floor as i32).saturating_add(bitmap.left),
+            baseline.saturating_add(bitmap.top),
             run.color,
             clip,
             mask.as_deref(),

@@ -1,7 +1,6 @@
-//! End-to-end tests: HTML → style → layout → display list → pixels.
-//!
-//! They depend on `xbro-layout` being implemented and are ignored by
-//! default: `cargo test -p xbro-paint --test end_to_end -- --ignored`.
+//! End-to-end tests: HTML → style → layout → display list → pixels, with
+//! the system fonts. Assertions are deliberately loose (colors at a few
+//! positions, amounts of ink) so they hold whatever fonts are installed.
 //! Set `XBRO_DUMP=<dir>` to also write the fixture renderings as PNGs.
 
 mod common;
@@ -101,7 +100,6 @@ fn render_html(html: &str, width: u32, height: u32) -> Rendered {
 }
 
 #[test]
-#[ignore = "requires xbro-layout"]
 fn colored_blocks() {
     let r = render_html(
         r#"<body style="margin:0"><div style="background:red;width:100px;height:50px"></div>
@@ -116,7 +114,6 @@ fn colored_blocks() {
 }
 
 #[test]
-#[ignore = "requires xbro-layout"]
 fn body_background_fills_canvas() {
     let r = render_html(
         r#"<body style="background:#ff0000;margin:0;height:10px"></body>"#,
@@ -128,7 +125,6 @@ fn body_background_fills_canvas() {
 }
 
 #[test]
-#[ignore = "requires xbro-layout"]
 fn text_and_links() {
     let r = render_html(
         r#"<body style="margin:0;font:20px sans-serif"><p style="margin:0">Hello <a href="x">link</a></p></body>"#,
@@ -148,7 +144,6 @@ fn text_and_links() {
 }
 
 #[test]
-#[ignore = "requires xbro-layout"]
 fn z_index_and_overflow() {
     let r = render_html(
         r#"<body style="margin:0">
@@ -168,7 +163,6 @@ fn z_index_and_overflow() {
 }
 
 #[test]
-#[ignore = "requires xbro-layout"]
 fn form_controls_render() {
     let r = render_html(
         r#"<body style="margin:0"><input type=checkbox checked style="margin:0"> <input value="text"></body>"#,
@@ -183,7 +177,6 @@ fn form_controls_render() {
 }
 
 #[test]
-#[ignore = "requires xbro-layout"]
 fn fixtures_render() {
     let dump = std::env::var("XBRO_DUMP").ok();
     for name in [
@@ -220,4 +213,88 @@ fn fixtures_render() {
         }
         let _ = (&r.tree, rgb(WHITE));
     }
+}
+
+#[test]
+fn fixtures_at_any_scroll_scale_and_offset() {
+    let fonts = system_fonts();
+    for name in ["wiki.html", "layout.html", "modern.html"] {
+        let html = std::fs::read_to_string(fixtures_dir().join(name)).expect("fixture");
+        let r = render_html(&html, 800, 600);
+        let doc_h = r.tree.document_size.height;
+        assert!(doc_h.is_finite() && doc_h >= 600.0, "{name}: {doc_h}");
+        for (scroll_y, scale, offset) in [
+            (0.0, 1.5, (0, 0)),
+            (doc_h / 2.0, 1.0, (0, 40)),
+            (doc_h - 600.0, 2.0, (-10, 0)),
+            (doc_h + 1000.0, 1.0, (0, 0)),
+            (-500.0, 0.5, (5, 5)),
+        ] {
+            let mut target = tiny_skia::Pixmap::new(400, 300).expect("pixmap");
+            let options = RasterOptions {
+                scroll: xbro_layout::Point::new(0.0, scroll_y),
+                scale,
+                offset,
+                height: Some(250),
+            };
+            rasterize(&r.list, fonts, &NoImageProvider, &mut target, &options);
+            // Rows below the drawing band are untouched (transparent).
+            let below = 40u32.max(offset.1.max(0) as u32 + 250);
+            if below < 300 {
+                assert_eq!(px(&target, 10, below).3, 0, "{name}: drew outside the band");
+            }
+        }
+    }
+}
+
+#[test]
+fn display_list_build_is_fast() {
+    let html = std::fs::read_to_string(fixtures_dir().join("wiki.html")).expect("fixture");
+    let r = render_html(&html, 1280, 800);
+    let start = std::time::Instant::now();
+    let list = build_display_list_full(&r.tree, system_fonts(), &NoImageProvider);
+    let elapsed = start.elapsed();
+    assert_eq!(list, r.list, "deterministic");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "display list built in {elapsed:?}"
+    );
+}
+
+#[test]
+fn hostile_nesting_stays_bounded() {
+    // 300 nested stacking contexts with translucency and rounded clips:
+    // layers are capped, clip chains stay cheap, nothing overflows.
+    let mut html = String::from("<body style='margin:0'>");
+    for i in 0..300 {
+        html.push_str(&format!(
+            "<div style='position:relative;z-index:{};opacity:.99;overflow:hidden;\
+             border-radius:{}px;padding:1px;background:rgb({},{},200)'>",
+            i % 3,
+            i % 7,
+            i % 256,
+            (i * 7) % 256
+        ));
+    }
+    html.push_str("deep text");
+    html.push_str(&"</div>".repeat(300));
+    let start = std::time::Instant::now();
+    let r = std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || {
+            let r = render_html(&html, 400, 300);
+            (
+                r.list.items.len(),
+                dark_pixels(&r.pixmap, 0, 0, 400, 300, 250),
+            )
+        })
+        .expect("thread")
+        .join()
+        .expect("no panic or overflow");
+    assert!(r.0 > 0);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
 }

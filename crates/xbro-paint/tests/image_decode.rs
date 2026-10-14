@@ -237,6 +237,49 @@ fn huge_headers_are_rejected_without_allocating() {
     assert!(Image::decode(&gif, None).is_none());
 }
 
+/// An SVG document whose elements nest `depth` levels deep (`<svg>` included).
+fn nested_svg(depth: usize) -> String {
+    let mut s = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#);
+    s.push_str(&"<g>".repeat(depth.saturating_sub(1)));
+    s.push_str(r#"<rect width="10" height="10" fill="red"/>"#);
+    s.push_str(&"</g>".repeat(depth.saturating_sub(1)));
+    s.push_str("</svg>");
+    s
+}
+
+#[test]
+fn deeply_nested_svg_is_rejected_without_overflowing_the_stack() {
+    // Image loaders run on ordinary threads (2 MiB stacks): usvg would
+    // overflow them (aborting the process) on a few thousand levels.
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            assert!(Image::decode(nested_svg(100_000).as_bytes(), None).is_none());
+            assert!(Image::decode(nested_svg(257).as_bytes(), Some("image/svg+xml")).is_none());
+            assert!(Image::from_svg_str(&nested_svg(5_000)).is_none());
+            let ok = Image::decode(nested_svg(256).as_bytes(), None).expect("256 levels");
+            assert_eq!(ok.natural_size(), Size::new(10.0, 10.0));
+            assert!(Image::from_svg_str(&nested_svg(256)).is_some());
+            // Entities declaring markup could rebuild deep trees: rejected.
+            let entity = r#"<!DOCTYPE svg [ <!ENTITY a "<g></g>"> ]>
+                <svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">&a;</svg>"#;
+            assert!(Image::decode(entity.as_bytes(), None).is_none());
+        })
+        .expect("thread")
+        .join()
+        .expect("no stack overflow");
+}
+
+#[test]
+fn gzip_data_is_not_decoded() {
+    // `.svgz` is unsupported: gzip bytes are rejected whatever the hint.
+    let gz = [
+        0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    assert!(Image::decode(&gz, Some("image/svg+xml")).is_none());
+    assert!(Image::decode(&gz, None).is_none());
+}
+
 #[test]
 fn largest_side_limit_is_inclusive() {
     let wide = RgbaImage::from_pixel(16_384, 1, Rgba([1, 2, 3, 255]));

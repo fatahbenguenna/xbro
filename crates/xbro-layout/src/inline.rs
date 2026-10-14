@@ -32,9 +32,7 @@ use crate::float::FloatContext;
 use crate::geom::{Edges, Point, Rect};
 use crate::intrinsic::Intrinsic;
 use crate::sizing::{box_edges, lp, sane, sane_size, EPSILON};
-use crate::text::{
-    continues_word, is_break_after_dash, is_cjk, is_cjk_closing, push_transformed,
-};
+use crate::text::{continues_word, is_break_after_dash, is_cjk, is_cjk_closing, push_transformed};
 use crate::{Fragment, InlineBoxFragment, LayoutBox, LineBox, TextFragment};
 
 /// Parent index meaning "the root inline box" (the IFC container).
@@ -64,6 +62,13 @@ pub(crate) struct InlineBoxInfo<'t> {
     pub padding: Edges,
     pub border: Edges,
     pub margin: Edges,
+    /// Cumulative `position: relative` offset of the box (its own plus its
+    /// inline ancestors'), applied to its fragments and content.
+    pub rel: (f32, f32),
+    /// Nearest positioned inline box among this box and its inline
+    /// ancestors (or [`NO_BOX`]): the containing block of absolutely
+    /// positioned boxes in its content (CSS 2.1 §10.1, item 4).
+    pub cb_box: u32,
 }
 
 impl InlineBoxInfo<'_> {
@@ -80,7 +85,11 @@ impl InlineBoxInfo<'_> {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum ItemKind {
     /// A word (no spaces) of `run`, bytes `start..end` of its text.
-    Word { run: u32, start: u32, end: u32 },
+    Word {
+        run: u32,
+        start: u32,
+        end: u32,
+    },
     /// One collapsible space, or a sequence of preserved spaces.
     Space {
         run: u32,
@@ -89,9 +98,15 @@ pub(crate) enum ItemKind {
         collapsible: bool,
     },
     /// A preserved tab (width computed from tab stops at line time).
-    Tab { run: u32, start: u32, end: u32 },
+    Tab {
+        run: u32,
+        start: u32,
+        end: u32,
+    },
     /// Forced line break (`<br>` or a preserved newline).
-    Break { clear: Clear },
+    Break {
+        clear: Clear,
+    },
     /// Start / end of inline box `i` (width = left / right margin+border+padding).
     Open(u32),
     Close(u32),
@@ -130,7 +145,11 @@ pub(crate) struct Items<'t> {
 /// Collects the inline content of `root` (a block container whose children
 /// are inline-level). `cb_width` resolves percentage margins/padding of
 /// inline boxes.
-pub(crate) fn collect_items<'t>(cx: &mut LayoutCx<'t>, root: &'t BoxNode, cb_width: f32) -> Items<'t> {
+pub(crate) fn collect_items<'t>(
+    cx: &mut LayoutCx<'t>,
+    root: &'t BoxNode,
+    cb_width: f32,
+) -> Items<'t> {
     let mut c = Collector {
         cx,
         out: Items::default(),
@@ -153,7 +172,8 @@ struct Collector<'c, 't> {
 }
 
 impl<'t> Collector<'_, 't> {
-    fn push(&mut self, kind: ItemKind, width: f32, parent: u32) -> &mut Item {
+    /// Appends an item; the returned handle sets its break flags.
+    fn push(&mut self, kind: ItemKind, width: f32, parent: u32) -> ItemFlags<'_> {
         self.out.items.push(Item {
             kind,
             width,
@@ -162,8 +182,7 @@ impl<'t> Collector<'_, 't> {
             shy: false,
             parent,
         });
-        let last = self.out.items.len() - 1;
-        &mut self.out.items[last]
+        ItemFlags(self.out.items.last_mut())
     }
 
     fn children(&mut self, kids: &'t [BoxNode], parent: u32, ws: WhiteSpace, depth: usize) {
@@ -202,6 +221,24 @@ impl<'t> Collector<'_, 't> {
                     let font = self.cx.font(&k.style);
                     let left = edges.margin.left + edges.border.left + edges.padding.left;
                     let right = edges.margin.right + edges.border.right + edges.padding.right;
+                    let own = crate::position::relative_offset(
+                        &k.style,
+                        Cb {
+                            x: 0.0,
+                            width: self.cb_width,
+                            height: None,
+                        },
+                    );
+                    let (up, up_cb) = self
+                        .out
+                        .boxes
+                        .get(parent as usize)
+                        .map_or(((0.0, 0.0), NO_BOX), |p| (p.rel, p.cb_box));
+                    let cb_box = if k.style.position.is_positioned() {
+                        idx
+                    } else {
+                        up_cb
+                    };
                     self.out.boxes.push(InlineBoxInfo {
                         b: k,
                         parent,
@@ -209,6 +246,8 @@ impl<'t> Collector<'_, 't> {
                         padding: edges.padding,
                         border: edges.border,
                         margin: edges.margin,
+                        rel: (own.0 + up.0, own.1 + up.1),
+                        cb_box,
                     });
                     self.push(ItemKind::Open(idx), left, parent);
                     self.children(&k.children, idx, k.style.white_space, depth + 1);
@@ -218,9 +257,9 @@ impl<'t> Collector<'_, 't> {
                     let idx = self.out.atomics.len() as u32;
                     self.out.atomics.push(k);
                     let wraps = ws.wraps();
-                    let item = self.push(ItemKind::Atomic(idx), 0.0, parent);
-                    item.break_before = wraps;
-                    item.break_after = wraps;
+                    self.push(ItemKind::Atomic(idx), 0.0, parent)
+                        .before(wraps)
+                        .after(wraps);
                     self.prev_space = false;
                     self.prev_word = false;
                 }
@@ -267,7 +306,7 @@ impl<'t> Collector<'_, 't> {
                     if !self.prev_space {
                         let start = seg.text.len() as u32;
                         seg.text.push(' ');
-                        let item = self.push(
+                        self.push(
                             ItemKind::Space {
                                 run,
                                 start,
@@ -276,8 +315,8 @@ impl<'t> Collector<'_, 't> {
                             },
                             space_width,
                             parent,
-                        );
-                        item.break_after = wraps;
+                        )
+                        .after(wraps);
                         self.prev_space = true;
                     }
                     self.prev_word = false;
@@ -287,7 +326,7 @@ impl<'t> Collector<'_, 't> {
                     seg.flush_word(self, false, false);
                     let start = seg.text.len() as u32;
                     seg.text.push('\t');
-                    let item = self.push(
+                    self.push(
                         ItemKind::Tab {
                             run,
                             start,
@@ -295,8 +334,8 @@ impl<'t> Collector<'_, 't> {
                         },
                         0.0,
                         parent,
-                    );
-                    item.break_after = wraps;
+                    )
+                    .after(wraps);
                     self.prev_space = false;
                     self.prev_word = false;
                 }
@@ -327,7 +366,7 @@ impl<'t> Collector<'_, 't> {
                             _ => false,
                         };
                     if !merged {
-                        let item = self.push(
+                        self.push(
                             ItemKind::Space {
                                 run,
                                 start,
@@ -336,8 +375,8 @@ impl<'t> Collector<'_, 't> {
                             },
                             space_width,
                             parent,
-                        );
-                        item.break_after = wraps;
+                        )
+                        .after(wraps);
                     }
                     self.prev_space = false;
                     self.prev_word = false;
@@ -358,14 +397,13 @@ impl<'t> Collector<'_, 't> {
                     }
                     push_transformed(&mut seg.text, c, tt, !self.prev_word);
                     let next = chars.peek().copied();
-                    if cjk && !next.is_some_and(is_cjk_closing) {
-                        seg.flush_word(self, true, false);
-                    } else if wraps
+                    let cjk_break = cjk && !next.is_some_and(is_cjk_closing);
+                    let dash_break = wraps
                         && is_break_after_dash(c)
                         && (c != '-'
                             || (prev_char.is_alphanumeric()
-                                && next.is_some_and(|n| n.is_alphabetic())))
-                    {
+                                && next.is_some_and(|n| n.is_alphabetic())));
+                    if cjk_break || dash_break {
                         seg.flush_word(self, true, false);
                     }
                     self.prev_word = continues_word(c);
@@ -388,6 +426,32 @@ impl<'t> Collector<'_, 't> {
     }
 }
 
+/// Handle on a just-pushed [`Item`] to set its flags.
+struct ItemFlags<'a>(Option<&'a mut Item>);
+
+impl ItemFlags<'_> {
+    fn after(mut self, v: bool) -> Self {
+        if let Some(it) = self.0.as_deref_mut() {
+            it.break_after = v;
+        }
+        self
+    }
+
+    fn before(mut self, v: bool) -> Self {
+        if let Some(it) = self.0.as_deref_mut() {
+            it.break_before = v;
+        }
+        self
+    }
+
+    fn shy(mut self, v: bool) -> Self {
+        if let Some(it) = self.0.as_deref_mut() {
+            it.shy = v;
+        }
+        self
+    }
+}
+
 /// Word accumulation state for one run.
 struct Segmenter {
     text: String,
@@ -407,10 +471,9 @@ impl Segmenter {
         match self.word_start.take() {
             Some(start) if start < self.text.len() => {
                 let word = self.text.get(start..).unwrap_or("");
-                let w = c
-                    .cx
-                    .measure(self.font.id, self.font.size, word, self.ls, self.wsp);
-                let item = c.push(
+                let w =
+                    c.cx.measure(self.font.id, self.font.size, word, self.ls, self.wsp);
+                c.push(
                     ItemKind::Word {
                         run: self.run,
                         start: start as u32,
@@ -418,9 +481,9 @@ impl Segmenter {
                     },
                     w,
                     self.parent,
-                );
-                item.break_after = break_after;
-                item.shy = shy;
+                )
+                .after(break_after)
+                .shy(shy);
             }
             _ => {
                 if break_after {
@@ -443,7 +506,7 @@ pub(crate) struct AtomicBox {
     /// Baseline offset from the margin box top.
     pub baseline: f32,
     /// Range of pending absolutely positioned boxes registered during its layout.
-    pub pending: (usize, usize),
+    pub pending: (u64, u64),
 }
 
 /// Result of laying out an inline formatting context.
@@ -487,7 +550,6 @@ enum Scan {
 /// Per-line vertical alignment node (root, inline box or atomic).
 #[derive(Copy, Clone, Debug)]
 struct VNode {
-    parent: usize,
     /// Index of the top/bottom-aligned node this one moves with (0 = root group).
     group: usize,
     /// Baseline relative to the group's baseline (y down).
@@ -538,6 +600,8 @@ pub(crate) fn layout_ifc<'t>(
         vindex: vec![u32::MAX; box_count],
         open: Vec::new(),
         tail_start: tail_start(&items),
+        inline_cbs: vec![None; box_count],
+        inline_abs: Vec::new(),
     };
     ifc.run(y)
 }
@@ -581,6 +645,12 @@ struct Ifc<'c, 't> {
     /// Inline boxes open at the start of the current line.
     open: Vec<u32>,
     tail_start: usize,
+    /// Padding boxes of the first and last fragments of each positioned
+    /// inline box (containing blocks of absolutely positioned content).
+    inline_cbs: Vec<Option<(Rect, Rect)>>,
+    /// Absolutely positioned boxes whose containing block is a positioned
+    /// inline box of this context: (inline box, box, static position).
+    inline_abs: Vec<(u32, &'t BoxNode, Point)>,
 }
 
 impl<'t> Ifc<'_, 't> {
@@ -594,7 +664,15 @@ impl<'t> Ifc<'_, 't> {
         let mut pos = Cursor { item: 0, offset: 0 };
         let mut first_line = true;
         let mut guard = 0usize;
-        let limit = self.items.items.len().saturating_mul(4).saturating_add(64);
+        let mut retries = 0usize;
+        // Every line consumes at least one item or one byte of a word.
+        let text_len: usize = self.items.runs.iter().map(|r| r.text.len()).sum();
+        let limit = self
+            .items
+            .items
+            .len()
+            .saturating_add(text_len)
+            .saturating_add(64);
         while pos.item < self.items.items.len() {
             guard += 1;
             if guard > limit {
@@ -602,9 +680,13 @@ impl<'t> Ifc<'_, 't> {
             }
             match self.scan(pos, y, first_line) {
                 Scan::Retry => {
+                    // Each retry moves below at least one float: bounded by
+                    // the number of floats, not by the line budget.
+                    guard -= 1;
+                    retries += 1;
                     let h = self.strut_height();
                     match self.floats.next_bottom(y, h) {
-                        Some(ny) if ny > y => y = ny,
+                        Some(ny) if ny > y && retries <= self.floats.len() + 1 => y = ny,
                         _ => {
                             // Cannot move further down: lay out as is.
                             if let Scan::Line {
@@ -633,7 +715,8 @@ impl<'t> Ifc<'_, 't> {
                     forced,
                     shy_end,
                 } => {
-                    if let Some(l) = self.build_line(&pieces, y, first_line, next, forced, shy_end) {
+                    if let Some(l) = self.build_line(&pieces, y, first_line, next, forced, shy_end)
+                    {
                         y = l.rect.bottom();
                         lines.push(l);
                         first_line = false;
@@ -657,13 +740,90 @@ impl<'t> Ifc<'_, 't> {
             let lb = self.cx.place_float(f, self.floats, y, self.cb);
             self.out_floats.push(lb);
         }
+        self.layout_inline_abspos();
+        // `y` is below the last line, and below the floats a final `<br
+        // clear>` cleared: the content (and the container's auto height)
+        // extends down to there, like browsers do.
         let height = lines
             .last()
-            .map_or(0.0, |l| sane_size(l.rect.bottom() - start_y));
+            .map_or(0.0, |l| sane_size(l.rect.bottom().max(y) - start_y));
         IfcOutput {
             lines,
             floats: std::mem::take(&mut self.out_floats),
             height,
+        }
+    }
+
+    /// Lays out the absolutely positioned boxes whose containing block is a
+    /// positioned inline box, now that its fragments are known: the bounding
+    /// box of the padding boxes of its first and last fragments. They become
+    /// children of the container (like floats). A box whose inline box got
+    /// no fragment waits for the enclosing containing block instead.
+    fn layout_inline_abspos(&mut self) {
+        for (ib, b, static_pos) in std::mem::take(&mut self.inline_abs) {
+            match self.inline_cbs.get(ib as usize).copied().flatten() {
+                Some((first, last)) => {
+                    let cbr = first.union(&last);
+                    let cbr = if cbr.is_empty() {
+                        // A zero-size fragment still anchors its content.
+                        Rect::new(
+                            first.x.min(last.x),
+                            first.y.min(last.y),
+                            sane_size(first.right().max(last.right()) - first.x.min(last.x)),
+                            sane_size(first.bottom().max(last.bottom()) - first.y.min(last.y)),
+                        )
+                    } else {
+                        cbr
+                    };
+                    let p = crate::cx::PendingAbs {
+                        b,
+                        static_pos,
+                        cb: crate::cx::AbsCb::Icb,
+                        seq: 0,
+                    };
+                    let lb = self.cx.layout_abspos(p, cbr);
+                    self.out_floats.push(lb);
+                }
+                None => self.cx.register_abs(b, static_pos),
+            }
+        }
+    }
+
+    /// Registers absolutely positioned box `a` (an inline-content item with
+    /// enclosing inline box `parent`) at its static position: with its
+    /// positioned inline ancestor, if any, else with the layout context.
+    fn register_inline_abs(&mut self, a: u32, parent: u32, at: Point) {
+        let Some(&ab) = self.items.abspos.get(a as usize) else {
+            return;
+        };
+        let cb_box = self
+            .items
+            .boxes
+            .get(parent as usize)
+            .map_or(NO_BOX, |ib| ib.cb_box);
+        if cb_box != NO_BOX && ab.style.position == xbro_style::Position::Absolute {
+            self.inline_abs.push((cb_box, ab, at));
+        } else {
+            self.cx.register_abs(ab, at);
+        }
+    }
+
+    /// Records the padding box of a fragment of positioned inline box `b`.
+    fn note_inline_cb(&mut self, b: u32, f: &InlineBoxFragment) {
+        let positioned = self
+            .items
+            .boxes
+            .get(b as usize)
+            .is_some_and(|ib| ib.b.style.position.is_positioned());
+        if !positioned {
+            return;
+        }
+        let pad = f.rect.inset(f.border);
+        if let Some(slot) = self.inline_cbs.get_mut(b as usize) {
+            *slot = Some(match *slot {
+                Some((first, _)) => (first, pad),
+                None => (pad, pad),
+            });
         }
     }
 
@@ -693,12 +853,9 @@ impl<'t> Ifc<'_, 't> {
     }
 
     fn line_space(&self, y: f32, first_line: bool) -> (f32, f32, f32) {
-        let (l, r) = self.floats.available(
-            y,
-            self.strut_height(),
-            self.cb.x,
-            self.cb.x + self.cb.width,
-        );
+        let (l, r) =
+            self.floats
+                .available(y, self.strut_height(), self.cb.x, self.cb.x + self.cb.width);
         let indent = if first_line { self.indent } else { 0.0 };
         (l, r, sane_size(r - l - indent))
     }
@@ -720,7 +877,14 @@ impl<'t> Ifc<'_, 't> {
 
     /// Largest char boundary `split` in `start..end` such that the prefix fits
     /// in `space` (at least one char when `at_least_one`).
-    fn split_word(&mut self, run: u32, start: u32, end: u32, space: f32, at_least_one: bool) -> Option<(u32, f32)> {
+    fn split_word(
+        &mut self,
+        run: u32,
+        start: u32,
+        end: u32,
+        space: f32,
+        at_least_one: bool,
+    ) -> Option<(u32, f32)> {
         let r = self.items.runs.get(run as usize)?;
         let s = r.text.get(start as usize..end as usize)?;
         let (font, size, ls, wsp) = (r.font.id, r.font.size, r.letter_spacing, r.word_spacing);
@@ -728,7 +892,9 @@ impl<'t> Ifc<'_, 't> {
         let mut best: Option<(u32, f32)> = None;
         let mut buf = [0u8; 4];
         for (i, ch) in s.char_indices() {
-            let cw = self.cx.measure(font, size, ch.encode_utf8(&mut buf), ls, wsp);
+            let cw = self
+                .cx
+                .measure(font, size, ch.encode_utf8(&mut buf), ls, wsp);
             let end_i = (i + ch.len_utf8()) as u32;
             if acc + cw > space + EPSILON {
                 if best.is_none() && at_least_one {
@@ -743,8 +909,7 @@ impl<'t> Ifc<'_, 't> {
     }
 
     fn scan_impl(&mut self, start: Cursor, y: f32, first_line: bool, allow_retry: bool) -> Scan {
-        let (mut left, mut right, mut avail) = self.line_space(y, first_line);
-        let _ = (&mut left, &mut right);
+        let (_, _, mut avail) = self.line_space(y, first_line);
         let strut = self.strut_height();
         let narrows = |fc: &FloatContext, cb: Cb| fc.narrows(y, strut, cb.x, cb.x + cb.width);
         let mut pieces: Vec<Piece> = Vec::new();
@@ -762,27 +927,69 @@ impl<'t> Ifc<'_, 't> {
                 } if !has_content => {}
                 ItemKind::Word { run, start: s, end } => {
                     let s2 = s.saturating_add(offset).min(end);
-                    let w = if offset == 0 {
-                        item.width
-                    } else {
-                        self.measure_range(run, s2, end)
-                    };
                     let anywhere = self.run_of(run).is_some_and(|r| r.break_anywhere);
-                    if width + w > avail + EPSILON {
-                        if has_content {
-                            if let Some((n, cur, shy)) = last_break {
-                                pieces.truncate(n);
-                                return Scan::Line {
-                                    pieces,
-                                    next: cur,
-                                    forced: None,
-                                    shy_end: shy,
-                                };
-                            }
-                            if anywhere {
-                                if let Some((split, sw)) =
-                                    self.split_word(run, s2, end, avail - width, false)
-                                {
+                    let room = avail - width;
+                    // Width of the (rest of the) word, `None` when it does not fit.
+                    let fit = if offset == 0 {
+                        (item.width <= room + EPSILON).then_some(item.width)
+                    } else {
+                        // Rest of a word split by `break_anywhere`: measure only
+                        // what fits, so long words stay linear.
+                        match self.split_word(run, s2, end, room, false) {
+                            Some((split, sw)) if split >= end => Some(sw),
+                            _ => None,
+                        }
+                    };
+                    let w = match fit {
+                        Some(w) => w,
+                        None => {
+                            let split_at = |cx: &mut Self, at_least_one: bool| {
+                                if anywhere {
+                                    cx.split_word(run, s2, end, room, at_least_one)
+                                } else {
+                                    None
+                                }
+                            };
+                            if has_content {
+                                if let Some((n, cur, shy)) = last_break {
+                                    pieces.truncate(n);
+                                    return Scan::Line {
+                                        pieces,
+                                        next: cur,
+                                        forced: None,
+                                        shy_end: shy,
+                                    };
+                                }
+                                if anywhere {
+                                    // Break inside the word, or before it when
+                                    // nothing of it fits.
+                                    let next = match split_at(self, false) {
+                                        Some((split, sw)) if split < end => {
+                                            pieces.push(Piece {
+                                                item: i,
+                                                start: s2,
+                                                end: split,
+                                                width: sw,
+                                            });
+                                            Cursor {
+                                                item: i,
+                                                offset: split - s,
+                                            }
+                                        }
+                                        _ => Cursor { item: i, offset },
+                                    };
+                                    return Scan::Line {
+                                        pieces,
+                                        next,
+                                        forced: None,
+                                        shy_end: false,
+                                    };
+                                }
+                            } else {
+                                if allow_retry && narrows(self.floats, self.cb) {
+                                    return Scan::Retry;
+                                }
+                                if let Some((split, sw)) = split_at(self, true) {
                                     if split < end {
                                         pieces.push(Piece {
                                             item: i,
@@ -802,35 +1009,14 @@ impl<'t> Ifc<'_, 't> {
                                     }
                                 }
                             }
-                        } else {
-                            if allow_retry && narrows(self.floats, self.cb) {
-                                return Scan::Retry;
-                            }
-                            if anywhere {
-                                if let Some((split, sw)) =
-                                    self.split_word(run, s2, end, avail - width, true)
-                                {
-                                    if split < end {
-                                        pieces.push(Piece {
-                                            item: i,
-                                            start: s2,
-                                            end: split,
-                                            width: sw,
-                                        });
-                                        return Scan::Line {
-                                            pieces,
-                                            next: Cursor {
-                                                item: i,
-                                                offset: split - s,
-                                            },
-                                            forced: None,
-                                            shy_end: false,
-                                        };
-                                    }
-                                }
+                            // Unbreakable: the word overflows the line.
+                            if offset == 0 {
+                                item.width
+                            } else {
+                                self.measure_range(run, s2, end)
                             }
                         }
-                    }
+                    };
                     pieces.push(Piece {
                         item: i,
                         start: s2,
@@ -1009,10 +1195,7 @@ impl<'t> Ifc<'_, 't> {
                             {
                                 let lb = self.cx.place_float(laid, self.floats, y, self.cb);
                                 self.out_floats.push(lb);
-                                let (l, r, a) = self.line_space(y, first_line);
-                                left = l;
-                                right = r;
-                                avail = a;
+                                avail = self.line_space(y, first_line).2;
                             } else {
                                 self.deferred.push(laid);
                             }
@@ -1073,7 +1256,9 @@ impl<'t> Ifc<'_, 't> {
         for (k, p) in pieces.iter().enumerate().rev() {
             match kind_of(p) {
                 Some(ItemKind::Close(_) | ItemKind::Abspos(_) | ItemKind::Break { .. }) => {}
-                Some(ItemKind::Space { collapsible, run, .. }) => {
+                Some(ItemKind::Space {
+                    collapsible, run, ..
+                }) => {
                     let run_wraps = self
                         .run_of(run)
                         .map_or(ws_wraps, |r| r.style.white_space.wraps());
@@ -1117,9 +1302,8 @@ impl<'t> Ifc<'_, 't> {
                     Some(ItemKind::Open(b)) => self.open.push(b),
                     Some(ItemKind::Close(b)) => self.close_box(b),
                     Some(ItemKind::Abspos(a)) => {
-                        if let Some(&ab) = items.abspos.get(a as usize) {
-                            self.cx.register_abs(ab, Point::new(left + indent, y));
-                        }
+                        let parent = items.items.get(p.item).map_or(NO_BOX, |it| it.parent);
+                        self.register_inline_abs(a, parent, Point::new(left + indent, y));
                     }
                     _ => {}
                 }
@@ -1134,7 +1318,11 @@ impl<'t> Ifc<'_, 't> {
             .filter(|(_, &k)| k)
             .map(|(p, _)| p.width)
             .sum();
-        let hyphen = if shy_end { self.hyphen_width(pieces, &keep) } else { 0.0 };
+        let hyphen = if shy_end {
+            self.hyphen_width(pieces, &keep)
+        } else {
+            0.0
+        };
         let content_width = content_width + hyphen;
         let slack = avail - content_width;
         let align = self.root_style.text_align;
@@ -1164,7 +1352,6 @@ impl<'t> Ifc<'_, 't> {
 
         // 4. Vertical alignment.
         let mut nodes: Vec<VNode> = vec![VNode {
-            parent: 0,
             group: 0,
             rel: 0.0,
             above: self.root_font.above,
@@ -1191,24 +1378,28 @@ impl<'t> Ifc<'_, 't> {
                     self.add_box_node(&mut nodes, &mut touched, b);
                 }
                 Some(ItemKind::Atomic(a)) => {
-                    let parent = self.parent_node(items.items.get(p.item).map_or(NO_BOX, |it| it.parent));
-                    if let Some(Some(ab)) = self.atomics.get(a as usize) {
-                        let pn = nodes.get(parent).copied().unwrap_or(nodes[0]);
+                    let parent =
+                        self.parent_node(items.items.get(p.item).map_or(NO_BOX, |it| it.parent));
+                    let pn = nodes.get(parent).or(nodes.first()).copied();
+                    if let (Some(Some(ab)), Some(pn)) = (self.atomics.get(a as usize), pn) {
                         let above = ab.baseline;
                         let below = (ab.height - ab.baseline).max(0.0);
                         let align = ab.lb.style.vertical_align;
                         let idx = nodes.len();
-                        nodes.push(make_vnode(parent, idx, &pn, above, below, align, pn.font));
+                        nodes.push(make_vnode(idx, &pn, above, below, align, pn.font));
                         atomic_nodes.push((k, idx));
                     }
                 }
-                Some(ItemKind::Word { run, .. } | ItemKind::Space { run, .. } | ItemKind::Tab { run, .. }) => {
-                    if last_run != Some(run) {
-                        last_run = Some(run);
-                        let parent = self.parent_node(items.items.get(p.item).map_or(NO_BOX, |it| it.parent));
-                        if let Some(r) = self.run_of(run) {
-                            text_contrib.push((parent, r.font.above, r.font.below));
-                        }
+                Some(
+                    ItemKind::Word { run, .. }
+                    | ItemKind::Space { run, .. }
+                    | ItemKind::Tab { run, .. },
+                ) if last_run != Some(run) => {
+                    last_run = Some(run);
+                    let parent =
+                        self.parent_node(items.items.get(p.item).map_or(NO_BOX, |it| it.parent));
+                    if let Some(r) = self.run_of(run) {
+                        text_contrib.push((parent, r.font.above, r.font.below));
                     }
                 }
                 _ => {}
@@ -1216,8 +1407,7 @@ impl<'t> Ifc<'_, 't> {
         }
         // Group extents.
         let mut ext: Vec<(f32, f32)> = vec![(f32::INFINITY, f32::NEG_INFINITY); nodes.len()];
-        for (i, n) in nodes.iter().enumerate() {
-            let _ = i;
+        for n in &nodes {
             if let Some(e) = ext.get_mut(n.group) {
                 e.0 = e.0.min(n.rel - n.above);
                 e.1 = e.1.max(n.rel + n.below);
@@ -1244,8 +1434,8 @@ impl<'t> Ifc<'_, 't> {
         let mut shifts: Vec<f32> = vec![0.0; nodes.len()];
         for (i, n) in nodes.iter().enumerate().skip(1) {
             if n.group == i {
-                if let Some(&(t, b)) = ext.get(i) {
-                    shifts[i] = match n.align {
+                if let (Some(&(t, b)), Some(shift)) = (ext.get(i), shifts.get_mut(i)) {
+                    *shift = match n.align {
                         VerticalAlign::Top => top - t,
                         _ => bottom - b,
                     };
@@ -1259,9 +1449,9 @@ impl<'t> Ifc<'_, 't> {
         let line_height = sane_size(bottom - top);
         let baseline = y - top;
         let node_baseline = |idx: usize| -> f32 {
-            nodes
-                .get(idx)
-                .map_or(baseline, |n| baseline + n.rel + shifts.get(n.group).copied().unwrap_or(0.0))
+            nodes.get(idx).map_or(baseline, |n| {
+                baseline + n.rel + shifts.get(n.group).copied().unwrap_or(0.0)
+            })
         };
 
         // 5. Fragments.
@@ -1269,12 +1459,16 @@ impl<'t> Ifc<'_, 't> {
         let mut x = left + indent + offset;
         // Open inline box fragments: (box index, fragment index).
         let mut open_frags: Vec<(u32, usize)> = Vec::new();
+        // Every inline box fragment of the line, for containing blocks.
+        let mut all_frags: Vec<(u32, usize)> = Vec::new();
         for &b in &open_at_start {
             let idx = self.vindex.get(b as usize).map_or(0, |&v| v as usize);
             let bl = node_baseline(idx);
             if let Some(ib) = items.boxes.get(b as usize) {
                 frags.push(Fragment::InlineBox(inline_fragment(ib, x, bl, false)));
+                shift_last(&mut frags, ib.rel);
                 open_frags.push((b, frags.len() - 1));
+                all_frags.push((b, frags.len() - 1));
             }
         }
         let mut acc: Option<TextAcc> = None;
@@ -1300,7 +1494,14 @@ impl<'t> Ifc<'_, 't> {
                         .is_some_and(|a| a.run == run && a.end == p.start);
                     if !contiguous {
                         if let Some(a) = acc.take() {
-                            self.flush_text(a, &nodes, &shifts, baseline, justify_extra, &mut frags);
+                            self.flush_text(
+                                a,
+                                &nodes,
+                                &shifts,
+                                baseline,
+                                justify_extra,
+                                &mut frags,
+                            );
                         }
                         let parent = self.parent_node(item.parent);
                         acc = Some(TextAcc {
@@ -1310,6 +1511,7 @@ impl<'t> Ifc<'_, 't> {
                             x,
                             width: 0.0,
                             parent,
+                            bx: item.parent,
                             hyphen: false,
                         });
                     }
@@ -1341,7 +1543,9 @@ impl<'t> Ifc<'_, 't> {
                         let idx = self.vindex.get(b as usize).map_or(0, |&v| v as usize);
                         let bl = node_baseline(idx);
                         frags.push(Fragment::InlineBox(inline_fragment(ib, x, bl, true)));
+                        shift_last(&mut frags, ib.rel);
                         open_frags.push((b, frags.len() - 1));
+                        all_frags.push((b, frags.len() - 1));
                         x += ib.border.left + ib.padding.left;
                     }
                     self.open.push(b);
@@ -1355,7 +1559,7 @@ impl<'t> Ifc<'_, 't> {
                         if let Some(pos) = open_frags.iter().rposition(|&(ob, _)| ob == b) {
                             let (_, fi) = open_frags.remove(pos);
                             if let Some(Fragment::InlineBox(f)) = frags.get_mut(fi) {
-                                f.rect.width = sane_size(x - f.rect.x);
+                                f.rect.width = sane_size(x + ib.rel.0 - f.rect.x);
                                 f.border.right = ib.border.right;
                                 f.padding.right = ib.padding.right;
                             }
@@ -1385,9 +1589,11 @@ impl<'t> Ifc<'_, 't> {
                             ..
                         } = ab;
                         // Laid out with the margin box at the origin.
-                        crate::tree::translate_box(&mut lb, x, top_y);
-                        self.cx.translate_pending_range(pending.0, pending.1, x, top_y);
-                        self.cx.apply_relative(&mut lb, self.cb);
+                        let (rx, ry) = self.rel_of(item.parent);
+                        crate::tree::translate_box(&mut lb, x + rx, top_y + ry);
+                        self.cx
+                            .translate_pending_range(pending.0, pending.1, x + rx, top_y + ry);
+                        self.cx.apply_relative_range(&mut lb, self.cb, pending);
                         frags.push(Fragment::Atomic(lb));
                         x += width;
                     } else {
@@ -1395,9 +1601,7 @@ impl<'t> Ifc<'_, 't> {
                     }
                 }
                 ItemKind::Abspos(a) => {
-                    if let Some(&ab) = items.abspos.get(a as usize) {
-                        self.cx.register_abs(ab, Point::new(x, y));
-                    }
+                    self.register_inline_abs(a, item.parent, Point::new(x, y));
                 }
                 ItemKind::Break { .. } | ItemKind::Opportunity | ItemKind::Float(_) => {
                     if let Some(a) = acc.take() {
@@ -1409,9 +1613,15 @@ impl<'t> Ifc<'_, 't> {
         if let Some(a) = acc.take() {
             self.flush_text(a, &nodes, &shifts, baseline, justify_extra, &mut frags);
         }
-        for (_, fi) in open_frags {
+        for (b, fi) in open_frags {
+            let dx = self.rel_of(b).0;
             if let Some(Fragment::InlineBox(f)) = frags.get_mut(fi) {
-                f.rect.width = sane_size(x - f.rect.x);
+                f.rect.width = sane_size(x + dx - f.rect.x);
+            }
+        }
+        for (b, fi) in all_frags {
+            if let Some(Fragment::InlineBox(f)) = frags.get(fi) {
+                self.note_inline_cb(b, f);
             }
         }
         // Inline boxes closed in trimmed pieces still close.
@@ -1432,6 +1642,14 @@ impl<'t> Ifc<'_, 't> {
             baseline,
             fragments: frags,
         })
+    }
+
+    /// Cumulative relative offset of inline box `b` (zero for the root).
+    fn rel_of(&self, b: u32) -> (f32, f32) {
+        self.items
+            .boxes
+            .get(b as usize)
+            .map_or((0.0, 0.0), |ib| ib.rel)
     }
 
     fn close_box(&mut self, b: u32) {
@@ -1456,10 +1674,11 @@ impl<'t> Ifc<'_, 't> {
             return;
         };
         let parent = self.parent_node(ib.parent);
-        let pn = nodes.get(parent).copied().unwrap_or(nodes[0]);
+        let Some(pn) = nodes.get(parent).or(nodes.first()).copied() else {
+            return;
+        };
         let idx = nodes.len();
         nodes.push(make_vnode(
-            parent,
             idx,
             &pn,
             ib.font.above,
@@ -1536,9 +1755,11 @@ impl<'t> Ifc<'_, 't> {
                 }
             }
         }
-        let baseline = nodes.get(a.parent).map_or(line_baseline, |n| {
-            line_baseline + n.rel + shifts.get(n.group).copied().unwrap_or(0.0)
-        });
+        let (rx, ry) = self.rel_of(a.bx);
+        let baseline = ry
+            + nodes.get(a.parent).map_or(line_baseline, |n| {
+                line_baseline + n.rel + shifts.get(n.group).copied().unwrap_or(0.0)
+            });
         let ascent = sane_size(r.font.metrics.ascent);
         let descent = sane_size(r.font.metrics.descent);
         let node = match r.node {
@@ -1547,7 +1768,12 @@ impl<'t> Ifc<'_, 't> {
         };
         frags.push(Fragment::Text(TextFragment {
             node,
-            rect: Rect::new(a.x, baseline - ascent, sane_size(a.width), ascent + descent),
+            rect: Rect::new(
+                a.x + rx,
+                baseline - ascent,
+                sane_size(a.width),
+                ascent + descent,
+            ),
             baseline,
             text,
             font: r.font.id,
@@ -1555,6 +1781,13 @@ impl<'t> Ifc<'_, 't> {
             glyphs,
             style: r.style.clone(),
         }));
+    }
+}
+
+/// Moves the last fragment (an inline box fragment) by a relative offset.
+fn shift_last(frags: &mut [Fragment], (dx, dy): (f32, f32)) {
+    if let Some(Fragment::InlineBox(f)) = frags.last_mut() {
+        f.rect = f.rect.translate(dx, dy);
     }
 }
 
@@ -1566,12 +1799,13 @@ struct TextAcc {
     x: f32,
     width: f32,
     parent: usize,
+    /// Enclosing inline box (for its relative offset).
+    bx: u32,
     hyphen: bool,
 }
 
 /// Creates the alignment node of a box aligned per `align` inside `parent`.
 fn make_vnode(
-    parent: usize,
     idx: usize,
     p: &VNode,
     above: f32,
@@ -1597,7 +1831,6 @@ fn make_vnode(
         }
     };
     VNode {
-        parent,
         group,
         rel,
         above,
@@ -1608,7 +1841,12 @@ fn make_vnode(
 }
 
 /// Inline box fragment starting at `x` (border edge) for a box whose baseline is `baseline`.
-fn inline_fragment(ib: &InlineBoxInfo<'_>, x: f32, baseline: f32, first: bool) -> InlineBoxFragment {
+fn inline_fragment(
+    ib: &InlineBoxInfo<'_>,
+    x: f32,
+    baseline: f32,
+    first: bool,
+) -> InlineBoxFragment {
     let m = &ib.font.metrics;
     let ascent = sane_size(m.ascent);
     let descent = sane_size(m.descent);
@@ -1645,8 +1883,16 @@ pub(crate) fn ifc_intrinsic<'t>(cx: &mut LayoutCx<'t>, root: &'t BoxNode) -> Int
     };
     for it in &items.items {
         match it.kind {
-            ItemKind::Word { .. } => {
-                seg += it.width;
+            ItemKind::Word { run, start, end } => {
+                let anywhere = items.runs.get(run as usize).filter(|r| r.break_anywhere);
+                if let Some(r) = anywhere {
+                    // Any character boundary is a break opportunity.
+                    let widest = widest_char(cx, r, start, end);
+                    seg += widest;
+                    end_seg(&mut min, &mut seg);
+                } else {
+                    seg += it.width;
+                }
                 line += it.width;
                 trailing = 0.0;
                 if it.break_after {
@@ -1668,7 +1914,10 @@ pub(crate) fn ifc_intrinsic<'t>(cx: &mut LayoutCx<'t>, root: &'t BoxNode) -> Int
                 }
             }
             ItemKind::Tab { run, .. } => {
-                let w = items.runs.get(run as usize).map_or(0.0, |r| r.space_width * 8.0);
+                let w = items
+                    .runs
+                    .get(run as usize)
+                    .map_or(0.0, |r| r.space_width * 8.0);
                 line += w;
                 seg += w;
                 trailing = 0.0;
@@ -1694,10 +1943,9 @@ pub(crate) fn ifc_intrinsic<'t>(cx: &mut LayoutCx<'t>, root: &'t BoxNode) -> Int
                 if it.break_before {
                     end_seg(&mut min, &mut seg);
                 }
+                seg += outer.min;
                 if it.break_after {
-                    min = min.max(outer.min);
-                } else {
-                    seg += outer.max;
+                    end_seg(&mut min, &mut seg);
                 }
                 line += outer.max;
                 trailing = 0.0;
@@ -1720,4 +1968,24 @@ pub(crate) fn ifc_intrinsic<'t>(cx: &mut LayoutCx<'t>, root: &'t BoxNode) -> Int
         min: sane_size(min),
         max: sane_size(max.max(min)),
     }
+}
+
+/// Advance of the widest character of `run.text[start..end]`.
+fn widest_char(cx: &mut LayoutCx<'_>, r: &Run, start: u32, end: u32) -> f32 {
+    let Some(text) = r.text.get(start as usize..end as usize) else {
+        return 0.0;
+    };
+    let mut buf = [0u8; 4];
+    let mut widest = 0.0f32;
+    for ch in text.chars() {
+        let w = cx.measure(
+            r.font.id,
+            r.font.size,
+            ch.encode_utf8(&mut buf),
+            r.letter_spacing,
+            r.word_spacing,
+        );
+        widest = widest.max(w);
+    }
+    widest
 }

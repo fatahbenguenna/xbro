@@ -21,11 +21,27 @@ struct PlacedFloat {
 }
 
 /// Floats placed so far in one block formatting context.
-#[derive(Clone, Debug, Default)]
+///
+/// Floats are recorded in placement order, which is also the order of
+/// their (non-decreasing) top edges since a float may not be placed above
+/// an earlier one; band queries binary-search that order, so documents
+/// with thousands of floats stay fast.
+#[derive(Clone, Debug)]
 pub(crate) struct FloatContext {
     floats: Vec<PlacedFloat>,
     /// A float may not be placed above an earlier float's top.
     min_top: f32,
+    /// Tallest float margin box so far (bounds the band search).
+    max_height: f32,
+    /// Lowest bottom edge of left / right floats.
+    bottom_left: Option<f32>,
+    bottom_right: Option<f32>,
+}
+
+impl Default for FloatContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FloatContext {
@@ -33,17 +49,28 @@ impl FloatContext {
         FloatContext {
             floats: Vec::new(),
             min_top: f32::NEG_INFINITY,
+            max_height: 0.0,
+            bottom_left: None,
+            bottom_right: None,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.floats.is_empty()
+    /// Number of floats placed so far.
+    pub fn len(&self) -> usize {
+        self.floats.len()
     }
 
     /// Floats whose vertical extent intersects the band `[y, y + h)`.
     fn in_band(&self, y: f32, h: f32) -> impl Iterator<Item = &PlacedFloat> {
         let h = h.max(EPSILON);
+        // Only floats whose top lies in (y - max_height, y + h) can intersect.
+        let lo = self
+            .floats
+            .partition_point(|f| f.rect.y + self.max_height <= y);
+        let hi = self.floats.partition_point(|f| f.rect.y < y + h);
         self.floats
+            .get(lo..hi.max(lo))
+            .unwrap_or(&[])
             .iter()
             .filter(move |f| f.rect.y < y + h && f.rect.bottom() > y && f.rect.height > 0.0)
     }
@@ -80,7 +107,15 @@ impl FloatContext {
     /// Places a float with margin box `w × h` whose top may not be above
     /// `min_y`, inside the containing block edges `[left, right]`. Returns
     /// the margin box origin and records the float.
-    pub fn place(&mut self, side: Side, w: f32, h: f32, min_y: f32, left: f32, right: f32) -> Point {
+    pub fn place(
+        &mut self,
+        side: Side,
+        w: f32,
+        h: f32,
+        min_y: f32,
+        left: f32,
+        right: f32,
+    ) -> Point {
         let mut y = min_y.max(self.min_top);
         if !y.is_finite() {
             y = min_y;
@@ -106,36 +141,40 @@ impl FloatContext {
             Side::Left => l,
             Side::Right => r - w,
         };
-        self.floats.push(PlacedFloat {
-            rect: Rect::new(x, y, w.max(0.0), h.max(0.0)),
-            side,
-        });
+        // Keep tops non-decreasing (the binary searches rely on it).
+        let y = match self.floats.last() {
+            Some(last) if y < last.rect.y => last.rect.y,
+            _ => y,
+        };
+        let rect = Rect::new(x, y, w.max(0.0), h.max(0.0));
+        self.floats.push(PlacedFloat { rect, side });
         self.min_top = self.min_top.max(y);
+        self.max_height = self.max_height.max(rect.height);
+        let slot = match side {
+            Side::Left => &mut self.bottom_left,
+            Side::Right => &mut self.bottom_right,
+        };
+        *slot = Some(slot.map_or(rect.bottom(), |b| b.max(rect.bottom())));
         Point::new(x, y)
     }
 
     /// The y a box with `clear` must be moved to (bottom of the relevant
     /// floats), if any float is cleared.
     pub fn clear_y(&self, clear: Clear) -> Option<f32> {
-        let wanted = |s: Side| match clear {
-            Clear::None => false,
-            Clear::Left => s == Side::Left,
-            Clear::Right => s == Side::Right,
-            Clear::Both => true,
-        };
-        self.floats
-            .iter()
-            .filter(|f| wanted(f.side))
-            .map(|f| f.rect.bottom())
-            .max_by(f32::total_cmp)
+        match clear {
+            Clear::None => None,
+            Clear::Left => self.bottom_left,
+            Clear::Right => self.bottom_right,
+            Clear::Both => self.bottom(),
+        }
     }
 
     /// Lowest float bottom edge.
     pub fn bottom(&self) -> Option<f32> {
-        self.floats
-            .iter()
-            .map(|f| f.rect.bottom())
-            .max_by(f32::total_cmp)
+        match (self.bottom_left, self.bottom_right) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 

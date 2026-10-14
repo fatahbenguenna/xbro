@@ -36,9 +36,21 @@ pub(crate) fn is_cjk(c: char) -> bool {
 pub(crate) fn is_cjk_closing(c: char) -> bool {
     matches!(
         c,
-        '\u{3001}' | '\u{3002}' | '\u{FF0C}' | '\u{FF0E}' | '\u{FF1A}' | '\u{FF1B}'
-            | '\u{FF01}' | '\u{FF1F}' | '\u{300D}' | '\u{300F}' | '\u{FF09}' | '\u{3009}'
-            | '\u{300B}' | '\u{3011}' | '\u{30FC}'
+        '\u{3001}'
+            | '\u{3002}'
+            | '\u{FF0C}'
+            | '\u{FF0E}'
+            | '\u{FF1A}'
+            | '\u{FF1B}'
+            | '\u{FF01}'
+            | '\u{FF1F}'
+            | '\u{300D}'
+            | '\u{300F}'
+            | '\u{FF09}'
+            | '\u{3009}'
+            | '\u{300B}'
+            | '\u{3011}'
+            | '\u{30FC}'
     )
 }
 
