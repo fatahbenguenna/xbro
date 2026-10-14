@@ -7,7 +7,10 @@ pub mod display_list;
 pub mod image;
 pub mod raster;
 
-pub use display_list::{build_display_list, BorderSideItem, DisplayItem, DisplayList, GlyphRun};
+pub use display_list::{
+    background_tile, build_display_list, build_display_list_full, build_display_list_with_images,
+    resolve_radii, BorderSideItem, DisplayItem, DisplayList, GlyphRun,
+};
 pub use image::{Image, ImageProvider, NoImageProvider};
 pub use raster::{draw_text, rasterize, RasterOptions};
 pub use tiny_skia;
