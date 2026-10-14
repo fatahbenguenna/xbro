@@ -396,3 +396,175 @@ fn deeply_nested_grid_column_flex_and_css_tables_on_a_small_stack() {
         }
     });
 }
+
+/// A tiny deterministic generator (xorshift) of random documents mixing
+/// every box kind with hostile property values.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+        let i = (self.next() % xs.len() as u64) as usize;
+        xs.get(i).copied().unwrap_or("")
+    }
+}
+
+const FUZZ_TAGS: &[&str] = &[
+    "div", "span", "p", "a", "ul", "li", "ol", "table", "tr", "td", "th", "caption", "img",
+    "input", "button", "select", "textarea", "br", "wbr", "svg", "pre", "center", "colgroup",
+];
+const FUZZ_PROPS: &[&str] = &[
+    "display:block",
+    "display:inline",
+    "display:inline-block",
+    "display:flex",
+    "display:inline-flex",
+    "display:grid",
+    "display:table",
+    "display:table-cell",
+    "display:table-row",
+    "display:contents",
+    "display:list-item",
+    "display:none",
+    "float:left",
+    "float:right",
+    "clear:both",
+    "position:absolute",
+    "position:relative",
+    "position:fixed",
+    "position:sticky",
+    "top:10px",
+    "left:-20px",
+    "right:0",
+    "bottom:0",
+    "inset:0",
+    "width:100px",
+    "width:50%",
+    "width:0",
+    "width:1e30px",
+    "min-width:300px",
+    "max-width:10px",
+    "height:50px",
+    "height:100%",
+    "min-height:100px",
+    "max-height:5px",
+    "margin:10px",
+    "margin:-30px",
+    "margin:auto",
+    "margin-top:-1e9px",
+    "padding:10%",
+    "border:3px solid red",
+    "box-sizing:border-box",
+    "overflow:hidden",
+    "overflow-x:hidden",
+    "white-space:pre",
+    "white-space:nowrap",
+    "white-space:pre-wrap",
+    "white-space:pre-line",
+    "text-align:justify",
+    "text-align:center",
+    "text-indent:-50px",
+    "letter-spacing:-20px",
+    "word-spacing:1e9px",
+    "line-height:0",
+    "line-height:1e30px",
+    "font-size:0",
+    "font-size:200px",
+    "vertical-align:top",
+    "vertical-align:bottom",
+    "vertical-align:middle",
+    "vertical-align:-1e9px",
+    "flex:1",
+    "flex:0 0 100px",
+    "flex-grow:1e30",
+    "flex-basis:50%",
+    "flex-direction:column",
+    "flex-direction:row-reverse",
+    "flex-wrap:wrap",
+    "flex-wrap:wrap-reverse",
+    "justify-content:space-between",
+    "align-items:baseline",
+    "align-content:space-around",
+    "gap:1e9px",
+    "order:-1",
+    "grid-template-columns:repeat(3,1fr)",
+    "aspect-ratio:16/9",
+    "list-style-position:inside",
+    "border-collapse:collapse",
+    "border-spacing:1e9px",
+    "visibility:hidden",
+    "opacity:0.5",
+    "z-index:5",
+    "z-index:-1",
+    "overflow-wrap:anywhere",
+];
+const FUZZ_TEXTS: &[&str] = &[
+    "hello world",
+    " ",
+    "\n  \t",
+    "a-b-c long-hyphenated-word",
+    "supercalifragilisticexpialidocious",
+    "日本語のテキスト。",
+    "x\u{AD}y\u{200B}z",
+    "\t\ttabs\tand  spaces  ",
+    "😀 emoji",
+    "(",
+    ").",
+];
+const FUZZ_ATTRS: &[&str] = &[
+    "",
+    " colspan=3",
+    " rowspan=0",
+    " alt='alt text'",
+    " type=checkbox checked",
+    " type=password value=secret",
+    " size=1000000",
+    " reversed start=3",
+    " span=1000",
+    " placeholder=hi",
+    " width=50 height=20",
+];
+
+fn random_children(r: &mut Rng, depth: usize, out: &mut String) {
+    let n = r.next() % 6;
+    for _ in 0..n {
+        if depth > 8 || r.next() % 4 == 0 {
+            out.push_str(r.pick(FUZZ_TEXTS));
+            continue;
+        }
+        let tag = r.pick(FUZZ_TAGS);
+        let mut style = String::new();
+        for _ in 0..r.next() % 5 {
+            style.push_str(r.pick(FUZZ_PROPS));
+            style.push(';');
+        }
+        let attr = r.pick(FUZZ_ATTRS);
+        out.push_str(&format!("<{tag}{attr} style='{style}'>"));
+        if !matches!(tag, "br" | "wbr" | "img" | "input") {
+            random_children(r, depth + 1, out);
+            out.push_str(&format!("</{tag}>"));
+        }
+    }
+}
+
+#[test]
+fn random_documents_never_panic() {
+    for seed in 1..=150u64 {
+        let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut html = String::from(
+            "<style>.x::after{content:open-quote 'A' url(a.png)}</style><body class=x>",
+        );
+        random_children(&mut r, 0, &mut html);
+        let width = [0.0, 50.0, 360.0, 1024.0][(r.next() % 4) as usize];
+        let t = std::time::Instant::now();
+        let l = lay_any(&html, width);
+        sane_layout(&l);
+        assert!(t.elapsed().as_secs() < 10, "seed {seed}: {:?}", t.elapsed());
+    }
+}
