@@ -1,4 +1,22 @@
 //! Selectors Level 4 (subset): parsing, specificity and matching.
+//!
+//! Parsing lives in `parse`, matching in `matching` (combinators, nested
+//! lists, `:has()`) and `predicates` (per-element tests), and the `An+B`
+//! microsyntax in `nth`. Selectors are bounded at parse time (at most
+//! [`MAX_COMPOUNDS`] compounds per complex selector, functional pseudo-classes
+//! nested at most [`MAX_SELECTOR_NESTING`] deep) so matching recursion is
+//! bounded too.
+
+mod matching;
+mod nth;
+mod parse;
+mod predicates;
+
+#[cfg(test)]
+mod tests;
+
+pub use parse::{list_weight, parse_nested_selector_list, MAX_COMPOUNDS, MAX_SELECTOR_NESTING};
+pub(crate) use parse::{nesting_parent, parse_nested_with};
 
 use crate::parser::ComponentValue;
 
@@ -37,6 +55,38 @@ pub trait Element: Sized + Clone {
     fn is_focused(&self) -> bool {
         false
     }
+    /// `:focus-within` — the element or one of its descendants is focused.
+    ///
+    /// The default walks (at most 4096) descendants looking for a focused
+    /// element; implementations that know the focused node should override it
+    /// with an O(depth) ancestor check.
+    fn is_focus_within(&self) -> bool {
+        if self.is_focused() {
+            return true;
+        }
+        let mut budget = 4096u32;
+        let mut stack: Vec<Self> = self.first_child_element().into_iter().collect();
+        while let Some(element) = stack.pop() {
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            if element.is_focused() {
+                return true;
+            }
+            if let Some(next) = element.next_sibling_element() {
+                stack.push(next);
+            }
+            if let Some(child) = element.first_child_element() {
+                stack.push(child);
+            }
+        }
+        false
+    }
+    /// `:target` — the element is the target of the document URL's fragment.
+    fn is_target(&self) -> bool {
+        false
+    }
     /// `:checked` — checked checkbox/radio, selected option.
     fn is_checked(&self) -> bool {
         false
@@ -44,6 +94,19 @@ pub trait Element: Sized + Clone {
     /// `:disabled` — form controls with the `disabled` attribute.
     fn is_disabled(&self) -> bool {
         false
+    }
+    /// 1-based position of the element among its element siblings, used by
+    /// `:nth-child()` and friends: counted from the first sibling, or from
+    /// the last one when `from_end` is set; with `of_type`, only siblings
+    /// with the same local name count. An element without siblings is 1.
+    ///
+    /// The default walks the siblings with [`Element::prev_sibling_element`]
+    /// / [`Element::next_sibling_element`], so it costs one call per sibling.
+    /// DOMs where those calls are not O(1) (e.g. they search the parent's
+    /// child list) should override it with a single scan of the child list,
+    /// otherwise matching `:nth-child()` against N siblings is O(N³).
+    fn nth_index(&self, of_type: bool, from_end: bool) -> usize {
+        predicates::walk_nth_index(self, of_type, from_end)
     }
 }
 
@@ -83,7 +146,9 @@ pub struct AttrSelector {
     pub name: String,
     pub op: AttrOperator,
     pub value: String,
-    /// `[a=v i]`
+    /// `[a=v i]`; also true without a flag for attributes whose values HTML
+    /// matches case-insensitively (`type`, `lang`, `dir`, `align`, ...), unless
+    /// the `s` flag is given.
     pub case_insensitive: bool,
 }
 
@@ -131,11 +196,44 @@ pub enum PseudoClass {
     Is(Vec<Selector>),
     /// `:where(list)` — like `:is` but zero specificity.
     Where(Vec<Selector>),
-    /// `:has(list)` — relative selectors; xbro supports descendant (`:has(x)`) and child (`:has(> x)`) forms.
+    /// `:has(list)` — relative selectors: descendant (`:has(x)`), child
+    /// (`:has(> x)`), next-sibling (`:has(+ x)`) and subsequent-sibling
+    /// (`:has(~ x)`) forms.
     Has(Vec<(Combinator, Selector)>),
-    /// `:lang(x)`, `:target`, `:placeholder-shown` and other recognized but
-    /// unimplemented pseudo-classes that never match.
+    /// Recognized but unimplemented pseudo-classes that never match
+    /// (`:valid`, `:invalid`, `:fullscreen`, `:host`, `:-webkit-autofill`, ...).
     NeverMatches,
+    /// `:target` (see [`Element::is_target`]).
+    Target,
+    /// `:lang(ranges)` — matched against the nearest `lang` attribute
+    /// (prefix match on `-` boundaries, ASCII case-insensitive, `*` wildcard).
+    Lang(Vec<String>),
+    /// `:dir(ltr|rtl)` — matched against the nearest `dir` attribute
+    /// (`auto` and no attribute count as `ltr`).
+    Dir {
+        rtl: bool,
+    },
+    /// `:defined` — always true (xbro has no custom element registry).
+    Defined,
+    /// `:required` — `input`/`select`/`textarea` with a `required` attribute.
+    Required,
+    /// `:optional` — `input`/`select`/`textarea` without `required`.
+    Optional,
+    /// `:read-only` — the negation of `:read-write`.
+    ReadOnly,
+    /// `:read-write` — editable text fields (not `readonly`/disabled) and
+    /// `contenteditable` content.
+    ReadWrite,
+    /// `:placeholder-shown` — text field with a `placeholder` and no value.
+    PlaceholderShown,
+    /// `:indeterminate` — `<progress>` without a `value`.
+    Indeterminate,
+    /// `:default` — `option[selected]`, checkbox/radio with `checked`.
+    Default,
+    /// `:open` — `details`/`dialog` with an `open` attribute.
+    Open,
+    /// `:closed` — `details`/`dialog` without an `open` attribute.
+    Closed,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -173,27 +271,81 @@ pub struct Selector {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct Specificity(pub u32, pub u32, pub u32);
 
+impl Specificity {
+    fn add(self, other: Specificity) -> Specificity {
+        Specificity(
+            self.0.saturating_add(other.0),
+            self.1.saturating_add(other.1),
+            self.2.saturating_add(other.2),
+        )
+    }
+}
+
+fn max_specificity<'a>(selectors: impl Iterator<Item = &'a Selector>) -> Specificity {
+    selectors
+        .map(Selector::specificity)
+        .max()
+        .unwrap_or_default()
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+impl Compound {
+    /// Specificity of this compound alone.
+    pub fn specificity(&self) -> Specificity {
+        let mut s = Specificity(
+            count(self.ids.len()),
+            count(self.classes.len()).saturating_add(count(self.attrs.len())),
+            u32::from(self.tag.is_some()),
+        );
+        for pc in &self.pseudo_classes {
+            s = s.add(match pc {
+                PseudoClass::Where(_) => Specificity::default(),
+                PseudoClass::Is(list) | PseudoClass::Not(list) => max_specificity(list.iter()),
+                PseudoClass::Has(list) => max_specificity(list.iter().map(|(_, s)| s)),
+                _ => Specificity(0, 1, 0),
+            });
+        }
+        s
+    }
+}
+
 impl Selector {
     /// Specificity per Selectors Level 4 (`:is/:not/:has` take their most
     /// specific argument, `:where` contributes zero).
     pub fn specificity(&self) -> Specificity {
-        todo!("xbro-css: implement Selector::specificity")
+        let mut s = self.subject.specificity();
+        for (_, compound) in &self.ancestors {
+            s = s.add(compound.specificity());
+        }
+        if self.pseudo_element.is_some() {
+            s.2 = s.2.saturating_add(1);
+        }
+        s
     }
 
     /// Returns true when `element` matches this selector, ignoring
     /// `pseudo_element` (the caller decides which pseudo-element it is styling).
+    ///
+    /// Matching does a bounded amount of work: nested selector lists are
+    /// memoized per element within the call, and a pathological selector
+    /// that still exceeds a fixed step budget (about a million compound
+    /// tests) is treated as not matching.
     pub fn matches<E: Element>(&self, element: &E) -> bool {
-        let _ = element;
-        todo!("xbro-css: implement Selector::matches")
+        matching::matches_selector(self, element)
     }
 }
 
 /// Parses a comma-separated selector list from component values.
 /// Returns `None` if any selector in the list is invalid or uses an unknown
 /// pseudo-class/element (the whole rule must then be dropped, per spec).
+///
+/// A top-level `&` (nesting selector outside of any style rule) matches the
+/// root element, like `:scope`.
 pub fn parse_selector_list_from(values: &[ComponentValue]) -> Option<Vec<Selector>> {
-    let _ = values;
-    todo!("xbro-css: implement parse_selector_list_from")
+    parse::parse_top_level(values)
 }
 
 /// Convenience wrapper around [`parse_selector_list_from`] for a string.

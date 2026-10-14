@@ -10,3 +10,8 @@ rust-version.workspace = true
 ureq.workspace = true
 url.workspace = true
 encoding_rs.workspace = true
+
+[dev-dependencies]
+# Only used by the integration tests to serve gzip-encoded bodies
+# (already in the dependency graph through ureq's default `gzip` feature).
+flate2 = "1"

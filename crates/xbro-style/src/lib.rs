@@ -2,11 +2,34 @@
 //! (origins, specificity, `!important`, inline styles), inheritance, CSS
 //! custom properties (`var()`), `calc()`, shorthands and HTML presentational
 //! hints, producing a [`ComputedStyle`] per rendered node.
+//!
+//! Approximations (see the module docs for details): logical properties are
+//! mapped for horizontal left-to-right text; `revert` rolls back to the
+//! user-agent value (there is no user origin);
+//! percentages inside `min()`/`max()`/`clamp()` that mix with lengths are
+//! resolved against the viewport width; gradient stop positions given as
+//! lengths are spread like omitted ones; radial and conic gradients paint
+//! their first color as the background color; intrinsic sizes
+//! (`min-content`, `fit-content`, ...) compute to `auto`.
+//!
+//! Hostile pages are bounded: values copied into every element they apply
+//! to are size-limited (`content` ≤ 256 items / 64 KiB of text, gradients
+//! ≤ 256 stops, `calc()` trees ≤ 256 nodes; larger ones are invalid
+//! declarations), repeated declarations in a block are deduplicated, and
+//! custom-property work is memoized across elements and charged to a
+//! per-document budget (see the `vars` module).
 
+mod bloom;
 pub mod cascade;
+mod compute;
 pub mod computed;
+mod dom;
+mod hints;
 pub mod properties;
+mod rules;
 pub mod ua;
+mod values;
+mod vars;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,14 +68,17 @@ pub struct StyleMap {
 }
 
 impl StyleMap {
+    /// Style of a rendered element or text node (`None` if not rendered).
     pub fn get(&self, node: NodeId) -> Option<&Arc<ComputedStyle>> {
         self.styles.get(node.index()).and_then(|s| s.as_ref())
     }
 
+    /// Style of the `::before` pseudo-element of `node`, if it generates a box.
     pub fn before(&self, node: NodeId) -> Option<&Arc<ComputedStyle>> {
         self.before.get(&node)
     }
 
+    /// Style of the `::after` pseudo-element of `node`, if it generates a box.
     pub fn after(&self, node: NodeId) -> Option<&Arc<ComputedStyle>> {
         self.after.get(&node)
     }

@@ -5,7 +5,7 @@
 //! as [`LengthPercentage`] and resolved by layout. `currentcolor` is resolved
 //! to a concrete [`Color`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub use xbro_css::Color;
 
@@ -788,8 +788,15 @@ impl ComputedStyle {
             cursor: parent.cursor,
             decorations_in_effect: parent.decorations_in_effect,
             decoration_color: parent.decoration_color,
-            ..ComputedStyle::default()
+            ..ComputedStyle::initial().clone()
         }
+    }
+
+    /// The initial values ([`ComputedStyle::default`]), built once and shared
+    /// (cloning it only bumps the `font_family` reference count).
+    pub fn initial() -> &'static ComputedStyle {
+        static INITIAL: OnceLock<ComputedStyle> = OnceLock::new();
+        INITIAL.get_or_init(ComputedStyle::default)
     }
 
     /// Used line height in px, given the primary font's `normal` line height

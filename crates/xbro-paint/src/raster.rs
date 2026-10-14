@@ -52,6 +52,7 @@ pub fn rasterize(
 /// Draws `text` with the given font on `target` at device-pixel position
 /// (`x`, `baseline`), returning the advance width in device px. Used by the
 /// browser UI (address bar, tabs, status bar).
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     target: &mut tiny_skia::Pixmap,
     fonts: &FontSystem,

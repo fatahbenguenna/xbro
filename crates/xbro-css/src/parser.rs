@@ -1,5 +1,25 @@
 //! Stylesheet parser (CSS Syntax Module Level 3, §5) producing rules with
 //! parsed selectors and raw declaration values.
+//!
+//! Parsing happens in two steps: the token stream is first grouped into a tree
+//! of [`ComponentValue`]s (blocks and functions, nesting depth bounded by
+//! [`MAX_NESTING_DEPTH`]), then rules and declarations are recognized on that
+//! tree with the error-recovery rules of the spec. CSS Nesting is flattened:
+//! nested style rules become separate [`StyleRule`]s whose selectors are
+//! resolved against their parent.
+
+mod builder;
+mod component;
+mod rules;
+mod serialize;
+mod supports;
+mod urls;
+
+#[cfg(test)]
+mod tests;
+
+pub use component::MAX_NESTING_DEPTH;
+pub use supports::{evaluate_supports, is_supported_property};
 
 use crate::media::MediaQueryList;
 use crate::selector::Selector;
@@ -48,15 +68,28 @@ impl ComponentValue {
         matches!(self, ComponentValue::Token(Token::Delim(d)) if *d == c)
     }
 
+    /// True if this is a function whose name matches `name` ASCII case-insensitively.
+    pub fn is_function(&self, name: &str) -> bool {
+        matches!(self, ComponentValue::Function { name: n, .. } if n.eq_ignore_ascii_case(name))
+    }
+
     /// Re-serializes the value to CSS text (used e.g. for custom properties and debugging).
+    ///
+    /// Tokenizing the result gives back the same component values (whitespace
+    /// runs become a single space; empty comments are inserted between tokens
+    /// that would otherwise merge, e.g. `1` followed by `px`).
     pub fn to_css(&self) -> String {
-        todo!("xbro-css: implement ComponentValue::to_css")
+        let mut out = String::new();
+        serialize::serialize_value(self, &mut out);
+        out
     }
 }
 
 /// Serializes a list of component values back to CSS text.
 pub fn to_css(values: &[ComponentValue]) -> String {
-    values.iter().map(ComponentValue::to_css).collect()
+    let mut out = String::new();
+    serialize::serialize_list(values, &mut out);
+    out
 }
 
 /// A `property: value [!important]` declaration.
@@ -111,9 +144,11 @@ impl Stylesheet {
     /// `@import` URLs, including inside nested rules) through `f`. The engine
     /// uses this to make URLs absolute against the stylesheet's own location,
     /// so later stages can use them directly.
+    ///
+    /// `src("x")` and the string arguments of `image-set()` are rewritten too;
+    /// empty URLs are left untouched.
     pub fn rewrite_urls(&mut self, f: &mut dyn FnMut(&str) -> String) {
-        let _ = f;
-        todo!("xbro-css: implement Stylesheet::rewrite_urls")
+        urls::rewrite_rules(&mut self.rules, f);
     }
 }
 
@@ -121,18 +156,17 @@ impl Stylesheet {
 /// CSS error-recovery rules. Unknown at-rules (`@font-face`, `@keyframes`,
 /// `@page`, `@charset`, `@namespace`, ...) are dropped.
 pub fn parse_stylesheet(css: &str) -> Stylesheet {
-    let _ = css;
-    todo!("xbro-css: implement parse_stylesheet")
+    builder::parse_stylesheet(component::parse(css))
 }
 
 /// Parses the contents of a `style="..."` attribute or a `{ ... }` block body.
+///
+/// Nested rules are ignored; declarations are returned in source order.
 pub fn parse_declaration_list(css: &str) -> Vec<Declaration> {
-    let _ = css;
-    todo!("xbro-css: implement parse_declaration_list")
+    rules::declarations_only(component::parse(css))
 }
 
 /// Parses a list of component values from a string (e.g. for tests or `var()` fallbacks).
 pub fn parse_component_values(css: &str) -> Vec<ComponentValue> {
-    let _ = css;
-    todo!("xbro-css: implement parse_component_values")
+    component::parse(css)
 }
