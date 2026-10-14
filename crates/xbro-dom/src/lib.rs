@@ -425,14 +425,15 @@ impl Document {
         out
     }
 
-    /// Whitespace-collapsed text of the first `<title>` element, if any.
+    /// Text of the first `<title>` element with ASCII whitespace stripped and
+    /// collapsed (per the HTML spec; non-breaking spaces are kept), if any.
     pub fn title(&self) -> Option<String> {
         let t = self
             .descendants(self.root())
             .find(|&n| self.is_element_named(n, "title"))?;
         let text = self
             .text_content(t)
-            .split_whitespace()
+            .split_ascii_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
         (!text.is_empty()).then_some(text)
@@ -544,11 +545,14 @@ mod tests {
 
     #[test]
     fn structure_and_queries() {
-        let (doc, html, head, body) = sample();
+        let (mut doc, html, head, body) = sample();
         assert_eq!(doc.document_element(), Some(html));
         assert_eq!(doc.head(), Some(head));
         assert_eq!(doc.body(), Some(body));
         assert_eq!(doc.title().as_deref(), Some("Hello world"));
+        let title = doc.children(head)[0];
+        doc.append_text(title, "\u{a0}!");
+        assert_eq!(doc.title().as_deref(), Some("Hello world \u{a0}!"));
         assert_eq!(doc.get_element_by_id("main"), Some(body));
         let e = doc.element(body).unwrap();
         assert!(e.has_class("a") && e.has_class("b") && !e.has_class("c"));
