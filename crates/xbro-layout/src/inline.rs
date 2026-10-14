@@ -12,9 +12,14 @@
 //! 2. **Line breaking** (greedy): items are added to the current line until
 //!    one overflows; the line then ends at the last soft wrap opportunity
 //!    (spaces, after hyphens, `<wbr>`, U+200B, U+00AD, around CJK
-//!    ideographs and atomic inlines). Words are only broken inside when
-//!    `break_anywhere` is set. Lines next to floats are shortened, and moved
-//!    below floats when not even their first unit fits.
+//!    ideographs and atomic inlines). A word is broken inside when it does
+//!    not fit on a line of its own and `overflow-wrap` is `break-word` or
+//!    `anywhere` (or `word-break: break-all`, which also breaks words
+//!    wherever a line is full). Only `overflow-wrap: anywhere` and
+//!    `word-break: break-all` lower the min-content width (to the widest
+//!    character); `break-word` does not (CSS Text 3 §5.5, as in browsers).
+//!    Lines next to floats are shortened, and moved below floats when not
+//!    even their first unit fits.
 //! 3. **Line construction**: collapsible spaces at line ends are removed,
 //!    `text-align`/`text-indent`/`justify` position the items, the line box
 //!    height comes from the CSS inline box model with half-leading and
@@ -22,7 +27,7 @@
 
 use std::sync::Arc;
 
-use xbro_style::{Clear, ComputedStyle, TextAlign, VerticalAlign, WhiteSpace};
+use xbro_style::{Clear, ComputedStyle, TextAlign, VerticalAlign, WhiteSpace, WordBreak};
 use xbro_text::FontId;
 
 use crate::block::Cb;
@@ -53,7 +58,17 @@ pub(crate) struct Run {
     pub word_spacing: f32,
     /// Width of one space (with letter/word spacing).
     pub space_width: f32,
+    /// A word that would overflow the line may be broken between any two
+    /// characters (`overflow-wrap: break-word | anywhere`, `word-break:
+    /// break-all`; only in wrapping text).
     pub break_anywhere: bool,
+    /// Those break opportunities count for the min-content width
+    /// (`overflow-wrap: anywhere`, `word-break: break-all`, CSS Text 3
+    /// §5.5: `break-word` does not shrink min-content sizes).
+    pub min_anywhere: bool,
+    /// `word-break: break-all`: words break between letters wherever the
+    /// line is full, not only when a word alone would overflow it.
+    pub break_all: bool,
 }
 
 /// A non-atomic inline box (an inline element).
@@ -460,7 +475,14 @@ impl<'t> Collector<'_, 't> {
             letter_spacing: ls,
             word_spacing: wsp,
             space_width,
-            break_anywhere: style.break_anywhere && wraps,
+            break_anywhere: wraps
+                && (style.overflow_wrap.breaks_overflowing_words()
+                    || style.word_break == WordBreak::BreakAll
+                    || style.break_anywhere),
+            min_anywhere: wraps
+                && (style.overflow_wrap.reduces_min_content()
+                    || style.word_break == WordBreak::BreakAll),
+            break_all: wraps && style.word_break == WordBreak::BreakAll,
         });
     }
 }
@@ -998,6 +1020,30 @@ impl<'t> Ifc<'_, 't> {
                                     None
                                 }
                             };
+                            let eager = self.run_of(run).is_some_and(|r| r.break_all);
+                            if has_content && eager {
+                                // `break-all`: fill the line with what fits
+                                // of the word.
+                                if let Some((split, sw)) = split_at(self, false) {
+                                    if split < end {
+                                        pieces.push(Piece {
+                                            item: i,
+                                            start: s2,
+                                            end: split,
+                                            width: sw,
+                                        });
+                                        return Scan::Line {
+                                            pieces,
+                                            next: Cursor {
+                                                item: i,
+                                                offset: split - s,
+                                            },
+                                            forced: None,
+                                            shy_end: false,
+                                        };
+                                    }
+                                }
+                            }
                             if has_content {
                                 if let Some((n, cur, shy)) = last_break {
                                     pieces.truncate(n);
@@ -1961,7 +2007,7 @@ pub(crate) fn ifc_intrinsic<'t>(cx: &mut LayoutCx<'t>, root: &'t BoxNode) -> Int
     for it in &items.items {
         match it.kind {
             ItemKind::Word { run, start, end } => {
-                let anywhere = items.runs.get(run as usize).filter(|r| r.break_anywhere);
+                let anywhere = items.runs.get(run as usize).filter(|r| r.min_anywhere);
                 if let Some(r) = anywhere {
                     // Any character boundary is a break opportunity.
                     let widest = widest_char(cx, r, start, end);

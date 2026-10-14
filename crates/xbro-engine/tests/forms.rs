@@ -322,3 +322,63 @@ fn generic_forms_edge_cases() {
         }
     }
 }
+
+#[test]
+fn focused_text_field_scrolls_to_the_caret() {
+    let mut page = load_html(
+        "<body style='margin:0'><input id=q size=6 value='a value much longer than the field is wide'>\
+         <p id=out>outside</p></body>",
+    );
+    let q = by_id(&page, "q");
+    let first_text = |page: &Page| {
+        page.layout_tree()
+            .text_fragments()
+            .into_iter()
+            .find(|t| t.node == q)
+            .map(|t| t.rect)
+            .expect("value laid out")
+    };
+    let content = |page: &Page| {
+        fn find(b: &xbro_layout::LayoutBox, n: xbro_dom::NodeId) -> Option<xbro_layout::Rect> {
+            if b.node == Some(n) {
+                return Some(b.content);
+            }
+            b.children
+                .iter()
+                .chain(
+                    b.lines
+                        .iter()
+                        .flat_map(|l| &l.fragments)
+                        .filter_map(|f| match f {
+                            xbro_layout::Fragment::Atomic(a) => Some(a),
+                            _ => None,
+                        }),
+                )
+                .find_map(|c| find(c, n))
+        }
+        find(page.layout_tree().root.as_ref().unwrap(), q).unwrap()
+    };
+    let start = first_text(&page);
+    let field = content(&page);
+    assert_eq!(start.x, field.x);
+    click_id(&mut page, "q");
+    assert!(page.has_text_focus());
+    // The end of the value and the caret are inside the field.
+    let scrolled = first_text(&page);
+    assert!(scrolled.x < field.x - 10.0, "{scrolled:?} {field:?}");
+    let caret = match page.display_list().items.last() {
+        Some(DisplayItem::Rect { rect, .. }) => *rect,
+        other => panic!("no caret: {other:?}"),
+    };
+    assert!(
+        caret.x >= field.x && caret.right() <= field.right() + 0.01,
+        "{caret:?} {field:?}"
+    );
+    // Typing keeps the end visible.
+    page.insert_text("xyz");
+    let typed = first_text(&page);
+    assert!(typed.x < scrolled.x);
+    // Losing the focus shows the start again.
+    page.blur();
+    assert_eq!(first_text(&page).x, field.x);
+}

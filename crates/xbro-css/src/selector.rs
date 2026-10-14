@@ -15,6 +15,7 @@ mod predicates;
 #[cfg(test)]
 mod tests;
 
+pub use matching::MatchCache;
 pub use parse::{list_weight, parse_nested_selector_list, MAX_COMPOUNDS, MAX_SELECTOR_NESTING};
 pub(crate) use parse::{nesting_parent, parse_nested_with};
 
@@ -107,6 +108,12 @@ pub trait Element: Sized + Clone {
     /// otherwise matching `:nth-child()` against N siblings is O(N³).
     fn nth_index(&self, of_type: bool, from_end: bool) -> usize {
         predicates::walk_nth_index(self, of_type, from_end)
+    }
+    /// A number identifying the element within its document, for
+    /// [`MatchCache`]: distinct elements must have distinct keys. `None`
+    /// (the default) disables caching for the element.
+    fn cache_key(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -334,7 +341,20 @@ impl Selector {
     /// that still exceeds a fixed step budget (about a million compound
     /// tests) is treated as not matching.
     pub fn matches<E: Element>(&self, element: &E) -> bool {
-        matching::matches_selector(self, element)
+        matching::matches_selector(self, element, None)
+    }
+
+    /// [`Selector::matches`], reusing (and filling) `cache` for the
+    /// results that do not depend on the subject: `:has()` evaluated on
+    /// other elements, which would otherwise walk the same subtrees again
+    /// for every element below them (`.page:has(.x) p` costs a walk of the
+    /// whole page per paragraph).
+    ///
+    /// The cache is only valid while the document, the element states and
+    /// the selectors stay unchanged (it is keyed by the address of the
+    /// selector lists): use one per style pass.
+    pub fn matches_with_cache<E: Element>(&self, element: &E, cache: &mut MatchCache) -> bool {
+        matching::matches_selector(self, element, Some(cache))
     }
 }
 

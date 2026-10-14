@@ -7,7 +7,8 @@ use xbro_css::ComponentValue as CV;
 
 use super::ids::{LonghandId, ALL_LONGHANDS};
 use super::{
-    background, border, box_model, content, declaration::PropertyDeclaration, flex, font, text,
+    background, border, box_model, content, declaration::PropertyDeclaration, flex, font, grid,
+    text,
 };
 use crate::values::ParseCtx;
 
@@ -117,6 +118,15 @@ const FONT: &[L] = &[
     L::FontSize,
     L::LineHeight,
     L::FontFamily,
+];
+
+const GRID_TEMPLATES: &[L] = &[L::GridTemplateRows, L::GridTemplateColumns];
+/// `grid-area` order: row-start / column-start / row-end / column-end.
+const GRID_AREA: &[L] = &[
+    L::GridRowStart,
+    L::GridColumnStart,
+    L::GridRowEnd,
+    L::GridColumnEnd,
 ];
 
 macro_rules! defs {
@@ -306,6 +316,8 @@ pub(crate) static PROPERTIES: &[PropertyDef] = defs! {
     "vertical-align" => &[L::VerticalAlign], text::vertical_align, quirk;
     "border-collapse" => &[L::BorderCollapse], text::border_collapse;
     "border-spacing" => &[L::BorderSpacing], text::border_spacing, quirk;
+    "caption-side" => &[L::CaptionSide], text::caption_side;
+    "table-layout" => &[L::TableLayout], text::table_layout;
     // ---- generated content, lists, cursor ----
     "content" => &[L::Content], content::content;
     "cursor" => &[L::Cursor], content::cursor;
@@ -348,9 +360,17 @@ pub(crate) static PROPERTIES: &[PropertyDef] = defs! {
     "grid-row-gap" => &[L::RowGap], flex::gap;
     "column-gap" => &[L::ColumnGap], flex::gap;
     "grid-column-gap" => &[L::ColumnGap], flex::gap;
-    "grid-template-columns" => &[L::GridColumns], flex::grid_template_columns;
-    "grid-template" => &[L::GridColumns], flex::grid_template;
-    "grid" => &[L::GridColumns], flex::grid_template;
+    "grid-template-columns" => &[L::GridTemplateColumns], grid::grid_template_tracks;
+    "grid-template-rows" => &[L::GridTemplateRows], grid::grid_template_tracks;
+    "grid-template" => GRID_TEMPLATES, grid::grid_template;
+    "grid" => GRID_TEMPLATES, grid::grid;
+    "grid-row-start" => &[L::GridRowStart], grid::grid_placement;
+    "grid-row-end" => &[L::GridRowEnd], grid::grid_placement;
+    "grid-column-start" => &[L::GridColumnStart], grid::grid_placement;
+    "grid-column-end" => &[L::GridColumnEnd], grid::grid_placement;
+    "grid-row" => &[L::GridRowStart, L::GridRowEnd], grid::grid_placement;
+    "grid-column" => &[L::GridColumnStart, L::GridColumnEnd], grid::grid_placement;
+    "grid-area" => GRID_AREA, grid::grid_placement;
     // ---- all ----
     "all" => ALL_LONGHANDS, only_css_wide;
 };

@@ -10,13 +10,20 @@
 //! resolved against the viewport width; gradient stop positions given as
 //! lengths are spread like omitted ones; radial and conic gradients paint
 //! their first color as the background color; intrinsic sizes
-//! (`min-content`, `fit-content`, ...) compute to `auto`.
+//! (`min-content`, `fit-content`, ...) compute to `auto` (except in grid
+//! track lists); named grid lines compute to `auto` and `subgrid` /
+//! `masonry` to `none`; `word-break: break-word` computes like
+//! `overflow-wrap: break-word` (not `anywhere`); a box that adds its own
+//! text decoration paints all its decorations in its own color.
 //!
 //! Hostile pages are bounded: values copied into every element they apply
 //! to are size-limited (`content` ≤ 256 items / 64 KiB of text, gradients
 //! ≤ 256 stops, `calc()` trees ≤ 256 nodes; larger ones are invalid
-//! declarations), repeated declarations in a block are deduplicated, and
-//! custom-property work is memoized across elements and charged to a
+//! declarations; grid track lists stop at [`MAX_GRID_TRACKS`] tracks and
+//! are shared between elements: computed once at parse time when they only
+//! use px/`%`/`fr`/keywords, memoized per font/viewport otherwise, within a
+//! per-document track budget), repeated declarations in a block are
+//! deduplicated, and custom-property work is memoized across elements and charged to a
 //! per-document budget (see the `vars` module).
 
 mod bloom;

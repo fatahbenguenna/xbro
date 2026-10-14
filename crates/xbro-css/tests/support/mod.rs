@@ -169,4 +169,7 @@ impl Element for El<'_> {
     fn is_empty(&self) -> bool {
         self.node().children.is_empty()
     }
+    fn cache_key(&self) -> Option<usize> {
+        Some(self.index)
+    }
 }

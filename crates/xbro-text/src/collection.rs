@@ -46,10 +46,12 @@ impl FontCollection {
                     .then(a.index.cmp(&b.index))
             });
         }
-        // FontId is a u32: ignore faces beyond that (never happens in practice).
+        // FontId keeps 30 bits for the face index (the others select
+        // synthetic styles): ignore faces beyond that (never happens in
+        // practice).
         let faces: Vec<FaceEntry> = infos
             .into_iter()
-            .take(u32::MAX as usize)
+            .take(crate::synthesis::MAX_FACES)
             .map(FaceEntry::new)
             .collect();
 
@@ -100,13 +102,14 @@ impl FontCollection {
         &self.faces
     }
 
-    /// The face `id`, if it exists.
+    /// The face `id`, if it exists (the face of a synthesised id).
     #[inline]
     pub(crate) fn face(&self, id: FontId) -> Option<&FaceEntry> {
-        self.faces.get(id.0 as usize)
+        self.faces.get(id.face().0 as usize)
     }
 
-    /// The loaded face `id` (loading it on first use).
+    /// The loaded face `id` (loading it on first use; the face of a
+    /// synthesised id).
     #[inline]
     pub(crate) fn loaded(&self, id: FontId) -> Option<&LoadedFace> {
         self.face(id)?.loaded(&self.db)

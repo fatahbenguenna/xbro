@@ -5,7 +5,9 @@
 //! horizontal left-to-right text at parse time), plus a few internal
 //! longhands whose computed values are combined into one field
 //! (`white-space-collapse` + `text-wrap-mode` → `white_space`,
-//! `overflow-wrap` + `word-break` → `break_anywhere`, `outline-style`).
+//! `overflow-wrap` + `word-break` → `overflow_wrap`, `word_break` and
+//! `break_anywhere`, `outline-style`). `grid-template-columns` also gives
+//! `grid_columns`.
 
 macro_rules! longhands {
     ($($name:ident),* $(,)?) => {
@@ -97,6 +99,8 @@ longhands!(
     ListStyleImage,
     BorderCollapse,
     BorderSpacing,
+    CaptionSide,
+    TableLayout,
     TextDecorationLine,
     TextDecorationColor,
     VerticalAlign,
@@ -112,7 +116,12 @@ longhands!(
     Order,
     RowGap,
     ColumnGap,
-    GridColumns,
+    GridTemplateColumns,
+    GridTemplateRows,
+    GridColumnStart,
+    GridColumnEnd,
+    GridRowStart,
+    GridRowEnd,
     Content,
 );
 
@@ -150,6 +159,7 @@ impl LonghandId {
                 | ListStyleImage
                 | BorderCollapse
                 | BorderSpacing
+                | CaptionSide
                 | Visibility
                 | Cursor
         )
@@ -204,12 +214,35 @@ mod tests {
             width: LengthPercentageAuto::px(5.0),
             visibility: Visibility::Hidden,
             cursor: Cursor::Pointer,
+            caption_side: CaptionSide::Bottom,
+            table_layout: TableLayout::Fixed,
+            overflow_wrap: OverflowWrap::Anywhere,
+            word_break: WordBreak::BreakAll,
+            grid_template_columns: Some(std::sync::Arc::new(GridTemplate::default())),
+            grid_column: GridPlacement {
+                start: GridLine::Line(1),
+                end: GridLine::Span(2),
+            },
             ..ComputedStyle::default()
         };
         let child = ComputedStyle::inherit_from(&parent);
         assert_eq!(child.color, parent.color);
         assert_eq!(child.visibility, Visibility::Hidden);
         assert_eq!(child.cursor, Cursor::Pointer);
+        assert_eq!(child.caption_side, CaptionSide::Bottom);
+        assert_eq!(child.overflow_wrap, OverflowWrap::Anywhere);
+        assert_eq!(child.word_break, WordBreak::BreakAll);
+        assert_eq!(child.table_layout, TableLayout::Auto);
+        assert_eq!(child.grid_template_columns, None);
+        assert!(child.grid_column.is_auto());
+        assert!(LonghandId::CaptionSide.is_inherited());
+        assert!(LonghandId::OverflowWrap.is_inherited());
+        assert!(LonghandId::WordBreak.is_inherited());
+        assert!(!LonghandId::TableLayout.is_inherited());
+        assert!(!LonghandId::GridTemplateColumns.is_inherited());
+        assert!(!LonghandId::GridTemplateRows.is_inherited());
+        assert!(!LonghandId::GridColumnStart.is_inherited());
+        assert!(!LonghandId::GridRowEnd.is_inherited());
         assert!(child.width.is_auto());
         assert!(LonghandId::Color.is_inherited());
         assert!(LonghandId::Visibility.is_inherited());

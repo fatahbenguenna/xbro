@@ -1,6 +1,5 @@
-//! Flexbox, box alignment, gaps and the grid column count.
+//! Flexbox, box alignment and gaps.
 
-use xbro_css::values::split_commas;
 use xbro_css::{ComponentValue as CV, Token};
 
 use super::{only, per_item, push, LonghandId, Out, Spec, SpecLpa};
@@ -396,116 +395,6 @@ pub(super) fn gap(items: &[&CV], ids: &[LonghandId], cx: &ParseCtx, out: &mut Ou
     })
 }
 
-/// Maximum number of columns reported (bounds absurd `repeat()` counts).
-const MAX_COLUMNS: u32 = 10_000;
-
-/// Track count of a `<track-list>`: `Some(Some(n))`, `Some(None)` when it
-/// cannot be known statically (`auto-fill` / `auto-fit`), `None` if invalid.
-fn track_count(items: &[&CV], depth: usize) -> Option<Option<u32>> {
-    if depth > 4 {
-        return None;
-    }
-    let mut count: u32 = 0;
-    let mut unknown = false;
-    for v in items {
-        match v {
-            CV::Block { open: '[', .. } => {}
-            CV::Function { name, args } if name.eq_ignore_ascii_case("repeat") => {
-                let parts = split_commas(args);
-                let [n, tracks] = parts.as_slice() else {
-                    return None;
-                };
-                let tracks: Vec<&CV> = tracks.iter().filter(|t| !t.is_whitespace()).collect();
-                let inner = track_count(&tracks, depth + 1)?;
-                match n {
-                    [CV::Token(Token::Number {
-                        value,
-                        is_integer: true,
-                    })] if *value >= 1.0 => {
-                        let times = value.min(MAX_COLUMNS as f32) as u32;
-                        match inner {
-                            Some(k) => count = count.saturating_add(times.saturating_mul(k)),
-                            None => unknown = true,
-                        }
-                    }
-                    [k] if k.is_ident("auto-fill") || k.is_ident("auto-fit") => unknown = true,
-                    _ => return None,
-                }
-            }
-            CV::Function { name, .. }
-                if ["minmax", "fit-content", "calc", "min", "max", "clamp"]
-                    .iter()
-                    .any(|f| name.eq_ignore_ascii_case(f)) =>
-            {
-                count = count.saturating_add(1);
-            }
-            CV::Token(Token::Dimension { .. } | Token::Percentage(_)) => {
-                count = count.saturating_add(1);
-            }
-            CV::Token(Token::Number { value, .. }) if *value == 0.0 => {
-                count = count.saturating_add(1);
-            }
-            _ if ["auto", "min-content", "max-content"]
-                .iter()
-                .any(|k| v.is_ident(k)) =>
-            {
-                count = count.saturating_add(1);
-            }
-            _ => return None,
-        }
-    }
-    Some((!unknown).then_some(count.min(MAX_COLUMNS)))
-}
-
-fn columns_value(items: &[&CV]) -> Option<u32> {
-    if let [v] = items {
-        if v.is_ident("none") || v.is_ident("subgrid") || v.is_ident("masonry") {
-            return Some(0);
-        }
-    }
-    if items.first().is_some_and(|v| v.is_ident("subgrid")) {
-        return Some(0);
-    }
-    Some(track_count(items, 0)?.unwrap_or(0))
-}
-
-pub(super) fn grid_template_columns(
-    items: &[&CV],
-    ids: &[LonghandId],
-    _: &ParseCtx,
-    out: &mut Out,
-) -> Option<()> {
-    push(out, only(ids)?, Spec::Count(columns_value(items)?));
-    Some(())
-}
-
-/// `grid-template` / `grid`: the column count comes from the part after `/`
-/// (0 for `none`, area-only templates or auto-flow columns).
-pub(super) fn grid_template(
-    items: &[&CV],
-    ids: &[LonghandId],
-    _: &ParseCtx,
-    out: &mut Out,
-) -> Option<()> {
-    let id = only(ids)?;
-    let count = match items.iter().position(|v| v.is_delim('/')) {
-        Some(slash) => {
-            let columns = items.get(slash + 1..)?;
-            if columns
-                .iter()
-                .any(|v| v.is_ident("auto-flow") || v.is_ident("dense"))
-            {
-                0
-            } else {
-                columns_value(columns)?
-            }
-        }
-        None => 0,
-    };
-    push(out, id, Spec::Count(count));
-    Some(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{parse, spec};
@@ -635,38 +524,6 @@ mod tests {
         assert_eq!(
             spec("flex-flow", "column wrap", LonghandId::FlexWrap),
             Some(Spec::FlexWrap(FlexWrap::Wrap))
-        );
-    }
-
-    #[test]
-    fn grid_columns() {
-        let cols = |css: &str| match spec("grid-template-columns", css, LonghandId::GridColumns) {
-            Some(Spec::Count(n)) => Some(n),
-            _ => None,
-        };
-        assert_eq!(cols("1fr 1fr 200px"), Some(3));
-        assert_eq!(cols("repeat(4, 1fr)"), Some(4));
-        assert_eq!(cols("[a] 100px repeat(2, 1fr [b] 2fr) auto"), Some(6));
-        assert_eq!(cols("repeat(auto-fill, minmax(100px, 1fr))"), Some(0));
-        assert_eq!(cols("none"), Some(0));
-        assert_eq!(cols("minmax(0, 1fr) fit-content(40%)"), Some(2));
-        assert_eq!(cols("repeat(1000000000, 1fr)"), Some(MAX_COLUMNS));
-        assert_eq!(cols("bogus"), None);
-        assert_eq!(
-            spec(
-                "grid-template",
-                "auto 1fr / 100px 1fr",
-                LonghandId::GridColumns
-            ),
-            Some(Spec::Count(2))
-        );
-        assert_eq!(
-            spec("grid", "auto-flow / 1fr 1fr 1fr", LonghandId::GridColumns),
-            Some(Spec::Count(3))
-        );
-        assert_eq!(
-            spec("grid", "100px / auto-flow 50px", LonghandId::GridColumns),
-            Some(Spec::Count(0))
         );
     }
 }

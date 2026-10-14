@@ -1,8 +1,12 @@
 //! The user-agent stylesheet (based on the "Rendering" section of the HTML standard).
 //!
 //! Values follow the HTML standard and Chrome's defaults. Approximations:
-//! form-control borders are drawn as `1px solid #767676`, `fieldset` uses a
-//! `#c0c0c0` groove, `summary` is a plain block (no disclosure marker), the
+//! form-control borders are drawn as `1px solid #767676` (buttons,
+//! `select` and the button-like, checkbox, radio, range, color and file
+//! inputs are `border-box`; range inputs have no border nor padding),
+//! `fieldset` uses a `#c0c0c0` groove and its `min-inline-size:
+//! min-content` computes to `auto` (intrinsic sizes are not supported by
+//! the style system), `summary` is a plain block (no disclosure marker), the
 //! `-internal-center` behaviour of `th` is plain `center`, the
 //! block-centering of `<center>` / `align=center` only applies to tables, and the
 //! monospace font-size quirk is applied with `0.8125em` on monospace
@@ -81,6 +85,7 @@ table {
   text-indent: 0;
 }
 caption { display: table-caption; text-align: center; }
+caption[align=bottom i] { caption-side: bottom; }
 colgroup { display: table-column-group; }
 col { display: table-column; }
 thead { display: table-header-group; }
@@ -176,8 +181,28 @@ input:is([type=checkbox i], [type=radio i]) {
   background-color: transparent;
 }
 input[type=image i] { border: none; padding: 0; background-color: transparent; }
+input[type=range i] {
+  margin: 2px;
+  border: none;
+  padding: 0;
+  background-color: transparent;
+  cursor: default;
+}
+input[type=color i] {
+  border: 1px solid #767676;
+  padding: 1px 2px;
+  background-color: #efefef;
+  cursor: default;
+}
+button, select,
+input:is([type=submit i], [type=reset i], [type=button i], [type=image i], [type=color i],
+  [type=checkbox i], [type=radio i], [type=range i], [type=file i]) {
+  box-sizing: border-box;
+}
 select { padding: 1px 0; }
 fieldset {
+  display: block;
+  min-inline-size: min-content;
   margin: 0 2px;
   padding: 0.35em 0.75em 0.625em;
   border: 2px groove #c0c0c0;

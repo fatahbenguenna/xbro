@@ -31,6 +31,11 @@ pub struct LoadState {
     pub request: NavigationRequest,
     pub started: Instant,
     pub kind: NavKind,
+    /// Started from the browser UI (address bar, home button, back and
+    /// forward): the address bar shows its URL while it loads, as in other
+    /// browsers. Loads started by the page (links, forms, `<meta refresh>`)
+    /// keep showing the current page's URL until they commit.
+    pub from_ui: bool,
 }
 
 /// A pending `<meta http-equiv=refresh>`.
@@ -85,11 +90,16 @@ impl Tab {
         self.history.current().map(|e| e.url())
     }
 
-    /// URL shown in the address bar: the committed URL, or the one being
-    /// loaded when nothing was committed yet.
+    /// URL shown in the address bar: the one being loaded when the load
+    /// was started from the browser UI (see [`LoadState::from_ui`]) or when
+    /// nothing was committed yet, else the committed URL.
     pub fn display_url(&self) -> Option<&Url> {
-        self.url()
-            .or_else(|| self.loading.as_ref().map(|l| l.request.url()))
+        match &self.loading {
+            Some(load) if load.from_ui => Some(load.request.url()),
+            load => self
+                .url()
+                .or_else(|| load.as_ref().map(|l| l.request.url())),
+        }
     }
 
     pub fn is_loading(&self) -> bool {
@@ -351,6 +361,7 @@ mod tests {
             request: NavigationRequest::Get(url.clone()),
             started: Instant::now(),
             kind: NavKind::New,
+            from_ui: false,
         });
         assert_eq!(tab.title(), "https://example.com/");
         assert_eq!(tab.display_url(), Some(&url));
@@ -370,6 +381,7 @@ mod tests {
             request: NavigationRequest::Get(url),
             started: Instant::now(),
             kind: NavKind::History(1),
+            from_ui: true,
         });
         assert_eq!(tab.back_index(), Some(0));
         assert_eq!(tab.forward_index(), Some(2));

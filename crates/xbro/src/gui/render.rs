@@ -11,9 +11,9 @@ use super::address_bar::{self, url_segments};
 use super::browser::{Browser, Drag, Focus};
 use super::chrome::{ChromeElement, ChromeLayout, CHROME_HEIGHT, UI_TEXT_SIZE};
 use super::line_edit::LineEdit;
-use super::paint::{caret_x, icons, Painter, Rgba};
+use super::paint::{caret_x, icons, visible_range, Painter, Rgba};
 use super::tabs::TabId;
-use super::viewport::{Axis, PageArea};
+use super::viewport::{self, Axis, PageArea};
 
 mod colors {
     use super::Rgba;
@@ -32,6 +32,8 @@ mod colors {
     pub const FIELD: Rgba = Rgba::rgb(241, 243, 244);
     pub const FIELD_HOVER: Rgba = Rgba::rgb(232, 234, 237);
     pub const FIELD_FOCUSED: Rgba = Rgba::rgb(255, 255, 255);
+    pub const BADGE_HOVER: Rgba = Rgba::rgb(232, 240, 254);
+    pub const BADGE_PRESSED: Rgba = Rgba::rgb(210, 227, 252);
     pub const NOT_FOUND: Rgba = Rgba::rgb(252, 228, 228);
     pub const ACCENT: Rgba = Rgba::rgb(26, 115, 232);
     pub const SELECTION: Rgba = Rgba::rgb(187, 214, 251);
@@ -48,6 +50,9 @@ mod colors {
 /// Largest window area drawn, in device pixels (two buffers of this size
 /// are kept: the frame and the page layer).
 const MAX_FRAME_PIXELS: u64 = 1 << 27;
+
+/// Field texts longer than this (bytes) are drawn from their visible part only.
+const LONG_FIELD_TEXT: usize = 256;
 
 /// What the cached page layer shows.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -154,9 +159,17 @@ fn draw_overlays(p: &mut Painter, b: &Browser, layout: &ChromeLayout, area: &Pag
         return;
     };
     let page_rect = area.rect();
-    if tab.find.open && tab.page.is_some() {
-        for (i, rect) in tab.find.matches.iter().enumerate() {
-            let dev = area.to_device(*rect, tab.scroll);
+    if let (true, Some(page)) = (tab.find.open && !tab.find.matches.is_empty(), &tab.page) {
+        // Content scrolling under a fixed header (or any fixed box with a
+        // background) is hidden, and so are its highlights.
+        let backdrops: Vec<Rect> = page
+            .fixed_backdrops()
+            .into_iter()
+            .map(|r| area.to_device(r, Point::ZERO))
+            .collect();
+        for (i, m) in tab.find.matches.iter().enumerate() {
+            // Matches in fixed content stay at their viewport position.
+            let dev = area.to_device(m.viewport_rect(tab.scroll), Point::ZERO);
             let Some(visible) = dev.intersection(&page_rect) else {
                 continue;
             };
@@ -165,7 +178,18 @@ fn draw_overlays(p: &mut Painter, b: &Browser, layout: &ChromeLayout, area: &Pag
             } else {
                 colors::MATCH
             };
-            p.fill_device_rect(visible, color);
+            let mut pieces = vec![visible];
+            if !m.fixed {
+                for hole in &backdrops {
+                    pieces = pieces
+                        .into_iter()
+                        .flat_map(|r| viewport::subtract(r, *hole))
+                        .collect();
+                }
+            }
+            for piece in pieces {
+                p.fill_device_rect(piece, color);
+            }
         }
     }
 
@@ -202,29 +226,81 @@ fn draw_overlays(p: &mut Painter, b: &Browser, layout: &ChromeLayout, area: &Pag
         // Huge (data:) URLs: only the start can be shown anyway.
         let text: String = text.chars().take(1000).collect();
         let page = layout.page;
-        let height = 22.0;
+        let height = STATUS_HEIGHT;
         let max_width = (page.width * 0.6).max(160.0).min(page.width - 4.0);
         let text = b
             .fonts
             .truncate(&text, UI_TEXT_SIZE - 1.0, false, p.dpi, max_width - 16.0);
         let width = b.fonts.measure(&text, UI_TEXT_SIZE - 1.0, false, p.dpi) + 16.0;
-        let rect = Rect::new(
-            page.x - 1.0,
-            page.bottom() - height + 1.0,
-            width + 1.0,
-            height,
-        );
-        p.fill_rounded(rect, [0.0, 5.0, 0.0, 0.0], colors::STATUS_BORDER);
-        let inner = Rect::new(rect.x, rect.y + 1.0, rect.width - 1.0, rect.height - 1.0);
-        p.fill_rounded(inner, [0.0, 4.0, 0.0, 0.0], colors::STATUS);
+        let pointer = b.mouse.map(|(x, y)| Point::new(x / p.dpi, y / p.dpi));
+        let (rect, right) = status_bubble(page, width, height, pointer);
+        // A one-pixel border on the sides facing the page, rounded at the top.
+        let (outer_radii, inner_radii, inner) = if right {
+            (
+                [5.0, 0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0, 0.0],
+                Rect::new(
+                    rect.x + 1.0,
+                    rect.y + 1.0,
+                    rect.width - 1.0,
+                    rect.height - 1.0,
+                ),
+            )
+        } else {
+            (
+                [0.0, 5.0, 0.0, 0.0],
+                [0.0, 4.0, 0.0, 0.0],
+                Rect::new(rect.x, rect.y + 1.0, rect.width - 1.0, rect.height - 1.0),
+            )
+        };
+        p.fill_rounded(rect, outer_radii, colors::STATUS_BORDER);
+        p.fill_rounded(inner, inner_radii, colors::STATUS);
         p.text(
-            rect.x + 9.0,
+            inner.x + if right { 8.0 } else { 9.0 },
             inner.y + inner.height / 2.0,
             &text,
             UI_TEXT_SIZE - 1.0,
             colors::TEXT_DIM,
             false,
         );
+    }
+}
+
+/// Height of the status bubble, logical px.
+const STATUS_HEIGHT: f32 = 22.0;
+/// Margin above the status bubble where the pointer moves it aside.
+const STATUS_MARGIN: f32 = 8.0;
+
+/// Whether a pointer at `p` (logical px) can affect where the status bubble
+/// goes: the band along the bottom of the page area where it is drawn.
+pub fn in_status_band(page: Rect, p: Point) -> bool {
+    p.y >= page.bottom() - STATUS_HEIGHT - STATUS_MARGIN + 1.0 && p.y < page.bottom() + 1.0
+}
+
+/// Where the status bubble goes (logical px): in the bottom-left corner of
+/// the page, or in the bottom-right one when the pointer is over that place
+/// (it would hide the link being pointed at). Returns the rect and whether
+/// it is on the right.
+fn status_bubble(page: Rect, width: f32, height: f32, pointer: Option<Point>) -> (Rect, bool) {
+    let left = Rect::new(
+        page.x - 1.0,
+        page.bottom() - height + 1.0,
+        width + 1.0,
+        height,
+    );
+    // With a margin above and after it: the pointer is often a little
+    // above or after the part of a link that the bubble would hide.
+    let near = Rect::new(
+        left.x,
+        left.y - STATUS_MARGIN,
+        left.width + 2.0 * STATUS_MARGIN,
+        left.height + STATUS_MARGIN,
+    );
+    if pointer.is_some_and(|pt| near.contains(pt)) {
+        let right = Rect::new(page.right() - width, left.y, width + 1.0, height);
+        (right, true)
+    } else {
+        (left, false)
     }
 }
 
@@ -391,12 +467,43 @@ fn draw_toolbar(p: &mut Painter, b: &Browser, layout: &ChromeLayout, now: Instan
         }
     }
 
+    if let Some(badge) = layout.zoom_badge {
+        draw_zoom_badge(p, b, badge);
+    }
+
     if let Some(progress) = b.load_progress(now) {
         p.fill_rect(
             Rect::new(0.0, CHROME_HEIGHT - 2.0, layout.width * progress, 2.0),
             colors::ACCENT,
         );
     }
+}
+
+/// The zoom level ("125%") at the right end of the address field; a click
+/// resets it.
+fn draw_zoom_badge(p: &mut Painter, b: &Browser, r: Rect) {
+    let radius = r.height / 2.0;
+    let element = ChromeElement::ZoomReset;
+    let bg = if b.hover == Some(element) && b.pressed == Some(element) {
+        colors::BADGE_PRESSED
+    } else if b.hover == Some(element) {
+        colors::BADGE_HOVER
+    } else {
+        colors::FIELD_FOCUSED
+    };
+    p.fill_rounded(r, [radius; 4], bg);
+    p.stroke_rounded(r, radius, 1.0, colors::BORDER);
+    let label = format!("{}%", (b.zoom() * 100.0).round());
+    let size = UI_TEXT_SIZE - 1.0;
+    let w = b.fonts.measure(&label, size, false, p.dpi);
+    p.text(
+        r.x + (r.width - w) / 2.0,
+        r.y + r.height / 2.0,
+        &label,
+        size,
+        colors::TEXT,
+        false,
+    );
 }
 
 /// Draws an editable line of text in `inner` (selection, text, caret), or
@@ -446,10 +553,22 @@ fn draw_edit(
             inner,
         );
     } else {
+        // Only the part of a long text that can show is shaped and drawn
+        // again (the caret stops are cached, see `UiFonts`).
+        let text = edit.text();
+        let range = if text.len() > LONG_FIELD_TEXT {
+            visible_range(&stops, scroll_x, scroll_x + inner.width, 4.0 * UI_TEXT_SIZE)
+        } else {
+            0..text.len()
+        };
+        let (start, shown) = match text.get(range.clone()) {
+            Some(slice) => (range.start, slice),
+            None => (0, text),
+        };
         p.text_clipped(
-            x0,
+            x0 + caret_x(&stops, start),
             cy,
-            edit.text(),
+            shown,
             UI_TEXT_SIZE,
             colors::TEXT,
             false,
@@ -546,12 +665,31 @@ fn draw_find_bar(p: &mut Painter, b: &Browser, layout: &ChromeLayout) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::browser::tests::{browser, finish, url};
+    use super::super::browser::tests::{browser, engine, finish, fixed_header_page, url};
     use super::*;
 
     fn pixel(frame: &Pixmap, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * frame.width() + x) * 4) as usize;
         frame.data()[i..i + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn the_status_bubble_moves_away_from_the_pointer() {
+        let page = Rect::new(0.0, 74.0, 800.0, 526.0);
+        let (rect, right) = status_bubble(page, 200.0, 22.0, None);
+        assert!(!right);
+        assert_eq!((rect.x, rect.bottom()), (-1.0, 601.0));
+        let (_, right) = status_bubble(page, 200.0, 22.0, Some(Point::new(400.0, 590.0)));
+        assert!(!right, "the pointer is elsewhere");
+        let (rect, right) = status_bubble(page, 200.0, 22.0, Some(Point::new(100.0, 590.0)));
+        assert!(right);
+        assert_eq!(rect.right(), 801.0);
+        assert_eq!(rect.bottom(), 601.0);
+        // Just above or after the bubble counts too.
+        let (_, right) = status_bubble(page, 200.0, 22.0, Some(Point::new(100.0, 573.0)));
+        assert!(right);
+        let (_, right) = status_bubble(page, 200.0, 22.0, Some(Point::new(210.0, 590.0)));
+        assert!(right);
     }
 
     #[test]
@@ -589,5 +727,101 @@ mod tests {
         b.resize(1600, 1200, 2.0);
         let frame = r.render(&mut b, now).unwrap();
         assert_eq!((frame.width(), frame.height()), (1600, 1200));
+    }
+
+    #[test]
+    fn fixed_find_matches_are_highlighted_where_they_are_shown() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        let job = jobs.borrow_mut().pop().unwrap();
+        let page = engine().load_html(
+            &fixed_header_page(),
+            job.request.url().clone(),
+            job.viewport,
+        );
+        b.on_loaded(job.tab_id, job.nav_id, page);
+        b.scroll_to(Point::new(0.0, 1500.0));
+        b.open_find();
+        b.tabs.active_mut().unwrap().find.query.insert("needle");
+        b.run_find();
+        let m = b.active().unwrap().find.current_match().unwrap();
+        assert!(m.fixed);
+        let mut r = Renderer::default();
+        let frame = r.render(&mut b, Instant::now()).unwrap();
+        // The current-match colour over the white header, at the match's
+        // viewport position (the page is scrolled by 1500 px).
+        let area = b.page_area();
+        let dev = area.to_device(m.rect, Point::ZERO);
+        let [red, green, blue, _] = pixel(frame, dev.x as u32 + 1, dev.y as u32 + 1);
+        assert!(
+            red > 200 && green < 230 && blue < 160,
+            "{:?}",
+            (red, green, blue)
+        );
+    }
+
+    #[test]
+    fn huge_field_texts_are_shaped_once() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        finish(&mut b, &jobs, "A", 3);
+        b.focus_address();
+        let huge = format!("data:text/plain,{}", "0123456789".repeat(50_000));
+        b.address.edit.insert(&huge);
+        b.update_field_scrolls();
+        let mut r = Renderer::default();
+        let shapes = b.fonts.caret_shapes();
+        let frame = r.render(&mut b, Instant::now()).unwrap();
+        // The end of the text (where the caret is) is drawn.
+        let inner = b.layout().address_text();
+        let dark = (inner.x as u32..inner.right() as u32)
+            .flat_map(|x| (inner.y as u32..inner.bottom() as u32).map(move |y| (x, y)))
+            .filter(|&(x, y)| pixel(frame, x, y)[0] < 128)
+            .count();
+        if b.fonts.system.has_fonts() {
+            assert!(dark > 50, "{dark} dark pixels");
+        }
+        r.render(&mut b, Instant::now()).unwrap();
+        b.update_field_scrolls();
+        assert_eq!(b.fonts.caret_shapes(), shapes, "no new shaping");
+        // An edit shapes the new text once.
+        b.address.edit.insert("!");
+        b.update_field_scrolls();
+        r.render(&mut b, Instant::now()).unwrap();
+        assert_eq!(b.fonts.caret_shapes(), shapes + 1);
+    }
+
+    #[test]
+    fn matches_under_a_fixed_header_are_not_highlighted() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        let job = jobs.borrow_mut().pop().unwrap();
+        let page = engine().load_html(
+            &fixed_header_page(),
+            job.request.url().clone(),
+            job.viewport,
+        );
+        b.on_loaded(job.tab_id, job.nav_id, page);
+        b.open_find();
+        b.tabs.active_mut().unwrap().find.query.insert("needle");
+        b.run_find();
+        // Put a match of the flow under the 40 px header (below its text).
+        let m = b.active().unwrap().find.matches[10];
+        assert!(!m.fixed);
+        b.scroll_to(Point::new(0.0, m.rect.y - 22.0));
+        let mut r = Renderer::default();
+        let frame = r.render(&mut b, Instant::now()).unwrap();
+        let area = b.page_area();
+        let dev = area.to_device(m.viewport_rect(b.active().unwrap().scroll), Point::ZERO);
+        assert!(dev.y > area.top as f32 && dev.y + 4.0 < area.top as f32 + 40.0);
+        assert_eq!(
+            pixel(frame, dev.x as u32 + 1, dev.y as u32 + 1),
+            [255, 255, 255, 255]
+        );
+        // The next match, in view below the header, is highlighted.
+        let next = b.active().unwrap().find.matches[11];
+        let dev = area.to_device(next.viewport_rect(b.active().unwrap().scroll), Point::ZERO);
+        let [_, _, blue, _] = pixel(frame, dev.x as u32 + 1, dev.y as u32 + 1);
+        assert!(blue < 200, "highlighted: {blue}");
     }
 }

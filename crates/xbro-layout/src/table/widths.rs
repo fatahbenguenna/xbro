@@ -33,7 +33,7 @@ use xbro_style::{BoxSizing, ComputedStyle, LengthPercentageAuto};
 use super::structure::Grid;
 use crate::box_tree::BoxNode;
 use crate::cx::LayoutCx;
-use crate::sizing::{box_edges, sane, sane_size, width_limits, EPSILON};
+use crate::sizing::{sane, sane_size, width_limits, EPSILON};
 
 /// Stand-in for an "infinite" max-content width (percentage columns adding
 /// up to 100% next to other content make a table as wide as possible).
@@ -87,10 +87,10 @@ fn width_hint(style: &ComputedStyle, width: &LengthPercentageAuto, pb: f32) -> W
     }
 }
 
-/// Min/max-content border-box widths of a cell.
-fn cell_widths<'t>(cx: &mut LayoutCx<'t>, cell: &'t BoxNode) -> CellWidths {
+/// Min/max-content border-box widths of a cell whose horizontal padding
+/// and used borders add up to `pb`.
+fn cell_widths<'t>(cx: &mut LayoutCx<'t>, cell: &'t BoxNode, pb: f32) -> CellWidths {
     let style = &cell.style;
-    let pb = box_edges(style, 0.0).pb_h();
     let content = cx.content_intrinsic(cell);
     let (min_w, max_w) = width_limits(style, None, pb);
     let mut min = content.min.max(min_w) + pb;
@@ -137,19 +137,20 @@ fn spread(cols: &mut [Column], excess: f32, field: fn(&mut Column) -> &mut f32) 
 }
 
 /// Column constraints of the grid (automatic layout). `inner` is the
-/// horizontal spacing between two columns (negative when collapsed
-/// borders overlap).
+/// horizontal spacing between two columns; `pb` the horizontal padding
+/// plus used borders of each cell (indexed like `grid.cells`).
 pub(crate) fn columns<'t>(
     cx: &mut LayoutCx<'t>,
     grid: &Grid<'t>,
     table: &'t BoxNode,
     inner: f32,
+    pb: &[f32],
 ) -> Vec<Column> {
     let n = grid.ncols;
     let mut cols = vec![Column::default(); n];
     let mut spanning = Vec::new();
-    for cell in &grid.cells {
-        let w = cell_widths(cx, cell.b);
+    for (i, cell) in grid.cells.iter().enumerate() {
+        let w = cell_widths(cx, cell.b, pb.get(i).copied().unwrap_or(0.0));
         if cell.colspan > 1 {
             spanning.push((cell.col, cell.colspan, w));
         } else if let Some(c) = cols.get_mut(cell.col) {
@@ -356,8 +357,15 @@ pub(crate) fn distribute(cols: &[Column], target: f32) -> Vec<f32> {
 }
 
 /// Column widths with `table-layout: fixed` for a grid width `target`
-/// (spacing excluded; `inner` is the spacing between columns).
-pub(crate) fn fixed_widths(grid: &Grid<'_>, table: &BoxNode, target: f32, inner: f32) -> Vec<f32> {
+/// (spacing excluded; `inner` is the spacing between columns, `pb` the
+/// horizontal padding plus used borders of each cell).
+pub(crate) fn fixed_widths(
+    grid: &Grid<'_>,
+    table: &BoxNode,
+    target: f32,
+    inner: f32,
+    pb: &[f32],
+) -> Vec<f32> {
     let n = grid.ncols;
     let target = sane_size(target);
     let mut widths: Vec<Option<f32>> = vec![None; n];
@@ -377,7 +385,13 @@ pub(crate) fn fixed_widths(grid: &Grid<'_>, table: &BoxNode, target: f32, inner:
         }
     }
     if let Some(first) = grid.rows.first() {
-        for cell in grid.cells.get(first.cells.clone()).unwrap_or(&[]) {
+        for (i, cell) in grid
+            .cells
+            .iter()
+            .enumerate()
+            .skip(first.cells.start)
+            .take(first.cells.len())
+        {
             let end = (cell.col + cell.colspan).min(n);
             let Some(slots) = widths.get_mut(cell.col..end) else {
                 continue;
@@ -386,7 +400,7 @@ pub(crate) fn fixed_widths(grid: &Grid<'_>, table: &BoxNode, target: f32, inner:
                 continue;
             }
             let style = &cell.b.style;
-            let pb = box_edges(style, 0.0).pb_h();
+            let pb = pb.get(i).copied().unwrap_or(0.0);
             if let Some(w) = resolve(width_hint(style, &style.width, pb)) {
                 let k = slots.len() as f32;
                 let each = sane_size((w - inner * (k - 1.0)) / k);

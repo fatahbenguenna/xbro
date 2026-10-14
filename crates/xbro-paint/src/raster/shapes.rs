@@ -26,6 +26,35 @@ pub(crate) fn solid_paint(c: Color) -> Paint<'static> {
     paint
 }
 
+/// `target.fill_rect(rect, paint)` with anti-aliasing (identity transform).
+///
+/// tiny-skia 0.11 (`scan::hairline_aa::fill_dot8`) debug-asserts on a rect
+/// whose fractional left and right edges fall in adjacent pixel columns
+/// (no whole column between them, e.g. 11.1 → 12.5); release builds draw
+/// it correctly, but in debug builds the assertion aborted the whole
+/// rendering. Such a rect is drawn as its two single-column halves.
+pub(crate) fn fill_rect_aa(
+    target: &mut tiny_skia::PixmapMut<'_>,
+    rect: DevRect,
+    paint: &Paint<'_>,
+    mask: Option<&tiny_skia::Mask>,
+) {
+    let split = rect.x0.ceil();
+    let parts = if rect.x0 < split && split < rect.x1 && rect.x1 - split < 1.0 {
+        [
+            DevRect::new(rect.x0, rect.y0, split, rect.y1),
+            DevRect::new(split, rect.y0, rect.x1, rect.y1),
+        ]
+    } else {
+        [rect, DevRect::EMPTY]
+    };
+    for part in parts {
+        if let Some(r) = part.to_skia() {
+            target.fill_rect(r, paint, Transform::identity(), mask);
+        }
+    }
+}
+
 /// Scales CSS radii to device px and clamps them so adjacent radii fit.
 pub(crate) fn scale_radii(radii: [f32; 4], scale: f32, rect: DevRect) -> [f32; 4] {
     let mut r = radii.map(|v| {
@@ -274,9 +303,8 @@ pub(crate) fn draw_linear_gradient(
         let Some((visible, mask)) = p.rect_clip(dev) else {
             return;
         };
-        let Some(r) = visible.to_skia() else { return };
         if let Some(mut target) = p.target() {
-            target.fill_rect(r, &paint, Transform::identity(), mask.as_deref());
+            fill_rect_aa(&mut target, visible, &paint, mask.as_deref());
         }
         p.mark_dirty(visible);
     } else {

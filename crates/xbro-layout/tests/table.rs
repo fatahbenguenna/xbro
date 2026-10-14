@@ -155,7 +155,7 @@ fn colspan_distributes_its_width() {
 }
 
 #[test]
-fn rowspan_heights_go_to_the_last_row() {
+fn rowspan_heights_are_distributed_over_the_spanned_rows() {
     let Some(l) = table(
         "<table id=t style='border-spacing:0'>
            <tr><td rowspan=2><div style='width:10px;height:100px'></div></td><td style='height:20px'>a</td></tr>
@@ -167,13 +167,15 @@ fn rowspan_heights_go_to_the_last_row() {
         return;
     };
     let r = rows(&l, "t");
-    assert_eq!(r[0].height, 20.0);
-    assert_eq!(r[1].height, 80.0);
+    // The 60px the spanning cell lacks are shared by its rows in
+    // proportion to their heights (20px each).
+    assert_eq!(r[0].height, 50.0);
+    assert_eq!(r[1].height, 50.0);
     let c = cells(&l, "t");
     // The spanning cell covers both rows; the cell after it is in column 2.
     assert_eq!((c[0].y, c[0].height), (0.0, 100.0));
     assert_eq!(c[2].x, c[1].x);
-    assert_eq!(c[2].y, 20.0);
+    assert_eq!(c[2].y, 50.0);
     // The third row starts below the span.
     assert_eq!(c[3].y, 100.0);
     // rowspan=0 spans to the end of the group.
@@ -188,7 +190,7 @@ fn rowspan_heights_go_to_the_last_row() {
 }
 
 #[test]
-fn collapsed_borders_overlap() {
+fn collapsed_borders_are_shared() {
     let Some(l) = table(
         "<table id=t style='border-collapse:collapse;border:1px solid'>
            <tr><td style='border:1px solid;width:20px;height:10px'></td><td style='border:1px solid;width:20px;height:10px'></td></tr>
@@ -200,15 +202,174 @@ fn collapsed_borders_overlap() {
     };
     let c = cells(&l, "t");
     let t = l.rect("t");
-    // Shared borders are drawn once: neighbours overlap by 1px, and the
-    // outer cells overlap the table's border.
-    assert_eq!(c[1].x, c[0].right() - 1.0);
-    assert_eq!(c[2].y, c[0].bottom() - 1.0);
+    // Shared borders are drawn once: neighbours abut, each line is the
+    // left/top border of the cell after it, and the outer cells cover the
+    // table's border.
+    assert_eq!(c[1].x, c[0].right());
+    assert_eq!(c[2].y, c[0].bottom());
     assert_eq!(c[0].x, t.x);
     assert_eq!(c[0].y, t.y);
     assert_eq!(c[1].right(), t.right());
     assert_eq!(c[3].bottom(), t.bottom());
     assert_eq!(t.width, 22.0 + 22.0 - 1.0);
+    let b = |i: usize| l.box_id("t").children[0].children[i / 2].children[i % 2].border;
+    assert_eq!(b(0), xbro_layout::Edges::new(1.0, 0.0, 0.0, 1.0));
+    assert_eq!(b(1), xbro_layout::Edges::new(1.0, 1.0, 0.0, 1.0));
+    assert_eq!(b(3), xbro_layout::Edges::new(1.0, 1.0, 1.0, 1.0));
+    assert_eq!(t.height, 11.0 + 12.0);
+}
+
+#[test]
+fn collapsed_border_conflicts() {
+    let Some(l) = table(
+        "<table id=t style='border-collapse:collapse;border:4px solid rgb(0,0,255)'>
+           <tr><td id=a style='border:1px solid rgb(255,0,0);border-right:3px dotted rgb(0,128,0)'>a</td>
+               <td id=b style='border:2px solid rgb(255,0,0)'>b</td>
+               <td id=c style='border:1px solid;border-left-style:hidden'>c</td></tr>
+           <tr><td id=d style='border:1px solid'>d</td></tr>
+         </table>",
+        800.0,
+    ) else {
+        return;
+    };
+    let find = |id: &str| l.box_id(id);
+    // The table's 4px border wins on the outer edges of the outer cells.
+    let a = find("a");
+    assert_eq!((a.border.top, a.border.left), (4.0, 4.0));
+    assert_eq!(a.style.border.left.color, xbro_style::Color::rgb(0, 0, 255));
+    // The wider dotted right side of `a` wins over `b`'s 2px left side:
+    // `b` paints it, in `a`'s style.
+    let b = find("b");
+    assert_eq!((a.border.right, b.border.left), (0.0, 3.0));
+    assert_eq!(b.style.border.left.style, xbro_style::BorderStyle::Dotted);
+    assert_eq!(b.style.border.left.color, xbro_style::Color::rgb(0, 128, 0));
+    // `hidden` suppresses the border between `b` and `c`.
+    assert_eq!(find("c").border.left, 0.0);
+    // No cell right of `d` (a short row): `d` paints its own right border.
+    let d = find("d");
+    assert_eq!(d.border.right, 1.0);
+    // The second row is short: the slots right of `d` have no cell, so
+    // the table box keeps painting its own border (it would else be
+    // missing there); the cells still cover it.
+    let t = l.box_id("t");
+    assert_eq!(t.border.left, 4.0);
+    assert_eq!(t.style.border.left.style, xbro_style::BorderStyle::Solid);
+    assert_eq!(a.border_box().x, t.border_box().x);
+}
+
+#[test]
+fn collapsed_table_border_painted_by_cells_or_table() {
+    // Every slot along the outer edges has a cell (a rowspan and a
+    // colspan included): the cells paint the table's border, the table
+    // box does not.
+    let full = "<table id=t style='border-collapse:collapse;border:3px solid'>
+           <tr><td rowspan=2>a</td><td>b</td><td>c</td></tr>
+           <tr><td colspan=2>d</td></tr>
+         </table>";
+    // Rows of different lengths, or an empty row: empty slots along the
+    // edges, where only the table box can paint its border.
+    let short = "<table id=t style='border-collapse:collapse;border:3px solid'>
+           <tr><td>a</td><td>b</td><td>c</td></tr>
+           <tr><td>d</td></tr>
+           <tr><td>e</td><td>f</td><td>g</td></tr>
+         </table>";
+    let empty_row = "<table id=t style='border-collapse:collapse;border:3px solid'>
+           <tr><td>a</td><td>b</td></tr><tr></tr><tr><td>c</td><td>d</td></tr>
+         </table>";
+    for (html, table_paints) in [(full, false), (short, true), (empty_row, true)] {
+        let Some(l) = table(html, 800.0) else {
+            return;
+        };
+        let t = l.box_id("t");
+        assert_eq!(
+            t.style.border.right.style.is_visible(),
+            table_paints,
+            "{html}"
+        );
+        // Either way the outer cells take the table's border width.
+        let c = cells(&l, "t");
+        assert_eq!(c[0].x, t.border_box().x, "{html}");
+        let mut v = Vec::new();
+        boxes_of(t, &BoxKind::TableCell, &mut v);
+        assert!(v
+            .iter()
+            .all(|c| c.border.left == 3.0 || c.border_box().x > t.border_box().x));
+    }
+}
+
+#[test]
+fn bottom_captions_sit_below_the_table_box() {
+    let Some(l) = table(
+        "<style>#t caption.b{caption-side:bottom;height:25px}</style>
+         <table id=t style='border:2px solid;border-spacing:0;margin:10px 0 7px'>
+           <caption id=top style='height:30px'>Top</caption>
+           <caption id=bot class=b>Bottom</caption>
+           <tr><td style='width:200px;height:20px'></td></tr>
+         </table><div id=after style='height:5px'></div>",
+        800.0,
+    ) else {
+        return;
+    };
+    let t = l.box_id("t");
+    let bb = t.border_box();
+    assert_eq!(l.rect("top").y, 10.0);
+    assert_eq!(bb.y, 40.0);
+    assert_eq!(bb.height, 24.0);
+    let bot = l.rect("bot");
+    assert_eq!((bot.y, bot.height, bot.width), (64.0, 25.0, 204.0));
+    // Both captions are in the table's margin box; the next block follows.
+    assert_eq!(t.margin.bottom, 7.0 + 25.0);
+    assert_eq!(l.rect("after").y, 64.0 + 25.0 + 7.0);
+    // Floats and inline tables count it too.
+    let Some(l) = table(
+        "<div><table id=f style='float:left;border-spacing:0'><caption style='caption-side:bottom;height:15px'>c</caption>
+           <tr><td style='width:50px;height:10px'></td></tr></table>
+           <div id=next style='clear:left;height:5px'></div></div>",
+        800.0,
+    ) else {
+        return;
+    };
+    assert_eq!(l.rect("next").y, 25.0);
+}
+
+#[test]
+fn table_layout_fixed_from_a_stylesheet() {
+    let Some(l) = table(
+        "<style>.fixed{table-layout:fixed;width:300px;border-spacing:0}</style>
+         <table id=t class=fixed>
+           <tr><td style='width:50px'></td><td></td><td></td></tr>
+           <tr><td>a_very_long_unbreakable_word_that_would_widen_an_auto_column</td><td></td><td></td></tr>
+         </table>
+         <table id=a style='table-layout:fixed;border-spacing:0'><tr><td>x</td><td>yyyyyy</td></tr></table>",
+        800.0,
+    ) else {
+        return;
+    };
+    let c: Vec<Rect> = l.box_id("t").children[0].children[1]
+        .children
+        .iter()
+        .map(|b| b.border_box())
+        .collect();
+    // Widths from the first row (not the long word of the second one);
+    // the other columns share the rest.
+    assert_eq!((c[0].width, c[1].width, c[2].width), (50.0, 125.0, 125.0));
+    assert_eq!(l.rect("t").width, 300.0);
+    // `fixed` without a width: automatic layout.
+    let a = cells(&l, "a");
+    assert!(a[1].width > a[0].width);
+}
+
+#[test]
+fn table_min_height_grows_the_rows() {
+    let Some(l) = table(
+        "<table id=t style='min-height:100px;border-spacing:0'><tr><td style='height:10px'></td></tr><tr><td style='height:30px'></td></tr></table>",
+        800.0,
+    ) else {
+        return;
+    };
+    let r = rows(&l, "t");
+    assert_eq!((r[0].height, r[1].height), (25.0, 75.0));
+    assert_eq!(l.rect("t").height, 100.0);
 }
 
 #[test]
@@ -606,4 +767,42 @@ fn positioned_cells_contain_their_absolutely_positioned_boxes() {
     let s = l.rect("s");
     assert!(s.y > c.y + 30.0 && s.y < c.y + 60.0, "{s:?}");
     assert!(s.x > 0.0 && s.x < 20.0, "{s:?}");
+}
+
+#[test]
+fn collapsed_spans_beside_empty_slots_keep_their_whole_edge() {
+    // `wide` spans two columns above a row with a single cell: the part of
+    // its bottom edge over the empty slot has no other cell to paint it,
+    // so `wide` paints its whole bottom edge (and `d` not its top). Same
+    // for the right edge of `tall` beside an empty row.
+    let Some(l) = table(
+        "<style>td{border:2px solid}</style>
+         <table id=t style='border-collapse:collapse'>
+           <tr><td>x</td><td>yyyy</td><td>z</td></tr>
+           <tr><td id=wide colspan=2>wide</td><td id=c>c</td></tr>
+           <tr><td id=d>d</td></tr>
+         </table>
+         <table id=u style='border-collapse:collapse'>
+           <tr><td id=tall rowspan=3>tall</td><td id=a>a</td></tr>
+           <tr><td id=b>b</td></tr>
+           <tr style='height:30px'></tr>
+         </table>",
+        800.0,
+    ) else {
+        return;
+    };
+    let b = |id: &str| l.box_id(id).border;
+    assert_eq!(b("wide").bottom, 2.0);
+    assert_eq!(b("d").top, 0.0);
+    // `c` is above an empty slot too; the regular shared edges stay
+    // painted once (by the cell after / below).
+    assert_eq!(b("c").bottom, 2.0);
+    assert_eq!((b("wide").right, b("c").left), (0.0, 2.0));
+    assert_eq!(b("tall").right, 2.0);
+    assert_eq!((b("a").left, b("b").left), (0.0, 0.0));
+    assert_eq!((b("a").bottom, b("b").top), (0.0, 2.0));
+    // The bottom edge of `b` faces the empty row: `b` paints it.
+    assert_eq!(b("b").bottom, 2.0);
+    // Geometry: `d` starts right below `wide`'s border.
+    assert_eq!(l.rect("d").y, l.rect("wide").bottom());
 }

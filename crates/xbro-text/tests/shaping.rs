@@ -99,6 +99,56 @@ fn kerning_is_applied_between_glyphs_of_the_same_face() {
 }
 
 #[test]
+fn cached_kerning_matches_fresh_lookups() {
+    // Kerning pairs are cached per face: a warm cache, a cold one (a new
+    // font system) and threads filling a shared one concurrently must
+    // agree bit for bit.
+    let Some(fonts) = dejavu() else { return };
+    let text = "AVATAR To Wa Yo P. LT AV\u{200B}V fiflWAVE Ty r, v. 0123";
+    let cold: Vec<u32> = {
+        let Some(fresh) = dejavu() else { return };
+        fresh
+            .shape(FontId(0), 15.0, text, 0.0, 0.0)
+            .glyphs
+            .iter()
+            .map(|g| g.advance.to_bits())
+            .collect()
+    };
+    let advances = |fonts: &FontSystem| -> Vec<u32> {
+        fonts
+            .shape(FontId(0), 15.0, text, 0.0, 0.0)
+            .glyphs
+            .iter()
+            .map(|g| g.advance.to_bits())
+            .collect()
+    };
+    assert_eq!(advances(&fonts), cold);
+    assert_eq!(advances(&fonts), cold);
+    let fonts = Arc::new(fonts);
+    let threads: Vec<_> = (0..4)
+        .map(|t| {
+            let fonts = Arc::clone(&fonts);
+            std::thread::spawn(move || {
+                // Fill the cache with many distinct pairs.
+                let mut s = String::new();
+                for c in (0x20u32..0x250).filter_map(char::from_u32) {
+                    s.push(c);
+                    s.push(char::from_u32(0x41 + (c as u32 * 7 + t) % 58).unwrap_or('A'));
+                }
+                for _ in 0..20 {
+                    let _ = fonts.measure(FontId(0), 12.0, &s, 0.0, 0.0);
+                }
+                advances(&fonts)
+            })
+        })
+        .collect();
+    for thread in threads {
+        assert_eq!(thread.join().unwrap(), cold);
+    }
+    assert_eq!(advances(&fonts), cold);
+}
+
+#[test]
 fn letter_and_word_spacing() {
     let Some(fonts) = dejavu() else { return };
     let font = FontId(0);

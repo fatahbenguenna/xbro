@@ -326,4 +326,163 @@ mod tests {
         assert_eq!(pick("", None, Some(" x.png ")).unwrap().url, "x.png");
         assert_eq!(pick("", None, None), None);
     }
+
+    /// Deterministic xorshift64* numbers for the fuzz tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n.max(1) as u64) as usize
+        }
+    }
+
+    const PIECES: &[&str] = &[
+        "a.png",
+        "b.png",
+        "data:image/png;base64,AA==",
+        ",",
+        ",",
+        " ",
+        " ",
+        "  ",
+        "1x",
+        "2x",
+        "1.5x",
+        "0x",
+        "-1x",
+        "1e309x",
+        "NaNx",
+        "infx",
+        "640w",
+        "0w",
+        "-5w",
+        "1e40w",
+        "480h",
+        "2X",
+        "3W",
+        "x",
+        "w",
+        "(",
+        ")",
+        "(,)",
+        "\t",
+        "\u{a0}",
+        "\u{3000}",
+        "é",
+        "日本",
+        "url(a,b)",
+        "1e-45x",
+        "99999999999999999999w",
+        ".5x",
+        "+2x",
+        "1x2x",
+    ];
+
+    const SIZES: &[&str] = &[
+        "(max-width: 600px)",
+        "(min-width: 1e9px)",
+        "100vw",
+        "50vw",
+        "300px",
+        "2em",
+        "1rem",
+        "0",
+        "-10px",
+        "calc(100vw - 2em)",
+        "auto",
+        ",",
+        " ",
+        "(",
+        ")",
+        "1e39px",
+        "NaNpx",
+        "(orientation: portrait)",
+        "not all",
+        "and",
+        "100vh",
+        "1e-45px",
+        "é",
+    ];
+
+    fn random(rng: &mut Rng, pieces: &[&str], max: usize) -> String {
+        let mut s = String::new();
+        for _ in 0..rng.below(max) {
+            s.push_str(pieces[rng.below(pieces.len())]);
+            if rng.below(3) == 0 {
+                s.push(' ');
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn fuzz_srcset_sizes_and_choice() {
+        let mut rng = Rng(0x5eed_5eed_5eed_5eed);
+        let widths = [
+            0.0,
+            1.0,
+            320.0,
+            1024.0,
+            4000.0,
+            1e9,
+            -5.0,
+            f32::NAN,
+            f32::INFINITY,
+        ];
+        for _ in 0..5000 {
+            let srcset = random(&mut rng, PIECES, 16);
+            let sizes = random(&mut rng, SIZES, 8);
+            let c = ctx(widths[rng.below(widths.len())]);
+            let candidates = parse_srcset(&srcset);
+            assert!(candidates.len() <= 1000);
+            for candidate in &candidates {
+                assert!(!candidate.url.is_empty(), "{srcset:?}");
+                assert!(!candidate.url.contains(|c: char| c.is_ascii_whitespace()));
+                match candidate.descriptor {
+                    Descriptor::Density(v) | Descriptor::Width(v) => {
+                        assert!(v.is_finite() && v > 0.0, "{srcset:?}: {v}")
+                    }
+                    Descriptor::None => {}
+                }
+            }
+            if let Some(px) = evaluate_sizes(&sizes, &c) {
+                assert!(px.is_finite() && px >= 0.0, "{sizes:?}: {px}");
+            }
+            let src = ["", "src.png", "  "][rng.below(3)];
+            let sizes = (rng.below(2) == 0).then_some(sizes.as_str());
+            if let Some(choice) = choose(&srcset, sizes, Some(src), &c) {
+                assert!(!choice.url.is_empty());
+                assert!(
+                    (0.1..=10.0).contains(&choice.density),
+                    "{srcset:?} {sizes:?}: {choice:?}"
+                );
+                assert!(
+                    choice.url == "src.png" || candidates.iter().any(|k| k.url == choice.url),
+                    "{srcset:?}: {choice:?}"
+                );
+            } else {
+                assert!(candidates.is_empty() && src.trim().is_empty(), "{srcset:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn huge_srcset_stays_linear() {
+        let srcset = "a.png 1x, (((((".repeat(50_000) + &"b.png 2x,".repeat(50_000);
+        let start = std::time::Instant::now();
+        let candidates = parse_srcset(&srcset);
+        assert!(candidates.len() <= 1000);
+        let _ = choose(&srcset, None, None, &ctx(800.0));
+        let widths = "a.png 100w, ".repeat(50_000);
+        let sizes = "(max-width: 1px) 10px, ".repeat(20_000);
+        assert!(choose(&widths, Some(&sizes), None, &ctx(800.0)).is_some());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
 }

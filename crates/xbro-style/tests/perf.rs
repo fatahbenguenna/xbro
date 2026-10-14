@@ -111,3 +111,38 @@ fn large_document_under_300ms() {
     eprintln!("{elements} elements, 3000 rules styled in {elapsed:?}");
     assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
 }
+
+#[test]
+fn has_in_ancestor_compounds_is_evaluated_once_per_anchor() {
+    // `:has()` left of a descendant combinator is evaluated on the
+    // ancestors of every element; the cascade shares its results between
+    // elements (1.8 s for 21 000 elements when each paragraph re-walked
+    // the whole page; 330 ms for a 256-deep chain found by fuzzing).
+    let wide = format!(
+        "<div class=page>{}</div>",
+        "<section><p>para <span>x</span> <b>y</b></p><p>two</p></section>".repeat(3000)
+    );
+    let deep = "<div class=c1><span><b>".repeat(100) + "text";
+    let css = ".page:has(.missing) p { color: red } .page:has(.sidebar ~ .x) span { color: blue } \
+               :has(:link ~ *:hover > .c6) * { color: red } div:has(.c6) b { margin: 1px } \
+               section:has(> b, span) p { color: green }";
+    let sheet = xbro_css::parse_stylesheet(css);
+    for html in [&wide, &deep] {
+        let doc = xbro_html::parse_document(html);
+        let start = Instant::now();
+        let map = compute_styles(&doc, std::slice::from_ref(&sheet), &StyleContext::default());
+        let elapsed = start.elapsed();
+        assert!(map.styles.iter().any(Option::is_some));
+        eprintln!("{} nodes styled in {elapsed:?}", doc.len());
+        let budget = if cfg!(debug_assertions) { 3000 } else { 300 };
+        assert!(elapsed < Duration::from_millis(budget), "{elapsed:?}");
+    }
+    // The shared results are right: `section:has(> b, span) p` matches.
+    let doc = xbro_html::parse_document(
+        "<section><p id=a>x</p><span></span></section><section><p id=b>y</p></section>",
+    );
+    let map = compute_styles(&doc, std::slice::from_ref(&sheet), &StyleContext::default());
+    let color = |id: &str| map.get(doc.get_element_by_id(id).unwrap()).unwrap().color;
+    assert_eq!(color("a"), xbro_style::Color::rgb(0, 128, 0));
+    assert_ne!(color("b"), xbro_style::Color::rgb(0, 128, 0));
+}

@@ -2,7 +2,9 @@
 //! constraints, `box-sizing`) into used px values, with sanitising so that
 //! hostile values (`NaN`, `inf`, `1e30px`) never propagate into geometry.
 
-use xbro_style::{BoxSizing, ComputedStyle, LengthPercentage, LengthPercentageAuto, MaxSize};
+use xbro_style::{
+    BoxSizing, ComputedStyle, LengthPercentage, LengthPercentageAuto, MaxSize, Overflow,
+};
 
 use crate::geom::Edges;
 
@@ -160,6 +162,13 @@ fn max_size(v: &MaxSize, reference: Option<f32>) -> Option<f32> {
         (MaxSize::Length(l), None) if !l.has_percent() => Some(sane(l.px)),
         (MaxSize::Length(_), None) => None,
     }
+}
+
+/// A scroll container (`overflow` other than `visible`/`clip` on an
+/// axis): flex and grid items that are have no automatic minimum size.
+pub(crate) fn is_scroll_container(style: &ComputedStyle) -> bool {
+    let scrolls = |o: Overflow| !matches!(o, Overflow::Visible | Overflow::Clip);
+    scrolls(style.overflow_x) || scrolls(style.overflow_y)
 }
 
 /// `max(min, min(value, max))`: `min-*` wins over `max-*`.

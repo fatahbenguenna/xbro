@@ -753,10 +753,9 @@ impl<'a, 't> Builder<'a, 't> {
         let deco_color = style.decoration_color;
         let geometry = (!deco.is_none() && !deco_color.is_transparent() && t.rect.width > 0.0)
             .then(|| self.decoration_geometry(t));
-        let line = |y: f32, thickness: f32| DisplayItem::Rect {
+        let line = |y: f32, thickness: f32| DisplayItem::TextDecoration {
             rect: Rect::new(sane(t.rect.x), sane(y), sane_len(t.rect.width), thickness),
             color: deco_color,
-            radii: [0.0; 4],
         };
         if let Some(g) = &geometry {
             if deco.underline {
@@ -785,6 +784,13 @@ impl<'a, 't> Builder<'a, 't> {
         }
     }
 
+    /// Decoration lines of a text fragment: from the font metrics (the
+    /// `post` table underline, else 0.1em below the baseline) when fonts
+    /// are known, else from the fragment's box. The underline never
+    /// reaches more than 1px below the font's descent: its bottom edge is
+    /// clamped there (but its top stays below the baseline), which keeps
+    /// fonts with an exaggerated underline offset from drawing into the
+    /// next line.
     fn decoration_geometry(&mut self, t: &xbro_layout::TextFragment) -> DecorationGeometry {
         let size = t.font_size;
         let baseline = sane(t.baseline);
@@ -797,7 +803,12 @@ impl<'a, 't> Builder<'a, 't> {
                 let thickness = sane_len(m.underline_thickness).max(1.0);
                 DecorationGeometry {
                     thickness,
-                    underline: baseline + sane(m.underline_offset),
+                    underline: clamp_underline(
+                        baseline,
+                        sane(m.underline_offset),
+                        sane_len(m.descent),
+                        thickness,
+                    ),
                     overline: baseline - sane_len(m.ascent),
                     line_through: baseline - sane_len(m.x_height) / 2.0 - thickness / 2.0,
                 }
@@ -806,9 +817,11 @@ impl<'a, 't> Builder<'a, 't> {
                 let thickness = (size / 14.0).max(1.0);
                 let ascent = baseline - sane(t.rect.y);
                 let ascent = if ascent > 0.0 { ascent } else { size * 0.8 };
+                let descent = sane(t.rect.bottom()) - baseline;
+                let descent = if descent > 0.0 { descent } else { size * 0.2 };
                 DecorationGeometry {
                     thickness,
-                    underline: baseline + size * 0.1,
+                    underline: clamp_underline(baseline, size * 0.1, descent, thickness),
                     overline: baseline - ascent,
                     line_through: baseline - size * 0.25 - thickness / 2.0,
                 }
@@ -827,7 +840,35 @@ impl<'a, 't> Builder<'a, 't> {
         if !self.background_is_canvas(b) {
             self.paint_background(&b.style, border_box, sane_rect(b.padding_box()), radii);
         }
-        self.paint_border(&b.style, border_box, b.border, radii);
+        match top_gap(b, border_box) {
+            // A `<legend>` sits in a gap of the top border: the border is
+            // painted three times, clipped to the parts left and right of
+            // the gap and below the top side (corner joins stay intact).
+            // The part below the gap overlaps its neighbours by 1px so
+            // that their anti-aliased clip edges do not leave a seam in
+            // the bottom border (opaque colors drawn twice are unchanged),
+            // and starts 1px below the top side: at a fractional device
+            // position its anti-aliased top edge would otherwise repaint
+            // a faint line of the top border inside the gap (nothing else
+            // is painted there unless the legend covers a side border).
+            Some((g0, g1)) => {
+                let bb = border_box;
+                let top = sane_len(b.border.top).min(bb.height);
+                let below = (top + 1.0).min(bb.height);
+                let (m0, m1) = ((g0 - 1.0).max(bb.x), (g1 + 1.0).min(bb.right()));
+                let parts = [
+                    Rect::new(bb.x, bb.y, g0 - bb.x, bb.height),
+                    Rect::new(g1, bb.y, bb.right() - g1, bb.height),
+                    Rect::new(m0, bb.y + below, m1 - m0, bb.height - below),
+                ];
+                for part in parts.into_iter().filter(|r| !r.is_empty()) {
+                    self.push_clip(part, [0.0; 4]);
+                    self.paint_border(&b.style, border_box, b.border, radii);
+                    self.pop_clip();
+                }
+            }
+            None => self.paint_border(&b.style, border_box, b.border, radii),
+        }
     }
 
     /// Background color (border box), then image or gradient.
@@ -1121,6 +1162,16 @@ fn content_radii(b: &LayoutBox) -> [f32; 4] {
     inner_radii(radii, inset)
 }
 
+/// The gap left in the top border of `b` (see [`LayoutBox::border_top_gap`]),
+/// clamped to its border box `border_box`; `None` when there is no top
+/// border or the gap is empty.
+fn top_gap(b: &LayoutBox, border_box: Rect) -> Option<(f32, f32)> {
+    let (g0, g1) = b.border_top_gap?;
+    let g0 = sane(g0).max(border_box.x);
+    let g1 = sane(g1).min(border_box.right());
+    (g1 > g0 && sane_len(b.border.top) > 0.0).then_some((g0, g1))
+}
+
 /// For every element generating boxes, the largest node index found in
 /// the subtrees of its (non-pseudo) boxes: text, inline boxes, atomic
 /// inlines and child boxes. One pass over the tree.
@@ -1159,6 +1210,14 @@ fn subtree_ends(root: &LayoutBox) -> HashMap<usize, usize> {
     ends
 }
 
+/// Top edge of an underline `offset` below `baseline`, moved up when it
+/// would end more than 1px below the font's `descent`, but never above the
+/// baseline.
+fn clamp_underline(baseline: f32, offset: f32, descent: f32, thickness: f32) -> f32 {
+    let lowest = baseline + descent + 1.0 - thickness;
+    sane((baseline + offset).min(lowest).max(baseline))
+}
+
 /// URL of a node-less image box: the single `url()` item of its `content`
 /// (`::before`/`::after` images), else its `list-style-image` (inside
 /// list markers drawn as images). `None` when neither names a URL.
@@ -1188,6 +1247,20 @@ fn over_white(c: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn underline_clamping() {
+        // Metric placement kept when it fits above the descent + 1px.
+        assert_eq!(clamp_underline(100.0, 2.0, 4.0, 1.0), 102.0);
+        // Too low: the bottom edge stops 1px below the descent.
+        assert_eq!(clamp_underline(100.0, 30.0, 4.0, 1.0), 104.0);
+        assert_eq!(clamp_underline(100.0, 30.0, 4.0, 2.0), 103.0);
+        // Never above the baseline (offset above it, or thick lines).
+        assert_eq!(clamp_underline(100.0, -5.0, 4.0, 1.0), 100.0);
+        assert_eq!(clamp_underline(100.0, 2.0, 1.0, 6.0), 100.0);
+        // Finite whatever the input.
+        assert!(clamp_underline(f32::MAX, f32::MAX, f32::MAX, 0.0).is_finite());
+    }
 
     #[test]
     fn canvas_color_over_white() {

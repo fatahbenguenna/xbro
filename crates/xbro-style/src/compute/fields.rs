@@ -167,6 +167,8 @@ pub(super) fn copy_field(id: LonghandId, dst: &mut ComputedStyle, src: &Computed
         L::ListStyleImage => dst.list_style_image = src.list_style_image.clone(),
         L::BorderCollapse => dst.border_collapse = src.border_collapse,
         L::BorderSpacing => dst.border_spacing = src.border_spacing,
+        L::CaptionSide => dst.caption_side = src.caption_side,
+        L::TableLayout => dst.table_layout = src.table_layout,
         L::TextDecorationLine => dst.text_decoration_line = src.text_decoration_line,
         L::TextDecorationColor => dst.text_decoration_color = src.text_decoration_color,
         L::VerticalAlign => dst.vertical_align = src.vertical_align,
@@ -182,7 +184,12 @@ pub(super) fn copy_field(id: LonghandId, dst: &mut ComputedStyle, src: &Computed
         L::Order => dst.order = src.order,
         L::RowGap => dst.row_gap = src.row_gap,
         L::ColumnGap => dst.column_gap = src.column_gap,
-        L::GridColumns => dst.grid_columns = src.grid_columns,
+        L::GridTemplateColumns => dst.grid_template_columns = src.grid_template_columns.clone(),
+        L::GridTemplateRows => dst.grid_template_rows = src.grid_template_rows.clone(),
+        L::GridColumnStart => dst.grid_column.start = src.grid_column.start,
+        L::GridColumnEnd => dst.grid_column.end = src.grid_column.end,
+        L::GridRowStart => dst.grid_row.start = src.grid_row.start,
+        L::GridRowEnd => dst.grid_row.end = src.grid_row.end,
         L::Content => dst.content = src.content.clone(),
     }
 }

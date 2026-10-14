@@ -110,7 +110,7 @@ fn ring(rect: Rect) -> DisplayItem {
 }
 
 /// Caret rectangle of a focused text control box.
-fn caret(doc: &Document, b: &LayoutBox, node: NodeId) -> Option<DisplayItem> {
+fn caret_rect(doc: &Document, b: &LayoutBox, node: NodeId) -> Option<Rect> {
     let textarea = matches!(b.kind, BoxKind::Control(ControlKind::TextArea));
     if !textarea && !matches!(b.kind, BoxKind::Control(ControlKind::TextField)) {
         return None;
@@ -177,18 +177,34 @@ fn caret(doc: &Document, b: &LayoutBox, node: NodeId) -> Option<DisplayItem> {
     };
     let y = y.min(content.bottom() - h).max(content.y);
     let rect = Rect::new(x, y, 1.0, h.max(1.0));
-    (rect.x.is_finite() && rect.y.is_finite() && rect.height.is_finite()).then(|| {
-        let color = if b.style.color.is_transparent() {
-            Color::BLACK
-        } else {
-            b.style.color
-        };
-        DisplayItem::Rect {
-            rect,
-            color,
-            radii: [0.0; 4],
-        }
+    (rect.x.is_finite() && rect.y.is_finite() && rect.height.is_finite()).then_some(rect)
+}
+
+/// The caret of a focused text control box, as painted.
+fn caret(doc: &Document, b: &LayoutBox, node: NodeId) -> Option<DisplayItem> {
+    let rect = caret_rect(doc, b, node)?;
+    let color = if b.style.color.is_transparent() {
+        Color::BLACK
+    } else {
+        b.style.color
+    };
+    Some(DisplayItem::Rect {
+        rect,
+        color,
+        radii: [0.0; 4],
     })
+}
+
+/// Caret rectangle of the focused text field or textarea `focus`, with
+/// whether it lies in a `position: fixed` subtree (viewport coordinates).
+pub(crate) fn caret_of(tree: &LayoutTree, doc: &Document, focus: NodeId) -> Option<(Rect, bool)> {
+    let mut found = Found {
+        rects: Vec::new(),
+        control: None,
+    };
+    collect(tree.root.as_ref()?, focus, false, &mut found, 0);
+    let (b, fixed) = found.control?;
+    caret_rect(doc, b, focus).map(|r| (r, fixed))
 }
 
 /// Appends the focus indication of `focus` to `list`.

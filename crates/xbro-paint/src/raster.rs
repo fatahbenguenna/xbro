@@ -7,6 +7,8 @@
 //! against the current clip, and drawn:
 //!
 //! * rectangles snapped to device pixels, rounded shapes anti-aliased;
+//!   text decorations snapped with a whole number of device pixels of
+//!   thickness (at least one);
 //! * borders per side (diagonal joins between differing colors), with
 //!   dashed/dotted/double/groove/ridge/inset/outset styles;
 //! * text from cached glyph coverage masks blended in a dedicated loop;
@@ -191,6 +193,10 @@ fn fade(item: &DisplayItem, opacity: f32) -> Option<DisplayItem> {
             color: f(*color),
             radii: *radii,
         },
+        DisplayItem::TextDecoration { rect, color } => DisplayItem::TextDecoration {
+            rect: *rect,
+            color: f(*color),
+        },
         DisplayItem::Ellipse {
             rect,
             color,
@@ -361,6 +367,7 @@ impl<'a> Painter<'a> {
             }
             _ if self.skip > 0 => {}
             DisplayItem::Rect { rect, color, radii } => self.fill_rect(*rect, *color, *radii),
+            DisplayItem::TextDecoration { rect, color } => self.fill_decoration(*rect, *color),
             DisplayItem::Border { rect, sides, radii } => {
                 border::draw_border(self, *rect, sides, *radii)
             }
@@ -620,22 +627,32 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// A text decoration line: horizontal edges snapped like rectangles,
+    /// the top edge rounded to a device pixel and the thickness rounded to
+    /// a whole number of device pixels, at least one, so that every line
+    /// of a given thickness is equally crisp wherever it falls.
+    fn fill_decoration(&mut self, rect: Rect, color: Color) {
+        let dev = self.to_dev(rect);
+        if color.is_transparent() || dev.x1 <= dev.x0 {
+            return;
+        }
+        let thickness = (dev.y1 - dev.y0).round().max(1.0);
+        let snapped = dev.snap();
+        let top = dev.y0.round();
+        self.fill_dev_rect(
+            DevRect::new(snapped.x0, top, snapped.x1, top + thickness),
+            color,
+        );
+    }
+
     /// Fills an axis-aligned device rect (geometrically clipped).
     pub(crate) fn fill_dev_rect(&mut self, dev: DevRect, color: Color) {
         let Some((visible, mask)) = self.rect_clip(dev) else {
             return;
         };
-        let Some(rect) = visible.to_skia() else {
-            return;
-        };
         let paint = shapes::solid_paint(color);
         if let Some(mut target) = self.target() {
-            target.fill_rect(
-                rect,
-                &paint,
-                tiny_skia::Transform::identity(),
-                mask.as_deref(),
-            );
+            shapes::fill_rect_aa(&mut target, visible, &paint, mask.as_deref());
         }
         self.mark_dirty(visible);
     }

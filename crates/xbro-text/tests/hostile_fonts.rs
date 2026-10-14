@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use xbro_text::{FontId, FontSystem};
+use xbro_text::{FontId, FontSystem, Synthesis};
 
 /// Offsets of the `hhea` fields.
 const HHEA_ASCENDER: usize = 4;
@@ -124,7 +124,15 @@ fn huge_collections_are_indexed_in_linear_time() {
     let built = start.elapsed();
     assert_eq!(fonts.face_count(), count as usize);
     let id = select(&fonts, &["dejavu sans"], 700, true);
-    assert_eq!(id, FontId(0), "ties keep the lowest id");
+    assert_eq!(id.face(), FontId(0), "ties keep the lowest id");
+    // Every copy is a regular face: bold and italic are synthesised.
+    assert_eq!(
+        id.synthesis(),
+        Synthesis {
+            oblique: true,
+            bold: true
+        }
+    );
     assert_eq!(fonts.family_name(FontId(count - 1)), "DejaVu Sans");
     assert!(fonts.measure(FontId(count - 1), 16.0, "abc", 0.0, 0.0) > 0.0);
     eprintln!("indexed {count} faces in {built:?}");

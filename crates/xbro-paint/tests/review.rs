@@ -435,6 +435,7 @@ fn assert_finite(item: &DisplayItem) {
         }
         DisplayItem::NodeImage { rect, .. }
         | DisplayItem::UrlImage { rect, .. }
+        | DisplayItem::TextDecoration { rect, .. }
         | DisplayItem::PushClip { rect, .. } => rect_ok(rect),
         DisplayItem::BackgroundImage {
             clip, origin, tile, ..

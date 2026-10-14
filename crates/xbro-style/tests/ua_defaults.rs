@@ -208,3 +208,89 @@ fn misc_elements() {
     assert_eq!(s.get("img").display, Display::Inline);
     assert_eq!(s.get("fs").border.top.style, BorderStyle::Groove);
 }
+
+#[test]
+fn form_control_box_sizing() {
+    let s = style(
+        "<button id=b>b</button><select id=s></select><input id=text><textarea id=ta></textarea>\
+         <input id=sub type=submit><input id=res type=RESET><input id=btn type=button>\
+         <input id=img type=image><input id=col type=color><input id=cb type=checkbox>\
+         <input id=rad type=radio><input id=rng type=range><input id=file type=file>",
+        "",
+    );
+    for id in [
+        "b", "s", "sub", "res", "btn", "img", "col", "cb", "rad", "rng", "file",
+    ] {
+        assert_eq!(s.get(id).box_sizing, BoxSizing::BorderBox, "#{id}");
+    }
+    for id in ["text", "ta"] {
+        assert_eq!(s.get(id).box_sizing, BoxSizing::ContentBox, "#{id}");
+    }
+    // Range: no border, no padding, transparent background, 2px margins.
+    let rng = s.get("rng");
+    assert_eq!(rng.border_widths(), Sides::all(0.0));
+    assert_eq!(rng.padding, Sides::all(LengthPercentage::ZERO));
+    assert!(rng.background_color.is_transparent());
+    assert_eq!(rng.margin, Sides::all(LengthPercentageAuto::px(2.0)));
+    // Color keeps a 1px border around a button-face swatch.
+    let col = s.get("col");
+    assert_eq!(col.border_widths(), Sides::all(1.0));
+    assert_eq!(col.border.top.style, BorderStyle::Solid);
+    assert_eq!(col.padding.left, LengthPercentage::px(2.0));
+    assert_eq!(col.background_color, Color::rgb(0xef, 0xef, 0xef));
+    // Checkboxes and radios keep their margins.
+    assert_eq!(
+        s.get("cb").margin,
+        Sides {
+            top: LengthPercentageAuto::px(3.0),
+            right: LengthPercentageAuto::px(3.0),
+            bottom: LengthPercentageAuto::px(3.0),
+            left: LengthPercentageAuto::px(4.0),
+        }
+    );
+    assert_eq!(s.get("rad").border_widths(), Sides::all(0.0));
+    // Authors can still override.
+    let s = style(
+        "<button id=b>b</button>",
+        "button { box-sizing: content-box }",
+    );
+    assert_eq!(s.get("b").box_sizing, BoxSizing::ContentBox);
+}
+
+#[test]
+fn fieldset_and_legend() {
+    let s = style("<fieldset id=fs><legend id=lg>l</legend>x</fieldset>", "");
+    let fs = s.get("fs");
+    assert_eq!(fs.display, Display::Block);
+    assert_eq!(fs.border_widths(), Sides::all(2.0));
+    assert_eq!(fs.border.left.style, BorderStyle::Groove);
+    assert_eq!(fs.border.left.color, Color::rgb(0xc0, 0xc0, 0xc0));
+    assert_eq!(
+        fs.margin,
+        Sides {
+            top: LengthPercentageAuto::ZERO,
+            right: LengthPercentageAuto::px(2.0),
+            bottom: LengthPercentageAuto::ZERO,
+            left: LengthPercentageAuto::px(2.0),
+        }
+    );
+    // 0.35em 0.75em 0.625em at 16px.
+    let p = fs.padding;
+    assert!((p.top.px - 5.6).abs() < 0.01);
+    assert!((p.right.px - 12.0).abs() < 0.01);
+    assert!((p.bottom.px - 10.0).abs() < 0.01);
+    assert!((p.left.px - 12.0).abs() < 0.01);
+    // `min-inline-size: min-content` computes to auto (no intrinsic sizes).
+    assert!(fs.min_width.is_auto());
+    let lg = s.get("lg");
+    assert_eq!(lg.display, Display::Block);
+    assert_eq!(
+        lg.padding,
+        Sides {
+            top: LengthPercentage::ZERO,
+            right: LengthPercentage::px(2.0),
+            bottom: LengthPercentage::ZERO,
+            left: LengthPercentage::px(2.0),
+        }
+    );
+}

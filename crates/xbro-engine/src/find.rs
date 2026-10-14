@@ -13,9 +13,53 @@
 //! element's subtree (a `::before` run keeps the element's position), so
 //! results stay in document order and `::before`/`::after` texts are not
 //! searched as one string.
+//!
+//! Text in a `position: fixed` subtree is laid out in viewport coordinates;
+//! its matches are flagged ([`FindMatch::fixed`]) so that the UI can place
+//! them on screen whatever the scroll offset.
 
 use xbro_dom::{Document, NodeId};
-use xbro_layout::{LayoutTree, Rect, TextFragment};
+use xbro_layout::{LayoutTree, Point, Rect, TextFragment};
+
+use crate::boxes;
+
+/// One find-in-page match (a match spanning several fragments gives one
+/// [`FindMatch`] per fragment it touches).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FindMatch {
+    /// Rect of the matched text: in document coordinates, or in viewport
+    /// coordinates (relative to the top left of the visible area) when
+    /// [`FindMatch::fixed`] is set.
+    pub rect: Rect,
+    /// The text is in a `position: fixed` subtree: it stays at the same
+    /// place on screen whatever the scroll offset (and is always in view
+    /// when it is inside the viewport).
+    pub fixed: bool,
+}
+
+impl FindMatch {
+    /// The rect in document coordinates while the page is scrolled to `scroll`.
+    pub fn document_rect(&self, scroll: Point) -> Rect {
+        if self.fixed {
+            self.rect.translate(scroll.x, scroll.y)
+        } else {
+            self.rect
+        }
+    }
+
+    /// The rect relative to the top left of the viewport while the page is
+    /// scrolled to `scroll`.
+    pub fn viewport_rect(&self, scroll: Point) -> Rect {
+        if self.fixed {
+            self.rect
+        } else {
+            self.rect.translate(-scroll.x, -scroll.y)
+        }
+    }
+}
+
+/// A text fragment with whether it is in a `position: fixed` subtree.
+type Frag<'a> = (&'a TextFragment, bool);
 
 /// Upper bound on the number of reported rectangles.
 const MAX_RESULTS: usize = 10_000;
@@ -96,14 +140,14 @@ impl Needle {
     }
 }
 
-/// Searches one group of fragments (same source node) and appends rects.
-fn search_group(group: &[&TextFragment], needle: &Needle, out: &mut Vec<Rect>) {
+/// Searches one group of fragments (same source node) and appends matches.
+fn search_group(group: &[Frag<'_>], needle: &Needle, out: &mut Vec<FindMatch>) {
     let mut folded: Vec<char> = Vec::new();
     let mut origin: Vec<usize> = Vec::new(); // folded index → source char index
     let mut chars: Vec<SourceChar> = Vec::new();
-    for (fi, f) in group.iter().enumerate() {
+    for (fi, &(f, _)) in group.iter().enumerate() {
         if fi > 0 {
-            let prev = group[fi - 1];
+            let prev = group[fi - 1].0;
             let joined =
                 prev.text.ends_with(char::is_whitespace) || f.text.starts_with(char::is_whitespace);
             // A line break swallowed the space between two words.
@@ -153,11 +197,14 @@ fn search_group(group: &[&TextFragment], needle: &Needle, out: &mut Vec<Rect>) {
         };
         // One rect per fragment touched by source chars first..=last.
         let mut current: Option<(usize, usize, usize)> = None; // (fragment, start, end)
-        let flush = |cur: Option<(usize, usize, usize)>, out: &mut Vec<Rect>| {
+        let flush = |cur: Option<(usize, usize, usize)>, out: &mut Vec<FindMatch>| {
             if let Some((fi, s, e)) = cur {
-                if let Some(f) = group.get(fi) {
+                if let Some(&(f, fixed)) = group.get(fi) {
                     if let Some((x0, x1)) = glyph_span(f, s, e) {
-                        out.push(Rect::new(f.rect.x + x0, f.rect.y, x1 - x0, f.rect.height));
+                        out.push(FindMatch {
+                            rect: Rect::new(f.rect.x + x0, f.rect.y, x1 - x0, f.rect.height),
+                            fixed,
+                        });
                     }
                 }
             }
@@ -184,7 +231,7 @@ struct Run<'a> {
     /// `::before` runs sit at their node index (rank 1 and 0) and `::after`
     /// runs just before the first node following the element's subtree.
     key: (usize, u8),
-    fragments: Vec<&'a TextFragment>,
+    fragments: Vec<Frag<'a>>,
 }
 
 /// Index of the first node after the subtree of `node` in tree order
@@ -200,9 +247,9 @@ fn subtree_end(doc: &Document, node: NodeId) -> usize {
 /// Groups the fragments of `tree` per source node, in document order.
 fn runs<'a>(tree: &'a LayoutTree, doc: &Document) -> Vec<Run<'a>> {
     let mut runs: Vec<Run<'a>> = Vec::new();
-    for f in tree.text_fragments() {
+    for (f, fixed) in boxes::text_fragments_fixed(tree) {
         if let Some(last) = runs.last_mut().filter(|r| r.node == f.node) {
-            last.fragments.push(f);
+            last.fragments.push((f, fixed));
             continue;
         }
         let in_document = f.node.index() < doc.len();
@@ -223,7 +270,7 @@ fn runs<'a>(tree: &'a LayoutTree, doc: &Document) -> Vec<Run<'a>> {
         runs.push(Run {
             node: f.node,
             key,
-            fragments: vec![f],
+            fragments: vec![(f, fixed)],
         });
     }
     // Stable: runs with equal keys keep their layout order.
@@ -242,7 +289,7 @@ fn runs<'a>(tree: &'a LayoutTree, doc: &Document) -> Vec<Run<'a>> {
 }
 
 /// Case-insensitive search of `query` in the text of `tree` (see the module docs).
-pub(crate) fn find(tree: &LayoutTree, doc: &Document, query: &str) -> Vec<Rect> {
+pub(crate) fn find(tree: &LayoutTree, doc: &Document, query: &str) -> Vec<FindMatch> {
     let needle: Vec<char> = query
         .chars()
         .filter(|&c| c != SOFT_HYPHEN)

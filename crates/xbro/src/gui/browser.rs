@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use xbro_engine::{ClickAction, Cursor, NavigationRequest, Page, Point, Rect, Size, Url};
+use xbro_engine::{
+    ClickAction, Cursor, FindMatch, NavigationRequest, Page, Point, Rect, Size, Url,
+};
 use xbro_text::FontSystem;
 
 use super::address_bar::{self, AddressBar};
@@ -25,6 +27,8 @@ const MAX_REFRESH_DELAY: f32 = 30.0;
 const MIN_SELF_REFRESH_DELAY: f32 = 1.0;
 /// Longest title kept for a history entry (tab strip, window title).
 const MAX_TITLE_CHARS: usize = 300;
+/// Longest URL shown whole in the status bubble (bytes).
+const MAX_STATUS_URL: usize = 2048;
 /// Frame interval of the loading animations.
 pub const ANIMATION_INTERVAL: Duration = Duration::from_millis(40);
 /// Arrow-key scroll step, CSS px.
@@ -184,6 +188,7 @@ impl Browser {
             self.tabs.active_index(),
             self.find_open(),
         )
+        .with_zoom_badge((self.zoom() - 1.0).abs() > 1e-4)
     }
 
     /// Page area of the active tab.
@@ -208,11 +213,21 @@ impl Browser {
 
     /// Text of the status bubble: the hovered link, else the loading URL.
     pub fn status_text(&self) -> Option<String> {
+        // Only the start of a huge (`data:`) URL can show in the bubble.
+        let shown = |url: &Url| match url.as_str().get(..MAX_STATUS_URL) {
+            Some(start) if url.as_str().len() > MAX_STATUS_URL => format!("{start}…"),
+            _ => address_bar::readable_url(url),
+        };
         if let Some(link) = &self.hovered_link {
-            return Some(link.to_string());
+            return Some(shown(link));
         }
         let load = self.active()?.loading.as_ref()?;
-        Some(format!("Loading {}…", load.request.url()))
+        Some(format!("Loading {}…", shown(load.request.url())))
+    }
+
+    /// Whether the status bubble is shown (cheaper than [`Self::status_text`]).
+    pub fn has_status(&self) -> bool {
+        self.hovered_link.is_some() || self.active().is_some_and(Tab::is_loading)
     }
 
     /// Progress (0..1) of the active tab's load for the progress line. The
@@ -252,7 +267,8 @@ impl Browser {
         page.set_viewport(area.viewport());
         if page.viewport() != before {
             if tab.find.active() {
-                tab.find.refresh_matches(page.find(tab.find.query.text()));
+                tab.find
+                    .refresh_matches(page.find_matches(tab.find.query.text()));
             }
             self.page_dirty = true;
         }
@@ -271,9 +287,11 @@ impl Browser {
         }
     }
 
-    /// Loads `url` in the active tab.
+    /// Loads `url` in the active tab on behalf of the user (address bar,
+    /// home button): the address bar shows `url` while it loads.
     pub fn open_url(&mut self, url: Url) {
-        self.navigate(NavigationRequest::Get(url), NavKind::New);
+        let index = self.tabs.active_index();
+        self.start_navigation(index, NavigationRequest::Get(url), NavKind::New, true);
     }
 
     /// Starts a navigation in the active tab.
@@ -282,8 +300,21 @@ impl Browser {
         self.navigate_tab(index, request, kind);
     }
 
-    /// Starts a navigation in the tab at `index`.
+    /// Starts a navigation in the tab at `index`. New entries come from the
+    /// page (links, forms, refresh); history moves and reloads come from the
+    /// browser UI (see [`LoadState::from_ui`]).
     pub fn navigate_tab(&mut self, index: usize, request: NavigationRequest, kind: NavKind) {
+        let from_ui = matches!(kind, NavKind::History(_) | NavKind::Reload);
+        self.start_navigation(index, request, kind, from_ui);
+    }
+
+    fn start_navigation(
+        &mut self,
+        index: usize,
+        request: NavigationRequest,
+        kind: NavKind,
+        from_ui: bool,
+    ) {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
@@ -304,6 +335,7 @@ impl Browser {
             request: request.clone(),
             started: Instant::now(),
             kind,
+            from_ui,
         });
         (self.loader)(LoadJob {
             tab_id,
@@ -670,6 +702,14 @@ impl Browser {
         self.page_area().viewport()
     }
 
+    /// Scrolls a find match into view (centred): matches in fixed content
+    /// are always in view, the page does not move for them.
+    fn reveal_match(&mut self, m: FindMatch) {
+        if !m.fixed {
+            self.reveal(m.rect, true);
+        }
+    }
+
     /// Scrolls so that a document rect is visible.
     pub fn reveal(&mut self, rect: Rect, center: bool) {
         let Some(tab) = self.active() else {
@@ -698,6 +738,8 @@ impl Browser {
         }
         tab.zoom = zoom;
         self.sync_viewport();
+        // The zoom badge narrows the address field's text.
+        self.update_field_scrolls();
         self.invalidate_page();
         self.refresh_hover();
     }
@@ -757,13 +799,13 @@ impl Browser {
             return;
         };
         let matches = match (&tab.page, tab.find.query.text()) {
-            (Some(page), query) if !query.is_empty() => page.find(query),
+            (Some(page), query) if !query.is_empty() => page.find_matches(query),
             _ => Vec::new(),
         };
-        let current = tab.find.set_matches(matches, tab.scroll.y);
+        let current = tab.find.set_matches(matches, tab.scroll);
         self.invalidate();
-        if let Some(rect) = current {
-            self.reveal(rect, true);
+        if let Some(m) = current {
+            self.reveal_match(m);
         }
     }
 
@@ -772,14 +814,14 @@ impl Browser {
         let Some(tab) = self.tabs.active_mut() else {
             return;
         };
-        let rect = if backwards {
+        let current = if backwards {
             tab.find.prev()
         } else {
             tab.find.next()
         };
         self.invalidate();
-        if let Some(rect) = rect {
-            self.reveal(rect, true);
+        if let Some(m) = current {
+            self.reveal_match(m);
         }
     }
 
@@ -787,7 +829,8 @@ impl Browser {
     pub(super) fn refresh_find(&mut self) {
         if let Some(tab) = self.tabs.active_mut() {
             if let (true, Some(page)) = (tab.find.active(), tab.page.as_ref()) {
-                tab.find.refresh_matches(page.find(tab.find.query.text()));
+                tab.find
+                    .refresh_matches(page.find_matches(tab.find.query.text()));
             }
         }
     }
@@ -1007,8 +1050,8 @@ fn commit(tab: &mut Tab, load: LoadState, mut page: Page, viewport: Size, now: I
         })
     });
     if tab.find.active() {
-        let matches = page.find(tab.find.query.text());
-        tab.find.set_matches(matches, tab.scroll.y);
+        let matches = page.find_matches(tab.find.query.text());
+        tab.find.set_matches(matches, tab.scroll);
     } else {
         tab.find.matches.clear();
         tab.find.current = None;
@@ -1127,6 +1170,63 @@ pub(super) mod tests {
         finish(&mut b, &jobs, "C", 5);
         assert_eq!(titles(&b), ["A", "C"]);
         assert_eq!(b.active().unwrap().forward_index(), None);
+    }
+
+    #[test]
+    fn the_address_bar_shows_urls_loaded_from_the_ui_at_once() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        finish(&mut b, &jobs, "A", 3);
+        let shown = |b: &Browser| address_bar::display_text(b.active().unwrap().display_url());
+        // Typed in the address bar: shown while it loads (and when the bar
+        // is focused again), not replaced by the page still on screen.
+        b.open_url(url("https://typed.test/caf%C3%A9"));
+        assert_eq!(shown(&b), "https://typed.test/café");
+        b.focus_address();
+        assert_eq!(b.address.edit.text(), "https://typed.test/café");
+        b.focus_page();
+        assert_eq!(
+            b.status_text().as_deref(),
+            Some("Loading https://typed.test/café…")
+        );
+        // Stopped: the bar shows the page on screen again.
+        b.stop();
+        assert_eq!(shown(&b), "https://a.test/");
+        // A link keeps showing the current page until the new one arrives.
+        let link = NavigationRequest::Get(url("https://link.test/"));
+        b.apply_click(ClickAction::Navigate(link), None);
+        assert_eq!(shown(&b), "https://a.test/");
+        finish(&mut b, &jobs, "Link", 3);
+        assert_eq!(shown(&b), "https://link.test/");
+        // Back and forward show the entry they go to.
+        b.back();
+        assert_eq!(shown(&b), "https://a.test/");
+        finish(&mut b, &jobs, "A", 3);
+        b.forward();
+        assert_eq!(shown(&b), "https://link.test/");
+    }
+
+    #[test]
+    fn the_status_bubble_shows_the_start_of_huge_urls() {
+        let (mut b, jobs) = browser();
+        assert!(!b.has_status());
+        b.open_initial(url("https://a.test/"));
+        assert!(b.has_status(), "loading");
+        finish(&mut b, &jobs, "A", 3);
+        assert!(!b.has_status());
+        assert_eq!(b.status_text(), None);
+        let huge = url(&format!("data:text/plain,{}", "x".repeat(1_000_000)));
+        b.hovered_link = Some(huge.clone());
+        assert!(b.has_status());
+        let text = b.status_text().unwrap();
+        assert!(
+            text.len() <= MAX_STATUS_URL + '…'.len_utf8(),
+            "{}",
+            text.len()
+        );
+        assert!(text.starts_with("data:text/plain,xxx") && text.ends_with('…'));
+        b.hovered_link = Some(url("https://a.test/caf%C3%A9"));
+        assert_eq!(b.status_text().as_deref(), Some("https://a.test/café"));
     }
 
     #[test]
@@ -1290,6 +1390,44 @@ pub(super) mod tests {
         assert_eq!(b.focus, Focus::Page);
         assert_eq!(b.viewport_size().height, 526.0);
         assert!(b.active().unwrap().find.matches.is_empty());
+    }
+
+    /// A tall page whose fixed header contains the find query.
+    pub fn fixed_header_page() -> String {
+        format!(
+            "<div id=bar style='position:fixed;top:0;left:0;right:0;height:40px;\
+             background:white'>fixed needle</div>{}",
+            html("Fixed", 40)
+        )
+    }
+
+    #[test]
+    fn find_matches_in_fixed_content_do_not_scroll() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        respond(&mut b, &jobs, &fixed_header_page());
+        b.scroll_to(Point::new(0.0, 1500.0));
+        b.open_find();
+        b.tabs.active_mut().unwrap().find.query.insert("needle");
+        b.run_find();
+        let tab = b.active().unwrap();
+        assert_eq!(tab.find.matches.len(), 41);
+        // The header match comes first in document order and is in view.
+        let current = tab.find.current_match().unwrap();
+        assert!(current.fixed, "{current:?}");
+        assert_eq!(tab.find.counter(), "1/41");
+        assert_eq!(tab.scroll.y, 1500.0, "no jump to the top");
+        // The next match is in the flow, at the top of the document.
+        b.find_step(false);
+        let tab = b.active().unwrap();
+        assert!(!tab.find.current_match().unwrap().fixed);
+        assert_eq!(tab.scroll.y, 0.0);
+        b.scroll_to(Point::new(0.0, 2000.0));
+        // Stepping back to the header match leaves the scroll alone.
+        b.find_step(true);
+        let tab = b.active().unwrap();
+        assert!(tab.find.current_match().unwrap().fixed);
+        assert_eq!(tab.scroll.y, 2000.0);
     }
 
     #[test]

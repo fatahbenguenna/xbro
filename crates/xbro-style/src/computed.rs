@@ -508,6 +508,161 @@ pub enum BorderCollapse {
     Collapse,
 }
 
+/// `table-layout` (not inherited).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TableLayout {
+    #[default]
+    Auto,
+    /// Column widths come from the first row / `<col>` widths (CSS 2.1 §17.5.2.1).
+    Fixed,
+}
+
+/// `caption-side` (inherited). `block-start` / `block-end` map to
+/// `top` / `bottom` (horizontal writing mode).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum CaptionSide {
+    #[default]
+    Top,
+    Bottom,
+}
+
+/// `overflow-wrap` / `word-wrap` (inherited), CSS Text 3 §5.5.
+///
+/// Both non-normal values allow breaking an otherwise unbreakable word
+/// when it would overflow the line, but only `anywhere` lets those break
+/// opportunities reduce the min-content size; `break-word` does not.
+/// `word-break: break-word` computes to `BreakWord` here (see [`WordBreak`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum OverflowWrap {
+    #[default]
+    Normal,
+    BreakWord,
+    Anywhere,
+}
+
+impl OverflowWrap {
+    /// May an unbreakable word be broken when it would overflow the line?
+    pub fn breaks_overflowing_words(self) -> bool {
+        !matches!(self, OverflowWrap::Normal)
+    }
+
+    /// Do the extra break opportunities count for the min-content size?
+    pub fn reduces_min_content(self) -> bool {
+        matches!(self, OverflowWrap::Anywhere)
+    }
+}
+
+/// `word-break` (inherited), CSS Text 3 §5.2. The deprecated `break-word`
+/// keyword computes to `Normal` here and sets
+/// [`ComputedStyle::overflow_wrap`] to at least [`OverflowWrap::BreakWord`]
+/// (approximation: the spec makes it behave as `overflow-wrap: anywhere`,
+/// xbro keeps it from reducing min-content sizes). `auto-phrase` is `Normal`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    /// Breaks between any two letters (reduces min-content sizes).
+    BreakAll,
+    /// No breaks between letters of CJK text (treated as `Normal` by
+    /// layouts that do not segment CJK text).
+    KeepAll,
+}
+
+/// Largest number of explicit tracks of a [`GridTemplate`]: `repeat(N, …)`
+/// expansions (and an auto-repeat's own track list) stop there.
+pub const MAX_GRID_TRACKS: usize = 1000;
+
+/// Largest absolute grid line number / span stored in a [`GridLine`].
+pub const MAX_GRID_LINE: i32 = 10_000;
+
+/// One track sizing function of `grid-template-columns` / `-rows`.
+/// Lengths are computed to px; percentages are kept (resolved by layout
+/// against the grid container's content box).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GridTrack {
+    /// Non-negative `<length-percentage>`.
+    Length(LengthPercentage),
+    /// `<flex>` (`1fr`), non-negative.
+    Fr(f32),
+    Auto,
+    MinContent,
+    MaxContent,
+    /// `fit-content(<length-percentage>)`.
+    FitContent(LengthPercentage),
+    /// `minmax(min, max)`: `min` is never `Fr`, neither is ever `MinMax` or `FitContent`.
+    MinMax(Box<GridTrack>, Box<GridTrack>),
+}
+
+impl GridTrack {
+    /// A `<fixed-size>`: a length/percentage, or a `minmax()` with one
+    /// length/percentage bound (the only tracks allowed next to an auto-repeat).
+    pub fn is_fixed(&self) -> bool {
+        match self {
+            GridTrack::Length(_) => true,
+            GridTrack::MinMax(min, max) => {
+                matches!(**min, GridTrack::Length(_)) || matches!(**max, GridTrack::Length(_))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `repeat(auto-fill | auto-fit, <fixed-size>+)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoRepeat {
+    /// `auto-fill` (true) or `auto-fit` (false: empty repeated tracks collapse).
+    pub fill: bool,
+    /// The repeated tracks (at most [`MAX_GRID_TRACKS`]).
+    pub tracks: Vec<GridTrack>,
+}
+
+/// A computed `grid-template-columns` / `grid-template-rows` track list.
+///
+/// Line names (`[a b]`) are dropped and `repeat(N, …)` is expanded
+/// (at most [`MAX_GRID_TRACKS`] tracks in total). An auto-repeat is kept
+/// apart: its tracks, repeated as many times as fit, go between
+/// `tracks[..auto_repeat_index]` and `tracks[auto_repeat_index..]`
+/// (all of `tracks` are then fixed sizes, see [`GridTrack::is_fixed`]).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct GridTemplate {
+    pub tracks: Vec<GridTrack>,
+    pub auto_repeat: Option<AutoRepeat>,
+    /// Insertion point of the auto-repeated tracks in `tracks` (0 without auto-repeat).
+    pub auto_repeat_index: usize,
+}
+
+/// One end of a grid item's placement (`grid-column-start`, ...).
+/// Named lines (`<custom-ident>`, with or without an integer or `span`)
+/// are not supported and compute to `Auto`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum GridLine {
+    #[default]
+    Auto,
+    /// A line number, never 0 (negative numbers count from the end of the
+    /// explicit grid), clamped to ±[`MAX_GRID_LINE`].
+    Line(i32),
+    /// `span N`, N ≥ 1 (clamped to [`MAX_GRID_LINE`]).
+    Span(u32),
+}
+
+/// `grid-column` / `grid-row`: start and end lines.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct GridPlacement {
+    pub start: GridLine,
+    pub end: GridLine,
+}
+
+impl GridPlacement {
+    pub const AUTO: Self = Self {
+        start: GridLine::Auto,
+        end: GridLine::Auto,
+    };
+
+    pub fn is_auto(&self) -> bool {
+        *self == Self::AUTO
+    }
+}
+
 /// One item of the `content` property for `::before` / `::after`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContentItem {
@@ -633,8 +788,17 @@ pub struct ComputedStyle {
     /// Extra px added to each space (`normal` = 0).
     pub word_spacing: f32,
     pub white_space: WhiteSpace,
-    /// `overflow-wrap: anywhere | break-word` or `word-break: break-all | break-word`.
+    /// `overflow-wrap: anywhere | break-word` or `word-break: break-all | break-word`
+    /// (kept for compatibility). Layout should prefer the precise
+    /// [`overflow_wrap`](Self::overflow_wrap) / [`word_break`](Self::word_break):
+    /// all of these allow breaking overflowing words, but only
+    /// `overflow-wrap: anywhere` and `word-break: break-all` reduce the
+    /// min-content size (`break-word` does not).
     pub break_anywhere: bool,
+    /// `overflow-wrap` (also raised to `BreakWord` by `word-break: break-word`).
+    pub overflow_wrap: OverflowWrap,
+    /// `word-break` (`break-word` computes to `Normal`, see [`WordBreak`]).
+    pub word_break: WordBreak,
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
     /// `list-style-image` raw URL (shared: it is inherited by every descendant).
@@ -642,6 +806,10 @@ pub struct ComputedStyle {
     pub border_collapse: BorderCollapse,
     /// Horizontal / vertical `border-spacing` in px.
     pub border_spacing: (f32, f32),
+    /// `caption-side` (inherited).
+    pub caption_side: CaptionSide,
+    /// `table-layout` (not inherited).
+    pub table_layout: TableLayout,
 
     // ---- text decoration (not inherited, but propagated) ----
     /// The element's own `text-decoration-line`.
@@ -652,7 +820,15 @@ pub struct ComputedStyle {
     /// ancestors' lines (stopping at atomic inlines / out-of-flow boxes per spec,
     /// approximated). Layout/paint use this, painting with `decoration_color`.
     pub decorations_in_effect: TextDecorationLine,
-    /// Color for `decorations_in_effect` (color of the nearest decorating ancestor).
+    /// Color for `decorations_in_effect`. Per CSS Text Decoration 3, a
+    /// decoration is drawn in the color of the box that *declares* it
+    /// (its `text-decoration-color`, by default that box's own `color`),
+    /// so a propagated decoration keeps the decorating ancestor's color
+    /// whatever the descendant's `color` (`<p style="text-decoration:
+    /// underline"><em style="color: blue">` underlines the `em` in the `p`'s
+    /// color). Approximation: a single color is kept per box, so when a
+    /// box adds lines of its own, its color is used for all its lines,
+    /// including the propagated ones.
     pub decoration_color: Color,
 
     pub vertical_align: VerticalAlign,
@@ -670,9 +846,20 @@ pub struct ComputedStyle {
     pub order: i32,
     pub row_gap: LengthPercentage,
     pub column_gap: LengthPercentage,
-    /// Number of explicit columns from `grid-template-columns` (`repeat(N, …)` or the
-    /// count of track sizes); 0 when not a grid or unknown. Used for the grid approximation.
+    /// Number of explicit columns of `grid_template_columns` (`tracks.len()`);
+    /// 0 when not a grid, without a template, or when the template has an
+    /// auto-repeat (the count then depends on the container size). Used by the
+    /// grid approximation.
     pub grid_columns: u32,
+    /// `grid-template-columns` (also set by `grid-template` / `grid`); `None` for
+    /// `none` (and the unsupported `subgrid` / `masonry`). Not inherited.
+    pub grid_template_columns: Option<Arc<GridTemplate>>,
+    /// `grid-template-rows`, like `grid_template_columns`.
+    pub grid_template_rows: Option<Arc<GridTemplate>>,
+    /// `grid-column-start` / `grid-column-end` (`grid-column`, `grid-area`).
+    pub grid_column: GridPlacement,
+    /// `grid-row-start` / `grid-row-end` (`grid-row`, `grid-area`).
+    pub grid_row: GridPlacement,
 
     // ---- generated content ----
     pub content: Content,
@@ -731,11 +918,15 @@ impl Default for ComputedStyle {
             word_spacing: 0.0,
             white_space: WhiteSpace::Normal,
             break_anywhere: false,
+            overflow_wrap: OverflowWrap::Normal,
+            word_break: WordBreak::Normal,
             list_style_type: ListStyleType::Disc,
             list_style_position: ListStylePosition::Outside,
             list_style_image: None,
             border_collapse: BorderCollapse::Separate,
             border_spacing: (0.0, 0.0),
+            caption_side: CaptionSide::Top,
+            table_layout: TableLayout::Auto,
             text_decoration_line: TextDecorationLine::NONE,
             text_decoration_color: None,
             decorations_in_effect: TextDecorationLine::NONE,
@@ -754,6 +945,10 @@ impl Default for ComputedStyle {
             row_gap: LengthPercentage::ZERO,
             column_gap: LengthPercentage::ZERO,
             grid_columns: 0,
+            grid_template_columns: None,
+            grid_template_rows: None,
+            grid_column: GridPlacement::AUTO,
+            grid_row: GridPlacement::AUTO,
             content: Content::Normal,
         }
     }
@@ -779,11 +974,14 @@ impl ComputedStyle {
             word_spacing: parent.word_spacing,
             white_space: parent.white_space,
             break_anywhere: parent.break_anywhere,
+            overflow_wrap: parent.overflow_wrap,
+            word_break: parent.word_break,
             list_style_type: parent.list_style_type,
             list_style_position: parent.list_style_position,
             list_style_image: parent.list_style_image.clone(),
             border_collapse: parent.border_collapse,
             border_spacing: parent.border_spacing,
+            caption_side: parent.caption_side,
             visibility: parent.visibility,
             cursor: parent.cursor,
             decorations_in_effect: parent.decorations_in_effect,

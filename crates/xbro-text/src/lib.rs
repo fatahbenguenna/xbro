@@ -3,6 +3,10 @@
 //! (cmap lookup + advances + kerning, no complex scripts), text measurement
 //! and cached glyph rasterisation (ab_glyph).
 //!
+//! When a family has no slanted or bold face, [`FontSystem::select`]
+//! returns a [`FontId`] denoting the face plus synthetic oblique and/or
+//! bold (see [`Synthesis`]), like browsers do.
+//!
 //! [`FontSystem`] is `Send + Sync`; caches use interior mutability so a single
 //! instance can be shared (`Arc<FontSystem>`) between the UI thread and page
 //! loading threads.
@@ -35,6 +39,7 @@ mod raster;
 mod sfnt;
 mod shaping;
 mod sync;
+mod synthesis;
 
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -45,9 +50,24 @@ use raster::RasterCache;
 use shaping::GlyphMap;
 use sync::{read, write};
 
-/// Handle to a loaded font face inside a [`FontSystem`].
+/// Handle to a loaded font face inside a [`FontSystem`], possibly with
+/// synthetic styles: the low 30 bits index the face, the two high bits
+/// select synthetic oblique and bold (see [`FontId::face`] and
+/// [`FontId::synthesis`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FontId(pub u32);
+
+/// Synthetic styles applied to a face when its family lacks the requested
+/// slant or weight (CSS `font-synthesis`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Synthesis {
+    /// Outlines sheared by ≈14° around the baseline (`x += 0.25·y`);
+    /// advances are unchanged.
+    pub oblique: bool,
+    /// Ink dilated horizontally by `size / 24` px, and every glyph advance
+    /// widened by the same amount.
+    pub bold: bool,
+}
 
 /// Vertical metrics of a font at a given size, in px.
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
@@ -141,6 +161,8 @@ pub struct FontSystem {
     select_cache: RwLock<SelectCache>,
     /// (requested font, char) → glyph, face and advance.
     glyph_cache: RwLock<GlyphMap>,
+    /// (face, first glyph, second glyph) → kerning in em.
+    kern_cache: RwLock<shaping::KernMap>,
     /// char → fallback face.
     fallback_cache: RwLock<FallbackMap>,
     /// Rasterised glyphs.
@@ -200,6 +222,7 @@ impl FontSystem {
             default_font: OnceLock::new(),
             select_cache: RwLock::new(SelectCache::default()),
             glyph_cache: RwLock::new(GlyphMap::default()),
+            kern_cache: RwLock::new(shaping::KernMap::default()),
             fallback_cache: RwLock::new(FallbackMap::default()),
             raster_cache: Mutex::new(RasterCache::default()),
         }
@@ -247,6 +270,13 @@ impl FontSystem {
     /// as in CSS. Faces that cannot be parsed, and bitmap-only faces (colour
     /// emoji fonts, whose glyphs cannot be rasterised), are skipped; a
     /// bitmap-only face is chosen only when nothing else is installed.
+    ///
+    /// Font synthesis: when the matched face is upright although a slant
+    /// was requested, or weighs 500 or less although 600 or more was
+    /// requested, the result denotes that face with synthetic oblique
+    /// and/or bold ([`FontId::synthesis`]); real italic, oblique and bold
+    /// faces are preferred whenever the family has them. Characters taken
+    /// from fallback faces get the same treatment.
     pub fn select(&self, query: &FontQuery<'_>) -> FontId {
         if self.collection.is_empty() {
             return FontId(0);
@@ -258,8 +288,13 @@ impl FontSystem {
         let id = if query.families.is_empty() && weight == 400 && !query.italic {
             self.default_font()
         } else {
-            self.collection
-                .resolve(query.families, weight, query.italic)
+            let face = self
+                .collection
+                .resolve(query.families, weight, query.italic);
+            match self.collection.face(face) {
+                Some(entry) => face.with_synthesis(synthesis::needed(entry, weight, query.italic)),
+                None => face,
+            }
         };
         write(&self.select_cache).insert(query.families, weight, query.italic, id);
         id
@@ -279,6 +314,7 @@ impl FontSystem {
     ///
     /// An id that names no usable face (unknown, or unparsable) gives the
     /// metrics of the default face, the one its text is shaped with.
+    /// Synthetic styles do not change the metrics.
     pub fn metrics(&self, font: FontId, size: f32) -> FontMetrics {
         let size = metrics::sanitize_size(size);
         if self.collection.is_empty() {
@@ -300,6 +336,11 @@ impl FontSystem {
     /// produce no glyph either; a tab gets the glyph and advance of a space.
     /// Kerning between two glyphs of the same face is added to the first
     /// glyph's advance, so `width` is always the sum of the advances.
+    ///
+    /// With synthetic bold ([`FontId::synthesis`]), every glyph with a
+    /// non-zero advance is `size / 24` px wider (zero-width marks stay
+    /// zero-width); glyphs name the (possibly synthesised) face to
+    /// rasterise them with.
     pub fn shape(
         &self,
         font: FontId,
@@ -335,6 +376,10 @@ impl FontSystem {
     ///
     /// Also `None` for unknown fonts or glyphs, non-positive sizes and
     /// glyphs larger than 2048 px.
+    ///
+    /// Synthetic styles of `font` are applied: oblique shears the outline
+    /// (x += 0.25·y around the baseline), bold widens the ink to the right
+    /// by `size / 24` px.
     pub fn rasterize(
         &self,
         font: FontId,
@@ -346,6 +391,7 @@ impl FontSystem {
     }
 
     /// Family name of a loaded face (for debugging / `--dump-layout`).
+    /// Synthesised faces have the name of their face.
     ///
     /// Empty for an unknown id.
     pub fn family_name(&self, font: FontId) -> String {

@@ -21,8 +21,10 @@
 //!   `width` is auto; `cb.height` when definite), `y`, the top of the
 //!   content box, and the table's used edges.
 //! * **Output**: a [`ContentLayout`](crate::block::ContentLayout) whose `children` are the laid-out
-//!   captions (above the table: `offset_top` is their height, which block
-//!   layout adds above the table's border box and to its top margin) and
+//!   captions (`caption-side: top` ones above the table: `offset_top` is
+//!   their height, which block layout adds above the table's border box
+//!   and to its top margin; `bottom` ones below it: `offset_bottom`, added
+//!   to its bottom margin) and
 //!   row groups in visual order (header first, footer last) with their rows
 //!   and cells as children (a cell spanning several rows is a child of the
 //!   last row it spans, so that it paints above all their backgrounds), all
@@ -35,15 +37,15 @@
 //!
 //! # Approximations
 //!
-//! * `table-layout` is not in `ComputedStyle`: `fixed` is detected from the
-//!   table element's inline `style` attribute only.
-//! * `caption-side` is not supported (captions are on top); `empty-cells`
-//!   and `visibility: collapse` are ignored.
-//! * Collapsed borders are not resolved per edge: overlapping cell borders
-//!   are painted over each other.
+//! * `table-layout: fixed` applies when the table has a specified width.
+//! * `empty-cells` and `visibility: collapse` are ignored.
+//! * Collapsed borders (see [`collapse`]) are resolved per cell edge
+//!   between cells and the table; row, row group and column borders are
+//!   ignored, and a cell owns one width per side.
 //! * Row and row group backgrounds cover the whole row area (including
 //!   the spacing between cells).
 
+mod collapse;
 mod fixup;
 mod layout;
 mod structure;

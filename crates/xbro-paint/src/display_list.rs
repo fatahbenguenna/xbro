@@ -134,6 +134,17 @@ pub enum DisplayItem {
     },
     /// A run of glyphs.
     Text(GlyphRun),
+    /// A text decoration line (underline, overline or line-through):
+    /// `rect` spans the decorated fragment horizontally; its top edge and
+    /// height are the line's position and thickness. The rasteriser snaps
+    /// it to device pixels with a thickness rounded to a whole number of
+    /// device pixels (at least one), so lines stay crisp at any scale.
+    TextDecoration {
+        /// Line rectangle in CSS px.
+        rect: Rect,
+        /// Line color.
+        color: Color,
+    },
     /// Image keyed by node (replaced elements), drawn scaled into `rect`.
     NodeImage {
         /// Destination (the content box).

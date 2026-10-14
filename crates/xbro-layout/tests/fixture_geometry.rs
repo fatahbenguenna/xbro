@@ -310,9 +310,23 @@ fn wiki_page_columns_infobox_and_wikitable() {
         .map(LayoutBox::border_box)
         .collect();
     assert_eq!(cells.len(), 3);
+    // Shared borders: the cells abut, each internal 1px line is the left
+    // border of the cell after it; the outer cells cover the table's own
+    // border, which the table box does not paint.
     for w in cells.windows(2) {
-        close(w[1].x, w[0].right() - 1.0, 0.01);
+        close(w[1].x, w[0].right(), 0.01);
     }
+    let first_cells = &first_row.children;
+    assert_eq!(
+        first_cells[0].border,
+        xbro_layout::Edges::new(1.0, 0.0, 0.0, 1.0)
+    );
+    assert_eq!(first_cells[1].border.left, 1.0);
+    assert_eq!(first_cells[2].border.right, 1.0);
+    close(cells[0].x, wt.border_box().x, 0.01);
+    close(cells[2].right(), wt.border_box().right(), 0.01);
+    close(first_row.border_box().y, wt.border_box().y, 0.01);
+    assert_eq!(wt.style.border.left.style, xbro_style::BorderStyle::None);
 
     let Some(phone) = load("wiki.html", 360.0) else {
         return;

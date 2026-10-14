@@ -16,6 +16,7 @@
 use crate::hash::FastMap;
 use crate::matching::best_unchecked;
 use crate::sync::{read, write};
+use crate::synthesis::{self, effective_style};
 use crate::{FontId, FontSystem};
 
 /// Maximum number of face coverages computed during one lookup.
@@ -29,7 +30,8 @@ pub(crate) type FallbackMap = FastMap<char, Option<FontId>>;
 
 impl FontSystem {
     /// A face covering `c`, adapted to the weight/slant of `primary` when
-    /// the covering family has a better matching face that also covers it.
+    /// the covering family has a better matching face that also covers it,
+    /// with the synthetic styles that face needs to match `primary`.
     /// The flag is false when the result must not be cached because the
     /// scan stopped early (budget exhausted) without finding an outline face.
     pub(crate) fn fallback_face(&self, c: char, primary: FontId) -> (Option<FontId>, bool) {
@@ -102,7 +104,10 @@ impl FontSystem {
     }
 
     /// Picks, within the family of `base`, the face best matching the
-    /// weight/slant of `primary`, provided it also covers `c`.
+    /// weight/slant of `primary` (synthetic styles included), provided it
+    /// also covers `c`, and synthesises what that face lacks: a slanted
+    /// primary makes an upright fallback face oblique, a bold one (600 or
+    /// more) emboldens a fallback face of weight 500 or less.
     fn adapt_style(&self, base: FontId, primary: FontId, c: char) -> FontId {
         let collection = &self.collection;
         let (Some(base_face), Some(primary_face)) =
@@ -110,26 +115,23 @@ impl FontSystem {
         else {
             return base;
         };
-        if base_face.weight == primary_face.weight
-            && base_face.is_slanted() == primary_face.is_slanted()
-        {
-            return base;
-        }
-        let Some(ids) = base_face
-            .families_lower
-            .first()
-            .and_then(|family| collection.family(family))
-        else {
-            return base;
+        let (weight, slanted) = effective_style(primary_face, primary);
+        let best = if base_face.weight == weight && base_face.is_slanted() == slanted {
+            base
+        } else {
+            match base_face
+                .families_lower
+                .first()
+                .and_then(|family| collection.family(family))
+                .and_then(|ids| best_unchecked(collection.faces(), ids, weight, slanted))
+            {
+                Some(best) if best != base && self.covers(best, c) => best,
+                _ => base,
+            }
         };
-        match best_unchecked(
-            collection.faces(),
-            ids,
-            primary_face.weight,
-            primary_face.is_slanted(),
-        ) {
-            Some(best) if best != base && self.covers(best, c) => best,
-            _ => base,
+        match collection.face(best) {
+            Some(face) => best.with_synthesis(synthesis::needed(face, weight, slanted)),
+            None => best,
         }
     }
 }

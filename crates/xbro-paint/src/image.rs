@@ -121,6 +121,33 @@ impl Image {
     }
 }
 
+/// Pixel dimensions (width, height) of raster image data, read from its
+/// header only: nothing is decoded or allocated, so callers can budget the
+/// memory of [`Image::decode`] (4 bytes per pixel) before decoding. The
+/// dimensions are as stored (an EXIF rotation swaps them, the pixel count
+/// stays the same) and are reported even when they exceed the decoding
+/// limits ([`MAX_IMAGE_SIDE`], [`MAX_IMAGE_PIXELS`]).
+///
+/// Returns `None` for SVG documents (rendered on demand: no pixel buffer is
+/// kept when decoded), for data in an unknown format and for unreadable
+/// headers. `content_type` is a hint: SVG-typed data that looks like SVG is
+/// not probed.
+pub fn probe_image_size(bytes: &[u8], content_type: Option<&str>) -> Option<(u32, u32)> {
+    if bytes.is_empty() || (content_type.is_some_and(is_svg_content_type) && looks_like_svg(bytes))
+    {
+        return None;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        reader.format()?;
+        reader.into_dimensions().ok()
+    }))
+    .ok()
+    .flatten()
+}
+
 /// True for `image/svg+xml` (any case, parameters ignored).
 fn is_svg_content_type(content_type: &str) -> bool {
     content_type
@@ -346,6 +373,70 @@ mod tests {
         assert!(!dimensions_allowed(1, 16_385));
         assert!(!dimensions_allowed(16_384, 16_384)); // 268 MP
         assert!(!dimensions_allowed(0, 10));
+    }
+
+    /// A PNG file with a valid `IHDR` of `w`×`h` and almost no pixel data.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8], data: &[u8]| {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IDAT", &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        chunk(b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn probing_reads_dimensions_from_the_header() {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(8, 4)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        assert_eq!(probe_image_size(&png, Some("image/png")), Some((8, 4)));
+        // The content type is only a hint.
+        assert_eq!(probe_image_size(&png, Some("image/svg+xml")), Some((8, 4)));
+        assert_eq!(probe_image_size(&png, None), Some((8, 4)));
+        let mut jpeg = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(16, 9)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!(probe_image_size(&jpeg.into_inner(), None), Some((16, 9)));
+        // Huge headers are reported (nothing is allocated), and decoding
+        // still rejects them.
+        let huge = png_header(100_000, 50_000);
+        assert_eq!(probe_image_size(&huge, None), Some((100_000, 50_000)));
+        assert!(Image::decode(&huge, None).is_none());
+        // SVG, unknown formats, truncated headers.
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>";
+        assert_eq!(probe_image_size(svg, Some("image/svg+xml")), None);
+        assert_eq!(probe_image_size(svg, None), None);
+        assert_eq!(probe_image_size(b"", None), None);
+        assert_eq!(probe_image_size(b"not an image at all", None), None);
+        assert_eq!(probe_image_size(&png[..12], None), None);
     }
 
     #[test]

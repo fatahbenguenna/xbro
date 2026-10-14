@@ -212,4 +212,84 @@ mod tests {
         let plain = xbro_html::parse_document("<meta http-equiv=refresh content=3>");
         assert_eq!(meta_refresh(&plain, &url, &url), Some((3.0, url.clone())));
     }
+
+    #[test]
+    fn fuzz_refresh_contents() {
+        const PIECES: &[&str] = &[
+            "0",
+            "5",
+            "1.5",
+            ".",
+            "..",
+            "99999999999999999999999999999999999999999",
+            ";",
+            ",",
+            " ",
+            "\t",
+            "\n",
+            "\u{c}",
+            "url",
+            "URL",
+            "Url",
+            "=",
+            " = ",
+            "'",
+            "\"",
+            "next.html",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "http://e.org/x",
+            "%zz",
+            "é",
+            "日本",
+            "\u{a0}",
+            "-1",
+            "+1",
+            "1e9",
+            "x",
+            "//",
+            "#f",
+            "?q",
+            "\u{0}",
+        ];
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut below = |n: usize| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
+        };
+        let http = Url::parse("https://e.org/dir/page.html").unwrap();
+        let file = Url::parse("file:///tmp/dir/page.html").unwrap();
+        for _ in 0..5000 {
+            let content: String = (0..below(10))
+                .map(|_| PIECES[below(PIECES.len())])
+                .collect();
+            if let Some((delay, target)) = parse_refresh(&content) {
+                assert!(delay.is_finite() && delay >= 0.0, "{content:?}: {delay}");
+                if let Some(t) = &target {
+                    assert!(
+                        !t.is_empty() && t.trim_matches(|c: char| c.is_ascii_whitespace()) == t
+                    );
+                }
+            }
+            let html = format!(
+                "<base href='{}'><meta http-equiv=refresh content=\"{}\">",
+                PIECES[below(PIECES.len())],
+                content.replace('"', "&quot;")
+            );
+            let doc = xbro_html::parse_document(&html);
+            for document_url in [&http, &file] {
+                let base = base_url(&doc, document_url);
+                assert!(!matches!(base.scheme(), "data" | "javascript"));
+                if let Some((delay, url)) = meta_refresh(&doc, &base, document_url) {
+                    assert!(delay.is_finite() && delay >= 0.0);
+                    assert_ne!(url.scheme(), "javascript", "{html:?}");
+                    if document_url.scheme() != "file" {
+                        assert_ne!(url.scheme(), "file", "{html:?}");
+                    }
+                }
+            }
+        }
+    }
 }

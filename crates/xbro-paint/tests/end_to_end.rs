@@ -86,6 +86,7 @@ fn render_html(html: &str, width: u32, height: u32) -> Rendered {
         fonts,
         replaced: &NoImages,
         viewport,
+        focused: None,
     });
     let list = build_display_list_full(&tree, fonts, &NoImageProvider);
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("pixmap");

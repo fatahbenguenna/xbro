@@ -199,3 +199,88 @@ fn dumps_are_readable() {
         "{outline}"
     );
 }
+
+/// The "hero overlay" pattern: an absolutely positioned overlay (an
+/// earlier sibling or a `::before`) under positioned content. Layout puts
+/// the overlay after its containing block's in-flow children, but hit
+/// testing follows the painter's document order: the later positioned
+/// content is above the overlay and gets the clicks.
+#[test]
+fn hero_overlay_does_not_swallow_clicks() {
+    let Some(l) = lay(
+        &page(
+            "<style>.hero{position:relative;height:200px}\
+             .hero::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4)}\
+             .content{position:relative;padding:20px}</style>\
+             <section id=h1 class=hero style='height:150px'>\
+               <div id=ov style='position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4)'></div>\
+               <div id=c1 class=content><a id=a1 href=x>Click me</a></div>\
+             </section>\
+             <section id=h2 class=hero><div class=content><a id=a2 href=y>Or me</a></div></section>\
+             <section id=h3 style='position:relative;height:100px'>\
+               <div id=c3 style='position:relative'><a id=a3 href=z>Covered</a></div>\
+               <a id=stretched href=w style='position:absolute;top:0;left:0;right:0;bottom:0'></a>\
+             </section>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    let link_hit = |id: &str| {
+        let r = l.tree.node_rect(l.id(id)).unwrap();
+        let h = hit(&l, r.x + 5.0, r.y + r.height / 2.0).unwrap();
+        l.doc.parent(h)
+    };
+    // Earlier overlay sibling: the link is clickable; elsewhere the overlay.
+    assert_eq!(link_hit("a1"), Some(l.id("a1")));
+    assert_eq!(hit(&l, 300.0, 120.0), Some(l.id("ov")));
+    // `::before` overlay: the link is clickable; elsewhere the hero element
+    // (a pseudo-element hits as its originating element).
+    assert_eq!(link_hit("a2"), Some(l.id("a2")));
+    let h2 = l.rect("h2");
+    assert_eq!(hit(&l, 300.0, h2.y + 150.0), Some(l.id("h2")));
+    // A later overlay (the "stretched link" pattern) is above the content.
+    let r = l.tree.node_rect(l.id("a3")).unwrap();
+    assert_eq!(hit(&l, r.x + 5.0, r.y + 5.0), Some(l.id("stretched")));
+}
+
+#[test]
+fn z_index_still_beats_document_order() {
+    let Some(l) = lay(
+        &page(
+            "<section style='position:relative;height:100px'>\
+               <div id=ov style='position:absolute;top:0;left:0;right:0;bottom:0;z-index:1'></div>\
+               <div style='position:relative'><a id=a href=x>Link</a></div>\
+             </section>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    let r = l.tree.node_rect(l.id("a")).unwrap();
+    assert_eq!(hit(&l, r.x + 5.0, r.y + 5.0), Some(l.id("ov")));
+}
+
+#[test]
+fn legend_above_the_fieldset_border_box_is_hit() {
+    // The legend straddles the top border: its upper half lies above the
+    // fieldset's border box, and is still hit (and clickable).
+    let Some(l) = lay(
+        &page(
+            "<fieldset id=f style='margin:0;border:2px solid;padding:0 10px'>\
+               <legend id=lg style='font-size:30px'><a id=a href=x>Legend</a></legend>content\
+             </fieldset>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    let f = l.box_id("f").border_box();
+    let lg = l.rect("lg");
+    assert!(lg.y < f.y);
+    let h = hit(&l, lg.x + 10.0, lg.y + 3.0).unwrap();
+    assert_eq!(l.doc.parent(h), Some(l.id("a")));
+    // Beside the legend, above the border box: nothing of the fieldset.
+    let outside = hit(&l, lg.right() + 20.0, lg.y + 3.0);
+    assert_ne!(outside, Some(l.id("f")));
+}

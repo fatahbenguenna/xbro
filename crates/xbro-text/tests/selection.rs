@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use xbro_text::{FontId, FontQuery, FontSystem};
+use xbro_text::{FontId, FontQuery, FontSystem, Synthesis};
 
 #[test]
 fn generic_families_resolve_to_installed_fonts() {
@@ -134,8 +134,18 @@ fn weight_matching() {
     // Out-of-range weights are clamped, never panic.
     assert_eq!(weight(0), FontId(0));
     assert_eq!(weight(u16::MAX), FontId(1));
-    // Serif has no bold face in this set: the regular one is used.
-    assert_eq!(select(&fonts, &["serif"], 700, false), FontId(2));
+    // Serif has no bold face in this set: the regular one is emboldened.
+    let serif_bold = select(&fonts, &["serif"], 700, false);
+    assert_eq!(serif_bold.face(), FontId(2));
+    assert_eq!(
+        serif_bold.synthesis(),
+        Synthesis {
+            bold: true,
+            oblique: false
+        }
+    );
+    // Real bold faces are never synthesised.
+    assert!(weight(700).synthesis().is_none());
 }
 
 #[test]
@@ -146,8 +156,14 @@ fn style_matching() {
     // Italic falls back to oblique, normal prefers the upright face.
     assert_eq!(select(&fonts, &["monospace"], 400, true), FontId(1));
     assert_eq!(select(&fonts, &["monospace"], 400, false), FontId(0));
-    // No slanted sans face: italic falls back to normal.
-    assert_eq!(select(&fonts, &["sans-serif"], 400, true), FontId(2));
+    // Real oblique faces are not synthesised.
+    assert!(select(&fonts, &["monospace"], 400, true)
+        .synthesis()
+        .is_none());
+    // No slanted sans face: the upright one gets a synthetic oblique.
+    let italic = select(&fonts, &["sans-serif"], 400, true);
+    assert_eq!(italic.face(), FontId(2));
+    assert!(italic.synthesis().oblique && !italic.synthesis().bold);
 }
 
 #[test]
@@ -195,7 +211,8 @@ fn pathological_queries_do_not_panic() {
         weight: 400,
         italic: true,
     });
-    assert_eq!(id, FontId(0));
+    assert_eq!(id.face(), FontId(0));
+    assert!(id.synthesis().oblique);
     let weird = vec!["\u{0}\u{FFFF}\"'".to_string(), "\u{1F600}".to_string()];
     let _ = fonts.select(&FontQuery {
         families: &weird,
@@ -233,7 +250,7 @@ fn bitmap_only_families_are_skipped_when_an_outline_family_follows() {
         return;
     };
     assert_eq!(select(&only, &["noto color emoji"], 400, false), FontId(0));
-    assert_eq!(select(&only, &["serif"], 700, true), FontId(0));
+    assert_eq!(select(&only, &["serif"], 700, true).face(), FontId(0));
     assert!(only.has_fonts());
 }
 

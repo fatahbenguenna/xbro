@@ -286,6 +286,101 @@ fn memoized_lists_agree_with_reference() {
 }
 
 #[test]
+fn shared_match_cache_agrees_with_reference() {
+    // One cache for all the elements and selectors of a document, as in a
+    // style pass: `:has()` results computed for an anchor while matching
+    // one subject are reused for the others.
+    let mut rng = Rng::new(0xcac4e);
+    let mut compared = 0;
+    for case in 0..3000 {
+        let dom = random_dom(&mut rng);
+        let mut cache = MatchCache::new();
+        let texts: Vec<String> = (0..3)
+            .map(|_| {
+                let mut text = random_list_compound(&mut rng);
+                text.push_str(rng.pick(&[" ", " > ", " ~ ", " "]));
+                text.push_str(&random_complex(&mut rng, 0));
+                text
+            })
+            .collect();
+        let lists: Vec<_> = texts
+            .iter()
+            .filter_map(|t| parse_selector_list(t))
+            .collect();
+        for e in all_elements(&dom) {
+            for (list, text) in lists.iter().zip(&texts) {
+                for selector in list {
+                    assert_eq!(
+                        selector.matches_with_cache(&e, &mut cache),
+                        ref_matches(selector, &e),
+                        "case {case}: {text:?} on node {} of {:?}",
+                        e.index,
+                        dom.nodes
+                            .iter()
+                            .map(|n| (n.name.clone(), n.classes.clone(), n.parent))
+                            .collect::<Vec<_>>()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert!(compared > 10_000, "only {compared} comparisons");
+}
+
+#[test]
+fn has_left_of_a_descendant_combinator_is_linear_with_a_cache() {
+    // `:has()` in a compound left of the subject is evaluated on every
+    // ancestor of every element: without a shared cache, each evaluation
+    // walks the ancestor's subtree again (cubic on a deep chain, quadratic
+    // on `.page:has(.missing) p`).
+    let mut deep = Dom::default();
+    deep.add(None, "a");
+    for i in 1..300 {
+        deep.add(Some(i - 1), "b.x");
+    }
+    let mut wide = Dom::default();
+    let page = wide.add(None, "a.page");
+    for _ in 0..3000 {
+        let section = wide.add(Some(page), "b");
+        wide.add(Some(section), "c");
+    }
+    for (dom, text) in [
+        (&deep, ":has(.missing) *"),
+        (&deep, "b:has(> .x .missing, + .y) .x"),
+        (&wide, ".page:has(.missing) c"),
+        (&wide, ".page:has(b + .missing) b > c"),
+    ] {
+        let list = parse_selector_list(text).unwrap();
+        let mut cache = MatchCache::new();
+        dom.steps.set(0);
+        for e in all_elements(dom) {
+            for selector in &list {
+                assert!(!selector.matches_with_cache(&e, &mut cache));
+            }
+        }
+        let cached = dom.steps.get();
+        // Each anchor's subtree is walked once: linear in the sum of the
+        // subtree sizes (the size of the document times its depth).
+        let n = dom.nodes.len() as u64;
+        let depth = if std::ptr::eq(dom, &deep) { n } else { 2 };
+        assert!(cached < 4 * n * depth, "{text}: {cached} steps");
+        // Same results without the cache, with far more work.
+        dom.steps.set(0);
+        for e in all_elements(dom).into_iter().take(400) {
+            for selector in &list {
+                assert!(!selector.matches(&e));
+            }
+        }
+        let uncached = dom.steps.get();
+        assert!(
+            uncached > 10 * cached,
+            "{text}: {uncached} vs {cached} steps"
+        );
+    }
+}
+
+#[test]
 fn nested_rules_match_like_reference() {
     // Selectors produced by CSS Nesting (`:is()` chains with several parent
     // selectors) through the memoized path.

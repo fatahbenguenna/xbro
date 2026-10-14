@@ -337,6 +337,7 @@ pub(crate) fn build_page(
         generation: 0,
     };
     page.relayout_timed();
+    page.check_hover_cost();
     page
 }
 

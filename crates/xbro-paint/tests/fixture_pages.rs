@@ -127,6 +127,7 @@ fn load_html(html: &str, width: f32, height: f32) -> Page {
         fonts,
         replaced: &images,
         viewport,
+        focused: None,
     });
     let list = build_display_list_full(&tree, fonts, &images);
     Page { tree, list, images }
@@ -252,4 +253,153 @@ fn generated_and_marker_images_are_painted() {
     let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
     let c = px(&shot, cx as u32, cy as u32);
     assert!(c.0 > 180 && c.2 < 120, "logo pixel {c:?}");
+}
+
+/// A pseudo-element mixing several images and text paints each image
+/// box with its own URL (node-less image boxes carry their URL in their
+/// `content`), in order, and the pixels come from the images.
+#[test]
+fn several_generated_images_keep_their_own_urls() {
+    let page = load_html(
+        r#"<body style="margin:0;font:16px sans-serif">
+           <style>p::after { content: url(img/logo.png) " and " url(img/tile.png) }</style>
+           <p style="margin:0">x</p></body>"#,
+        300.0,
+        200.0,
+    );
+    let images: Vec<(&str, xbro_layout::Rect)> = page
+        .list
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            DisplayItem::UrlImage { url, rect } => Some((url.as_str(), *rect)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        images.iter().map(|(u, _)| *u).collect::<Vec<_>>(),
+        ["img/logo.png", "img/tile.png"]
+    );
+    let (logo, tile) = (images[0].1, images[1].1);
+    assert!(tile.x > logo.x + logo.width, "{logo:?} then {tile:?}");
+    let shot = render(&page, 300, 200, &RasterOptions::default());
+    let c = px(
+        &shot,
+        (logo.x + logo.width / 2.0) as u32,
+        (logo.y + logo.height / 2.0) as u32,
+    );
+    assert!(c.0 > 180 && c.2 < 120, "logo pixel {c:?}");
+    let c = px(&shot, (tile.x + 1.0) as u32, (tile.y + 1.0) as u32);
+    assert!(c != (255, 255, 255, 255), "tile pixel {c:?}");
+}
+
+/// The first text fragment of `tree` whose text contains `needle`.
+fn find_text<'t>(tree: &'t LayoutTree, needle: &str) -> Option<&'t xbro_layout::TextFragment> {
+    fn walk<'t>(
+        b: &'t xbro_layout::LayoutBox,
+        needle: &str,
+    ) -> Option<&'t xbro_layout::TextFragment> {
+        for fragment in b.lines.iter().flat_map(|l| &l.fragments) {
+            match fragment {
+                xbro_layout::Fragment::Text(t) if t.text.contains(needle) => return Some(t),
+                xbro_layout::Fragment::Atomic(a) => {
+                    if let Some(t) = walk(a, needle) {
+                        return Some(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        b.children.iter().find_map(|c| walk(c, needle))
+    }
+    walk(tree.root.as_ref()?, needle)
+}
+
+/// Ink-weighted mean x of row `y` within `x0..x1` (`None` without ink).
+fn ink_centroid(p: &tiny_skia::Pixmap, y: u32, x0: u32, x1: u32) -> Option<f32> {
+    let (mut sum, mut weight) = (0.0f32, 0.0f32);
+    for x in x0..x1.min(p.width()) {
+        let (r, g, b, _) = px(p, x, y);
+        let ink = 255.0 - (f32::from(r) + f32::from(g) + f32::from(b)) / 3.0;
+        sum += ink * x as f32;
+        weight += ink;
+    }
+    (weight > 50.0).then(|| sum / weight)
+}
+
+/// The wiki hatnote is `font-style: italic` in DejaVu Sans, which has no
+/// slanted face installed here: it is drawn with a synthetic oblique, its
+/// ink leaning right by a quarter of the height above the baseline.
+#[test]
+fn wiki_hatnote_is_slanted() {
+    let page = load("wiki.html", 1024.0, 768.0);
+    let frag = find_text(&page.tree, "redirects here").expect("hatnote text");
+    let font = frag.font;
+    if !font.synthesis().oblique {
+        eprintln!(
+            "skipping: {} has a real slanted face",
+            system_fonts().family_name(font)
+        );
+        return;
+    }
+    assert!(frag.style.font_style != xbro_style::FontStyle::Normal);
+    assert!(frag
+        .glyphs
+        .iter()
+        .all(|g| g.font.synthesis().oblique && !g.font.synthesis().bold));
+    // The hatnote's run, drawn alone as listed and drawn upright.
+    let run = page
+        .list
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::Text(run) if run.glyphs == frag.glyphs => Some(run.clone()),
+            _ => None,
+        })
+        .expect("hatnote run in the display list");
+    assert_eq!(run.font, font);
+    let mut upright = run.clone();
+    for g in &mut upright.glyphs {
+        g.font = g.font.face();
+    }
+    let shot = |run: xbro_paint::GlyphRun| {
+        let list = DisplayList {
+            items: vec![DisplayItem::Text(run)],
+            ..DisplayList::default()
+        };
+        let mut pixmap = tiny_skia::Pixmap::new(1024, 768).expect("pixmap");
+        rasterize(
+            &list,
+            system_fonts(),
+            &page.images,
+            &mut pixmap,
+            &RasterOptions::default(),
+        );
+        pixmap
+    };
+    let (slanted_shot, upright_shot) = (shot(run), shot(upright));
+    assert!(slanted_shot.data() != upright_shot.data());
+    let size = frag.font_size;
+    // Horizontal shift of the ink between the two renderings, averaged
+    // over the rows of a band `from..to` em above the baseline.
+    let shift = |from: f32, to: f32| {
+        let rows = (frag.baseline - to * size) as u32..(frag.baseline - from * size) as u32;
+        let shifts: Vec<f32> = rows
+            .filter_map(|y| {
+                Some(
+                    ink_centroid(&slanted_shot, y, 0, 1024)?
+                        - ink_centroid(&upright_shot, y, 0, 1024)?,
+                )
+            })
+            .collect();
+        assert!(!shifts.is_empty(), "ink between {from} and {to} em");
+        shifts.iter().sum::<f32>() / shifts.len() as f32
+    };
+    let low = shift(0.0, 0.2);
+    let high = shift(0.45, 0.7);
+    let expected = 0.25 * (0.575 - 0.1) * size;
+    assert!(
+        high - low > 0.6 * expected,
+        "ink shifts {low:.2} px near the baseline, {high:.2} px higher up (expected ≈{expected:.2} more)"
+    );
 }

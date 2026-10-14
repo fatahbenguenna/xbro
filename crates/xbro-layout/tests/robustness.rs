@@ -568,3 +568,49 @@ fn random_documents_never_panic() {
         assert!(t.elapsed().as_secs() < 10, "seed {seed}: {:?}", t.elapsed());
     }
 }
+
+#[test]
+fn hostile_grids_stay_bounded_and_fast() {
+    let mut items = String::new();
+    for i in 0..400 {
+        items.push_str(&format!(
+            "<div style='grid-column:span {} / {};grid-row:{} / span 900'>x</div>",
+            i % 7 + 1,
+            -(i % 5) - 1,
+            i * 37 % 20_000 + 1
+        ));
+    }
+    let html = format!(
+        "<div style='display:grid;grid-template-columns:repeat(auto-fill,0px) 1e9px minmax(1e30px,1fr) fit-content(-5px);gap:1e20px'>{items}</div>\
+         <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(1px,1fr));grid-template-rows:repeat(auto-fill,1px);height:1e9px;width:1e6px'>{items}</div>\
+         <div style='display:inline-grid;grid-template-columns:repeat(1000,min-content) repeat(1000,max-content);grid-auto-flow:column'>\
+           <div style='grid-column:1 / span 10000;grid-row:-10000 / 10000'>y</div><div style='grid-column:-1 / 1'>z</div></div>"
+    );
+    let t = std::time::Instant::now();
+    let l = lay_any(&html, 800.0);
+    sane_layout(&l);
+    assert!(t.elapsed().as_secs() < 30, "{:?}", t.elapsed());
+}
+
+#[test]
+fn many_wide_spanning_grid_items_stay_bounded() {
+    // Thousands of items each spanning hundreds of intrinsic tracks: the
+    // spanning-item distribution has a work budget, beyond which the
+    // remaining items no longer grow the tracks.
+    let mut items = String::new();
+    for i in 0..6000 {
+        items.push_str(&format!(
+            "<i style='display:block;grid-column:span {};min-width:{}px'>x</i>",
+            900 + i % 100,
+            i % 3000
+        ));
+    }
+    let html = format!(
+        "<div style='display:inline-grid;grid-template-columns:repeat(500,auto) repeat(500,fit-content(20px))'>{items}</div>\
+         <div style='display:grid;grid-template-columns:repeat(1000,minmax(min-content,1fr))'>{items}</div>"
+    );
+    let t = std::time::Instant::now();
+    let l = lay_any(&html, 800.0);
+    sane_layout(&l);
+    assert!(t.elapsed().as_secs() < 30, "{:?}", t.elapsed());
+}

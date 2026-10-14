@@ -321,6 +321,10 @@ impl<'a> Element for DomElement<'a> {
         };
         table.get(self.id.index()).copied().unwrap_or(1) as usize
     }
+
+    fn cache_key(&self) -> Option<usize> {
+        Some(self.id.index())
+    }
 }
 
 #[cfg(test)]

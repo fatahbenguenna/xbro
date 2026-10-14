@@ -144,6 +144,25 @@ pub fn scroll_into_view(
     clamp_scroll(target, document, viewport)
 }
 
+/// The parts of `rect` outside `hole` (at most four rects, none when the
+/// hole covers it).
+pub fn subtract(rect: Rect, hole: Rect) -> Vec<Rect> {
+    let Some(i) = rect.intersection(&hole) else {
+        return vec![rect];
+    };
+    let pieces = [
+        // Above, below, then left and right of the hole's band.
+        Rect::new(rect.x, rect.y, rect.width, i.y - rect.y),
+        Rect::new(rect.x, i.bottom(), rect.width, rect.bottom() - i.bottom()),
+        Rect::new(rect.x, i.y, i.x - rect.x, i.height),
+        Rect::new(i.right(), i.y, rect.right() - i.right(), i.height),
+    ];
+    pieces
+        .into_iter()
+        .filter(|r| r.width > 0.0 && r.height > 0.0)
+        .collect()
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Axis {
     Vertical,
@@ -326,6 +345,26 @@ mod tests {
             true,
         );
         assert_eq!(p, Point::new(0.0, 4500.0));
+    }
+
+    #[test]
+    fn rect_subtraction() {
+        let r = Rect::new(0.0, 0.0, 100.0, 50.0);
+        assert_eq!(subtract(r, Rect::new(200.0, 0.0, 10.0, 10.0)), vec![r]);
+        assert!(subtract(r, Rect::new(-10.0, -10.0, 200.0, 100.0)).is_empty());
+        // A header covering the top: only the bottom part is left.
+        assert_eq!(
+            subtract(r, Rect::new(-5.0, -5.0, 200.0, 25.0)),
+            vec![Rect::new(0.0, 20.0, 100.0, 30.0)]
+        );
+        // A hole in the middle: four pieces covering the rest.
+        let pieces = subtract(r, Rect::new(40.0, 10.0, 20.0, 20.0));
+        assert_eq!(pieces.len(), 4);
+        let area: f32 = pieces.iter().map(|p| p.width * p.height).sum();
+        assert_eq!(area, 100.0 * 50.0 - 20.0 * 20.0);
+        assert!(pieces
+            .iter()
+            .all(|p| p.intersection(&Rect::new(40.0, 10.0, 20.0, 20.0)).is_none()));
     }
 
     #[test]

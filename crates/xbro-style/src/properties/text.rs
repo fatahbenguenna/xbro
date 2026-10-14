@@ -3,7 +3,9 @@
 
 use xbro_css::ComponentValue as CV;
 
-use super::{only, push, LonghandId, Out, Spec, SpecTextAlign, SpecVerticalAlign, WsCollapse};
+use super::{
+    only, push, LonghandId, Out, Spec, SpecTextAlign, SpecVerticalAlign, SpecWordBreak, WsCollapse,
+};
 use crate::computed::*;
 use crate::values::{
     color as color_value, keyword, length, single, ParseCtx, ANY_LP, NON_NEG_LENGTH,
@@ -239,11 +241,15 @@ pub(super) fn overflow_wrap(
     _: &ParseCtx,
     out: &mut Out,
 ) -> Option<()> {
-    let b = keyword(
+    let w = keyword(
         single(items)?,
-        &[("normal", false), ("break-word", true), ("anywhere", true)],
+        &[
+            ("normal", OverflowWrap::Normal),
+            ("break-word", OverflowWrap::BreakWord),
+            ("anywhere", OverflowWrap::Anywhere),
+        ],
     )?;
-    push(out, only(ids)?, Spec::Bool(b));
+    push(out, only(ids)?, Spec::OverflowWrap(w));
     Some(())
 }
 
@@ -256,15 +262,15 @@ pub(super) fn word_break(
     let b = keyword(
         single(items)?,
         &[
-            ("normal", false),
-            ("keep-all", false),
-            ("auto-phrase", false),
-            ("manual", false),
-            ("break-all", true),
-            ("break-word", true),
+            ("normal", SpecWordBreak::Normal),
+            ("keep-all", SpecWordBreak::KeepAll),
+            ("auto-phrase", SpecWordBreak::Normal),
+            ("manual", SpecWordBreak::Normal),
+            ("break-all", SpecWordBreak::BreakAll),
+            ("break-word", SpecWordBreak::BreakWord),
         ],
     )?;
-    push(out, only(ids)?, Spec::Bool(b));
+    push(out, only(ids)?, Spec::WordBreak(b));
     Some(())
 }
 
@@ -428,6 +434,40 @@ pub(super) fn border_collapse(
     Some(())
 }
 
+/// `caption-side: top | bottom | block-start | block-end`.
+pub(super) fn caption_side(
+    items: &[&CV],
+    ids: &[LonghandId],
+    _: &ParseCtx,
+    out: &mut Out,
+) -> Option<()> {
+    let side = keyword(
+        single(items)?,
+        &[
+            ("top", CaptionSide::Top),
+            ("bottom", CaptionSide::Bottom),
+            ("block-start", CaptionSide::Top),
+            ("block-end", CaptionSide::Bottom),
+        ],
+    )?;
+    push(out, only(ids)?, Spec::CaptionSide(side));
+    Some(())
+}
+
+pub(super) fn table_layout(
+    items: &[&CV],
+    ids: &[LonghandId],
+    _: &ParseCtx,
+    out: &mut Out,
+) -> Option<()> {
+    let layout = keyword(
+        single(items)?,
+        &[("auto", TableLayout::Auto), ("fixed", TableLayout::Fixed)],
+    )?;
+    push(out, only(ids)?, Spec::TableLayout(layout));
+    Some(())
+}
+
 pub(super) fn border_spacing(
     items: &[&CV],
     ids: &[LonghandId],
@@ -544,16 +584,57 @@ mod tests {
         );
         assert_eq!(
             spec("word-wrap", "break-word", LonghandId::OverflowWrap),
-            Some(Spec::Bool(true))
+            Some(Spec::OverflowWrap(OverflowWrap::BreakWord))
         );
         assert_eq!(
+            spec("overflow-wrap", "ANYWHERE", LonghandId::OverflowWrap),
+            Some(Spec::OverflowWrap(OverflowWrap::Anywhere))
+        );
+        assert_eq!(
+            spec("overflow-wrap", "normal", LonghandId::OverflowWrap),
+            Some(Spec::OverflowWrap(OverflowWrap::Normal))
+        );
+        assert!(parse("overflow-wrap", "break-all").is_none());
+        assert!(parse("overflow-wrap", "anywhere anywhere").is_none());
+        assert_eq!(
             spec("word-break", "keep-all", LonghandId::WordBreak),
-            Some(Spec::Bool(false))
+            Some(Spec::WordBreak(SpecWordBreak::KeepAll))
         );
         assert_eq!(
             spec("word-break", "break-all", LonghandId::WordBreak),
-            Some(Spec::Bool(true))
+            Some(Spec::WordBreak(SpecWordBreak::BreakAll))
         );
+        assert_eq!(
+            spec("word-break", "break-word", LonghandId::WordBreak),
+            Some(Spec::WordBreak(SpecWordBreak::BreakWord))
+        );
+        assert_eq!(
+            spec("word-break", "auto-phrase", LonghandId::WordBreak),
+            Some(Spec::WordBreak(SpecWordBreak::Normal))
+        );
+        assert!(parse("word-break", "anywhere").is_none());
+    }
+
+    #[test]
+    fn table_properties() {
+        let side = |css: &str| spec("caption-side", css, LonghandId::CaptionSide);
+        assert_eq!(side("bottom"), Some(Spec::CaptionSide(CaptionSide::Bottom)));
+        assert_eq!(side("TOP"), Some(Spec::CaptionSide(CaptionSide::Top)));
+        assert_eq!(
+            side("block-end"),
+            Some(Spec::CaptionSide(CaptionSide::Bottom))
+        );
+        assert_eq!(
+            side("block-start"),
+            Some(Spec::CaptionSide(CaptionSide::Top))
+        );
+        assert_eq!(side("left"), None);
+        assert_eq!(side("top bottom"), None);
+        let layout = |css: &str| spec("table-layout", css, LonghandId::TableLayout);
+        assert_eq!(layout("fixed"), Some(Spec::TableLayout(TableLayout::Fixed)));
+        assert_eq!(layout("auto"), Some(Spec::TableLayout(TableLayout::Auto)));
+        assert_eq!(layout("none"), None);
+        assert_eq!(layout("10px"), None);
     }
 
     #[test]

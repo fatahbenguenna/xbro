@@ -67,6 +67,7 @@ pub fn block(node: usize, rect: Rect, style: Arc<ComputedStyle>) -> LayoutBox {
         children: Vec::new(),
         lines: Vec::new(),
         marker: None,
+        border_top_gap: None,
     }
 }
 

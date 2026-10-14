@@ -2,6 +2,18 @@
 //! (with a bounded cache of rendered SVG pixmaps), plus a bounded cache of
 //! box-filtered reductions for raster images drawn much smaller than their
 //! natural size.
+//!
+//! An SVG image is rendered whole at its destination size when that is at
+//! most [`SVG_WHOLE_AREA`] device px; larger destinations only render the
+//! part that is visible (expanded to a [`SVG_PART_GRID`] so that small
+//! scrolls reuse the rendering). resvg's cost grows with the rendered area
+//! (a blur filter over 4096 × 4096 px takes seconds), so it is bounded by
+//! the size of the drawing area instead of the size of the image. SVG
+//! filters are the exception: resvg computes them over the filtered
+//! element's whole region at the rendering scale, whatever part is drawn,
+//! so SVGs with filters are always rendered whole, at most
+//! [`MAX_FILTERED_SVG_AREA`] px, and scaled up (filters are mostly blurs
+//! and shadows, which lose little).
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -10,6 +22,7 @@ use xbro_layout::{Point, Rect, Size};
 use xbro_style::{BackgroundRepeat, BackgroundSize, LengthPercentage};
 
 use super::clip::DevRect;
+use super::shapes::fill_rect_aa;
 use super::Painter;
 use crate::display_list::background_tile;
 use crate::image::{with_svg_stack, Image};
@@ -19,31 +32,67 @@ use crate::image::{with_svg_stack, Image};
 const MAX_SVG_SIDE: f32 = 4096.0;
 /// Largest SVG rendering area, in device px.
 const MAX_SVG_AREA: f32 = 4096.0 * 4096.0;
+/// Largest rendering area of an SVG using filters, in device px.
+const MAX_FILTERED_SVG_AREA: f32 = 512.0 * 512.0;
 /// Maximum number of cached SVG renderings.
 const SVG_CACHE_ENTRIES: usize = 64;
 /// Maximum memory held by cached SVG renderings.
 const SVG_CACHE_BYTES: usize = 64 << 20;
 
-/// One cached rendering of an SVG tree at a pixel size.
+/// Largest destination area (device px) at which an SVG image is
+/// rendered whole; larger ones render their visible part only.
+const SVG_WHOLE_AREA: f32 = 1024.0 * 1024.0;
+/// The visible part of a large SVG destination is expanded to multiples
+/// of this many device px from the destination's top-left corner.
+const SVG_PART_GRID: f32 = 256.0;
+/// Most tile copies of a huge SVG background tile drawn one by one.
+const MAX_SVG_TILE_COPIES: usize = 256;
+
+/// What a cached SVG rendering shows.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum SvgView {
+    /// The whole image at this pixel size.
+    Whole { width: u32, height: u32 },
+    /// The `width` × `height` px rectangle at (`x`, `y`) of the image drawn
+    /// at `dest_w` × `dest_h` device px (sizes as f32 bits).
+    Part {
+        dest_w: u32,
+        dest_h: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl SvgView {
+    fn pixel_size(self) -> (u32, u32) {
+        match self {
+            SvgView::Whole { width, height } | SvgView::Part { width, height, .. } => {
+                (width, height)
+            }
+        }
+    }
+}
+
+/// One cached rendering of an SVG tree.
 struct SvgEntry {
     tree: Weak<resvg::usvg::Tree>,
-    width: u32,
-    height: u32,
+    view: SvgView,
     pixmap: Arc<Pixmap>,
 }
 
 /// Rendered SVGs, oldest first.
 static SVG_CACHE: Mutex<Vec<SvgEntry>> = Mutex::new(Vec::new());
 
-/// Renders `tree` at `width` × `height` px, using the cache.
-fn render_svg(tree: &Arc<resvg::usvg::Tree>, width: u32, height: u32) -> Option<Arc<Pixmap>> {
+/// Renders `view` of `tree`, using the cache.
+fn render_svg(tree: &Arc<resvg::usvg::Tree>, view: SvgView) -> Option<Arc<Pixmap>> {
     let mut cache = SVG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     cache.retain(|e| e.tree.strong_count() > 0);
-    if let Some(pos) = cache.iter().position(|e| {
-        e.width == width
-            && e.height == height
-            && e.tree.upgrade().is_some_and(|t| Arc::ptr_eq(&t, tree))
-    }) {
+    if let Some(pos) = cache
+        .iter()
+        .position(|e| e.view == view && e.tree.upgrade().is_some_and(|t| Arc::ptr_eq(&t, tree)))
+    {
         let entry = cache.remove(pos);
         let pixmap = entry.pixmap.clone();
         cache.push(entry);
@@ -51,12 +100,11 @@ fn render_svg(tree: &Arc<resvg::usvg::Tree>, width: u32, height: u32) -> Option<
     }
     drop(cache);
 
-    let pixmap = Arc::new(render_svg_uncached(tree, width, height)?);
+    let pixmap = Arc::new(render_svg_uncached(tree, view)?);
     let mut cache = SVG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     cache.push(SvgEntry {
         tree: Arc::downgrade(tree),
-        width,
-        height,
+        view,
         pixmap: pixmap.clone(),
     });
     let bytes = |c: &Vec<SvgEntry>| c.iter().map(|e| e.pixmap.data().len()).sum::<usize>();
@@ -66,14 +114,28 @@ fn render_svg(tree: &Arc<resvg::usvg::Tree>, width: u32, height: u32) -> Option<
     Some(pixmap)
 }
 
-fn render_svg_uncached(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<Pixmap> {
+fn render_svg_uncached(tree: &resvg::usvg::Tree, view: SvgView) -> Option<Pixmap> {
     let size = tree.size();
     let (sw, sh) = (size.width(), size.height());
     if !(sw > 0.0 && sh > 0.0) {
         return None;
     }
+    let (width, height) = view.pixel_size();
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
-    let transform = svg_fit(sw, sh, width as f32, height as f32);
+    let transform = match view {
+        SvgView::Whole { width, height } => svg_fit(sw, sh, width as f32, height as f32),
+        SvgView::Part {
+            dest_w,
+            dest_h,
+            x,
+            y,
+            ..
+        } => svg_fit(sw, sh, f32::from_bits(dest_w), f32::from_bits(dest_h))
+            .post_translate(-(x as f32), -(y as f32)),
+    };
+    if !within_rasterizer_limits(tree, transform) {
+        return None;
+    }
     // resvg recurses like usvg does: render on the large SVG stack (which
     // also contains panics).
     let target = &mut pixmap;
@@ -81,6 +143,26 @@ fn render_svg_uncached(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Opt
     // resvg uses its own tiny-skia version; both store premultiplied RGBA8.
     let size = tiny_skia::IntSize::from_wh(width, height)?;
     Pixmap::from_vec(pixmap.take(), size)
+}
+
+/// Largest distance from the origin, in device px, of the content of a
+/// rendered SVG (its stroke and filter bounds included).
+const MAX_SVG_EXTENT: f32 = 1e8;
+
+/// False when `tree` drawn with `transform` reaches geometry that resvg's
+/// tiny-skia cannot rasterise: it panics on coordinates around 1e10 px
+/// (`stroke-width="1e6"` in a 10-unit view box drawn 100 000 px wide).
+/// Such content is not drawn at all.
+fn within_rasterizer_limits(
+    tree: &resvg::usvg::Tree,
+    transform: resvg::tiny_skia::Transform,
+) -> bool {
+    let Some(bounds) = tree.root().abs_layer_bounding_box().transform(transform) else {
+        return false;
+    };
+    [bounds.left(), bounds.top(), bounds.right(), bounds.bottom()]
+        .iter()
+        .all(|v| v.abs() <= MAX_SVG_EXTENT)
 }
 
 /// Maps an SVG of size `sw` × `sh` into a `w` × `h` viewport the way
@@ -98,8 +180,9 @@ fn svg_fit(sw: f32, sh: f32, w: f32, h: f32) -> resvg::tiny_skia::Transform {
     resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, (w - cw) / 2.0, (h - ch) / 2.0)
 }
 
-/// Pixel size at which to render an SVG drawn into `w` × `h` device px.
-fn svg_render_size(w: f32, h: f32) -> Option<(u32, u32)> {
+/// Pixel size at which to render an SVG drawn into `w` × `h` device px,
+/// with at most `max_area` pixels.
+fn svg_render_size(w: f32, h: f32, max_area: f32) -> Option<(u32, u32)> {
     if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
         return None;
     }
@@ -107,8 +190,8 @@ fn svg_render_size(w: f32, h: f32) -> Option<(u32, u32)> {
     if w.max(h) > MAX_SVG_SIDE {
         f = MAX_SVG_SIDE / w.max(h);
     }
-    if w * h * f * f > MAX_SVG_AREA {
-        f = f.min((MAX_SVG_AREA / (w * h)).sqrt());
+    if w * h * f * f > max_area {
+        f = f.min((max_area / (w * h)).sqrt());
     }
     let rw = (w * f).round().clamp(1.0, MAX_SVG_SIDE) as u32;
     let rh = (h * f).round().clamp(1.0, MAX_SVG_SIDE) as u32;
@@ -126,8 +209,13 @@ fn pixmap_for(image: &Image, w: f32, h: f32) -> Option<Arc<Pixmap>> {
             level => Some(reduced(p, level).unwrap_or_else(|| p.clone())),
         },
         Image::Svg(tree) => {
-            let (rw, rh) = svg_render_size(w, h)?;
-            render_svg(tree, rw, rh)
+            let max_area = if tree.filters().is_empty() {
+                MAX_SVG_AREA
+            } else {
+                MAX_FILTERED_SVG_AREA
+            };
+            let (width, height) = svg_render_size(w, h, max_area)?;
+            render_svg(tree, SvgView::Whole { width, height })
         }
     }
 }
@@ -259,18 +347,75 @@ fn fill_with_pixmap(
     let Some((visible, mask)) = p.rect_clip(region) else {
         return;
     };
-    let Some(rect) = visible.to_skia() else {
-        return;
-    };
     let paint = Paint {
         shader: tiny_skia::Pattern::new(pixmap.as_ref(), spread, quality(&ts), 1.0, ts),
         anti_alias: true,
         ..Paint::default()
     };
     if let Some(mut target) = p.target() {
-        target.fill_rect(rect, &paint, Transform::identity(), mask.as_deref());
+        fill_rect_aa(&mut target, visible, &paint, mask.as_deref());
     }
     p.mark_dirty(visible);
+}
+
+/// True when an SVG drawn into `w` × `h` device px only renders its
+/// visible part (large, and without filters).
+fn svg_drawn_in_parts(image: &Image, w: f32, h: f32) -> bool {
+    matches!(image, Image::Svg(tree) if tree.filters().is_empty()) && w * h > SVG_WHOLE_AREA
+}
+
+/// The part of a `dest` rectangle (device px) to render for its `visible`
+/// part: relative to `dest`'s top-left corner, expanded to the grid and
+/// clipped to `dest`, as whole pixels `(x, y, width, height)`.
+fn svg_part(dest: DevRect, visible: DevRect) -> Option<(u32, u32, u32, u32)> {
+    let g = SVG_PART_GRID;
+    let (dw, dh) = (dest.width().ceil(), dest.height().ceil());
+    let snap_down = |v: f32, max: f32| ((v / g).floor() * g).clamp(0.0, max);
+    let snap_up = |v: f32, max: f32| ((v / g).ceil() * g).clamp(0.0, max);
+    let x0 = snap_down(visible.x0 - dest.x0, dw);
+    let y0 = snap_down(visible.y0 - dest.y0, dh);
+    let x1 = snap_up(visible.x1 - dest.x0, dw);
+    let y1 = snap_up(visible.y1 - dest.y0, dh);
+    let (w, h) = (x1 - x0, y1 - y0);
+    if !(w >= 1.0 && h >= 1.0) {
+        return None;
+    }
+    Some((x0 as u32, y0 as u32, w as u32, h as u32))
+}
+
+/// Draws the part of the SVG `tree`, drawn into `dest` (device px), that
+/// is visible through `within` and the clip.
+fn draw_svg_part(
+    p: &mut Painter<'_>,
+    tree: &Arc<resvg::usvg::Tree>,
+    dest: DevRect,
+    within: DevRect,
+) {
+    let Some((visible, _)) = p.rect_clip(dest.intersect(&within)) else {
+        return;
+    };
+    let Some((x, y, width, height)) = svg_part(dest, visible) else {
+        return;
+    };
+    // The device size of the destination is the difference of two large
+    // coordinates that move with scrolling: quantized, so that rounding
+    // noise does not defeat the cache.
+    let quantize = |v: f32| ((v * 16.0).round() / 16.0).to_bits();
+    let view = SvgView::Part {
+        dest_w: quantize(dest.width()),
+        dest_h: quantize(dest.height()),
+        x,
+        y,
+        width,
+        height,
+    };
+    let Some(pixmap) = render_svg(tree, view) else {
+        return;
+    };
+    let (ox, oy) = (dest.x0 + x as f32, dest.y0 + y as f32);
+    let part = DevRect::new(ox, oy, ox + width as f32, oy + height as f32);
+    let ts = Transform::from_translate(ox, oy);
+    fill_with_pixmap(p, part.intersect(&visible), &pixmap, ts, SpreadMode::Pad);
 }
 
 /// Draws `image` scaled into `rect` (CSS px).
@@ -278,6 +423,12 @@ pub(crate) fn draw_image(p: &mut Painter<'_>, rect: Rect, image: &Image) {
     let dest = p.to_dev(rect);
     if dest.is_empty() || p.rect_clip(dest).is_none() {
         return;
+    }
+    if let Image::Svg(tree) = image {
+        if svg_drawn_in_parts(image, dest.width(), dest.height()) {
+            draw_svg_part(p, tree, dest, dest);
+            return;
+        }
     }
     let Some(pixmap) = pixmap_for(image, dest.width(), dest.height()) else {
         return;
@@ -370,6 +521,12 @@ fn tile_image(
     if region.is_empty() || p.rect_clip(region).is_none() {
         return;
     }
+    if let Image::Svg(tree) = image {
+        if svg_drawn_in_parts(image, tw, th) {
+            draw_svg_tiles(p, tree, region, (ox, oy), (tw, th), repeat);
+            return;
+        }
+    }
     let Some(pixmap) = pixmap_for(image, tw, th) else {
         return;
     };
@@ -395,6 +552,48 @@ fn tile_image(
     fill_with_pixmap(p, region, &pixmap, ts, spread);
 }
 
+/// Tiles an SVG whose tiles are too large to be rendered whole: each tile
+/// copy meeting `region` (device) draws its visible part.
+fn draw_svg_tiles(
+    p: &mut Painter<'_>,
+    tree: &Arc<resvg::usvg::Tree>,
+    region: DevRect,
+    (ox, oy): (f32, f32),
+    (tw, th): (f32, f32),
+    repeat: BackgroundRepeat,
+) {
+    let copies = |origin: f32, tile: f32, from: f32, to: f32, repeats: bool| {
+        if !repeats {
+            return (0.0, 0.0);
+        }
+        let first = ((from - origin) / tile).floor();
+        let last = ((to - origin) / tile).ceil() - 1.0;
+        (first, last.max(first))
+    };
+    let repeat_x = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX);
+    let repeat_y = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY);
+    let (i0, i1) = copies(ox, tw, region.x0, region.x1, repeat_x);
+    let (j0, j1) = copies(oy, th, region.y0, region.y1, repeat_y);
+    if !(i0.is_finite() && i1.is_finite() && j0.is_finite() && j1.is_finite()) {
+        return;
+    }
+    let mut drawn = 0usize;
+    let mut j = j0;
+    while j <= j1 {
+        let mut i = i0;
+        while i <= i1 {
+            drawn += 1;
+            if drawn > MAX_SVG_TILE_COPIES {
+                return;
+            }
+            let (x, y) = (ox + i * tw, oy + j * th);
+            draw_svg_part(p, tree, DevRect::new(x, y, x + tw, y + th), region);
+            i += 1.0;
+        }
+        j += 1.0;
+    }
+}
+
 /// Moves a tiling origin by whole tiles so it lies at or before `target`
 /// and within one tile of it.
 fn rebase(origin: f32, tile: f32, target: f32) -> f32 {
@@ -415,12 +614,35 @@ mod tests {
 
     #[test]
     fn svg_sizes() {
-        assert_eq!(svg_render_size(10.4, 20.6), Some((10, 21)));
-        assert_eq!(svg_render_size(0.0, 20.0), None);
-        assert_eq!(svg_render_size(f32::NAN, 20.0), None);
-        let (w, h) = svg_render_size(100_000.0, 50_000.0).unwrap();
+        let size = |w, h| svg_render_size(w, h, MAX_SVG_AREA);
+        assert_eq!(size(10.4, 20.6), Some((10, 21)));
+        assert_eq!(size(0.0, 20.0), None);
+        assert_eq!(size(f32::NAN, 20.0), None);
+        let (w, h) = size(100_000.0, 50_000.0).unwrap();
         assert!(w <= 4096 && h <= 4096 && (w as f32 * h as f32) <= MAX_SVG_AREA);
-        assert_eq!(svg_render_size(0.2, 0.2), Some((1, 1)));
+        assert_eq!(size(0.2, 0.2), Some((1, 1)));
+        let (w, h) = svg_render_size(2000.0, 1000.0, MAX_FILTERED_SVG_AREA).unwrap();
+        assert!(
+            (w as f32 * h as f32) <= MAX_FILTERED_SVG_AREA * 1.01 && w == 2 * h,
+            "{w}x{h}"
+        );
+    }
+
+    #[test]
+    fn svg_parts_snap_to_the_grid() {
+        let dest = DevRect::new(-1000.5, 10.0, 9000.0, 5010.0);
+        // Visible part expanded to 256-px cells of the destination.
+        let part = svg_part(dest, DevRect::new(0.0, 20.0, 300.0, 100.0)).unwrap();
+        assert_eq!(part, (768, 0, 768, 256));
+        // A small scroll stays in the same cells.
+        assert_eq!(
+            svg_part(dest, DevRect::new(5.0, 30.0, 305.0, 110.0)),
+            Some(part)
+        );
+        // Clamped to the destination (its size rounded up).
+        let end = svg_part(dest, DevRect::new(8900.0, 4900.0, 9000.0, 5010.0)).unwrap();
+        assert_eq!(end, (9728, 4864, 273, 136));
+        assert_eq!(svg_part(dest, DevRect::EMPTY), None);
     }
 
     #[test]

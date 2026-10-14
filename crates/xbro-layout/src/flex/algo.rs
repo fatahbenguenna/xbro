@@ -23,7 +23,7 @@
 use std::ops::Range;
 
 use xbro_style::{
-    AlignItems, BoxSizing, ComputedStyle, FlexWrap, JustifyContent, LengthPercentageAuto, Overflow,
+    AlignItems, BoxSizing, ComputedStyle, FlexWrap, JustifyContent, LengthPercentageAuto,
 };
 
 use super::item::{self, Laid};
@@ -32,8 +32,9 @@ use crate::box_tree::{BoxNode, Kind};
 use crate::cx::LayoutCx;
 use crate::geom::{Edges, Point};
 use crate::sizing::{
-    box_edges, clamp_size, height_limits, lp, max_height, max_width, min_height, min_width, sane,
-    sane_size, shrink_to_fit, specified_height, specified_width, BoxEdges, EPSILON,
+    box_edges, clamp_size, height_limits, is_scroll_container, lp, max_height, max_width,
+    min_height, min_width, sane, sane_size, shrink_to_fit, specified_height, specified_width,
+    BoxEdges, EPSILON,
 };
 
 /// Bound on the iterations of the flexible length resolution loop (each
@@ -77,12 +78,6 @@ fn factor(v: f32) -> f32 {
     }
 }
 
-/// `overflow` other than `visible`/`clip`: no automatic minimum size.
-fn is_scroll_container(style: &ComputedStyle) -> bool {
-    let scrolls = |o: Overflow| !matches!(o, Overflow::Visible | Overflow::Clip);
-    scrolls(style.overflow_x) || scrolls(style.overflow_y)
-}
-
 /// Main-axis and cross-axis gaps of container `style` with content box `cb`.
 pub(super) fn gaps(style: &ComputedStyle, cb: Cb, row: bool) -> (f32, f32) {
     let column_gap = sane_size(lp(&style.column_gap, cb.width));
@@ -112,6 +107,11 @@ struct Item<'t> {
     auto_cross: (bool, bool),
     pb_main: f32,
     pb_cross: f32,
+    /// Height the item takes besides its content, padding, borders and
+    /// margins (table captions, a fieldset's legend room, see
+    /// [`item::extra_height`]), along the main / cross axis.
+    extra_main: f32,
+    extra_cross: f32,
     base: f32,
     hyp: f32,
     min_main: f32,
@@ -191,6 +191,8 @@ impl<'t> Item<'t> {
             auto_cross,
             pb_main,
             pb_cross,
+            extra_main: 0.0,
+            extra_cross: 0.0,
             base: 0.0,
             hyp: 0.0,
             min_main: 0.0,
@@ -214,11 +216,11 @@ impl<'t> Item<'t> {
     }
 
     fn outer_main(&self, size: f32) -> f32 {
-        size + self.pb_main + self.m_main.0 + self.m_main.1
+        size + self.pb_main + self.extra_main + self.m_main.0 + self.m_main.1
     }
 
     fn outer_cross(&self) -> f32 {
-        self.cross + self.pb_cross + self.m_cross.0 + self.m_cross.1
+        self.cross + self.pb_cross + self.extra_cross + self.m_cross.0 + self.m_cross.1
     }
 
     /// Physical used margins.
@@ -338,6 +340,7 @@ impl<'t> Item<'t> {
                 } else if let Some(l) = laid {
                     l.discard(cx);
                 }
+                self.extra_main = m.extra;
                 m.height
             }
         };
@@ -664,13 +667,26 @@ pub(super) fn layout<'t>(
             let by = y + e.margin.top;
             match definite_cross {
                 Some(c) if single_line && it.stretch => {
-                    // Stretched to the definite line: lay out once.
-                    let cross = clamp_size(
-                        c - it.m_cross.0 - it.m_cross.1 - it.pb_cross,
-                        it.min_cross,
-                        it.max_cross,
-                    );
-                    let laid = item::layout_item(cx, it.b, bx, by, it.target, Some(cross), &e, cb);
+                    // Stretched to the definite line: lay out once (twice
+                    // when captions or a legend take room besides the
+                    // content).
+                    let fit = |extra: f32| {
+                        clamp_size(
+                            c - it.m_cross.0 - it.m_cross.1 - it.pb_cross - extra,
+                            it.min_cross,
+                            it.max_cross,
+                        )
+                    };
+                    let mut cross = fit(0.0);
+                    let mut laid =
+                        item::layout_item(cx, it.b, bx, by, it.target, Some(cross), &e, cb);
+                    let extra = item::extra_height(&laid.lb, &e);
+                    if extra > 0.0 {
+                        it.extra_cross = extra;
+                        cross = fit(extra);
+                        laid.discard(cx);
+                        laid = item::layout_item(cx, it.b, bx, by, it.target, Some(cross), &e, cb);
+                    }
                     it.baseline =
                         crate::tree::first_baseline(&laid.lb).map(|bl| bl - laid.y + e.margin.top);
                     it.cross = cross;
@@ -680,6 +696,7 @@ pub(super) fn layout<'t>(
                 _ => {
                     let (m, laid) = item::measure(cx, it.b, bx, by, it.target, &e, cb);
                     it.cross = m.height;
+                    it.extra_cross = m.extra;
                     it.baseline = m.baseline.map(|bl| bl + e.margin.top);
                     it.laid = laid;
                 }
@@ -754,7 +771,7 @@ pub(super) fn layout<'t>(
         for it in line.iter_mut() {
             if it.stretch && !it.cross_final {
                 it.cross = clamp_size(
-                    lc - it.m_cross.0 - it.m_cross.1 - it.pb_cross,
+                    lc - it.m_cross.0 - it.m_cross.1 - it.pb_cross - it.extra_cross,
                     it.min_cross,
                     it.max_cross,
                 );

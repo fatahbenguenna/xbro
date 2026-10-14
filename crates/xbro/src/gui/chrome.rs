@@ -27,6 +27,11 @@ const BUTTON_GAP: f32 = 2.0;
 const FIND_FIELD_MAX_WIDTH: f32 = 260.0;
 const FIND_COUNTER_WIDTH: f32 = 70.0;
 const FIND_BUTTON_SIZE: f32 = 26.0;
+/// Size of the zoom level badge at the right end of the address field.
+const ZOOM_BADGE_WIDTH: f32 = 50.0;
+const ZOOM_BADGE_HEIGHT: f32 = 22.0;
+/// Space between the badge and the field's edge, and the field's text.
+const ZOOM_BADGE_GAP: f32 = 4.0;
 
 /// An interactive element of the chrome.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -39,6 +44,8 @@ pub enum ChromeElement {
     Reload,
     Home,
     Address,
+    /// The zoom level shown in the address field (when not 100 %): resets it.
+    ZoomReset,
     FindInput,
     FindPrev,
     FindNext,
@@ -84,6 +91,8 @@ pub struct ChromeLayout {
     pub reload: Rect,
     pub home: Rect,
     pub address: Rect,
+    /// Zoom level badge inside the right end of the address field.
+    pub zoom_badge: Option<Rect>,
     pub page: Rect,
     pub find: Option<FindBarLayout>,
 }
@@ -106,9 +115,32 @@ impl FindBarLayout {
 }
 
 impl ChromeLayout {
-    /// Text area of the address field.
+    /// Text area of the address field (left of the zoom badge).
     pub fn address_text(&self) -> Rect {
-        text_rect(self.address, ADDRESS_PADDING)
+        let rect = text_rect(self.address, ADDRESS_PADDING);
+        match self.zoom_badge {
+            Some(badge) => Rect::new(
+                rect.x,
+                rect.y,
+                (badge.x - ZOOM_BADGE_GAP - rect.x).clamp(0.0, rect.width),
+                rect.height,
+            ),
+            None => rect,
+        }
+    }
+
+    /// Shows the zoom badge in the address field (when the page is zoomed).
+    pub fn with_zoom_badge(mut self, shown: bool) -> Self {
+        let a = self.address;
+        self.zoom_badge = (shown && a.width >= 2.0 * ZOOM_BADGE_WIDTH).then(|| {
+            Rect::new(
+                a.right() - ZOOM_BADGE_GAP - ZOOM_BADGE_WIDTH,
+                a.y + (a.height - ZOOM_BADGE_HEIGHT) / 2.0,
+                ZOOM_BADGE_WIDTH,
+                ZOOM_BADGE_HEIGHT,
+            )
+        });
+        self
     }
 
     /// Layout for a `width`×`height` (logical px) window with `tab_count`
@@ -214,6 +246,7 @@ impl ChromeLayout {
             reload,
             home,
             address,
+            zoom_badge: None,
             page,
             find,
         }
@@ -238,6 +271,9 @@ impl ChromeLayout {
             return Hit::Chrome;
         }
         if p.y < CHROME_HEIGHT {
+            if self.zoom_badge.is_some_and(|r| inside(&r)) {
+                return Hit::Element(ZoomReset);
+            }
             let buttons = [
                 (self.back, Back),
                 (self.forward, Forward),
@@ -333,6 +369,30 @@ mod tests {
         assert_eq!(hit(&l, 500.0, 74.0), Hit::Page);
         assert_eq!(hit(&l, 500.0, 767.0), Hit::Page);
         assert_eq!(l.page, Rect::new(0.0, 74.0, 1024.0, 694.0));
+    }
+
+    #[test]
+    fn zoom_badge_sits_in_the_address_field() {
+        let plain = ChromeLayout::new(1024.0, 768.0, 1, 0, false);
+        assert_eq!(plain.zoom_badge, None);
+        assert_eq!(plain.clone().with_zoom_badge(false), plain);
+        let l = plain.clone().with_zoom_badge(true);
+        let badge = l.zoom_badge.unwrap();
+        assert_eq!(badge.right(), l.address.right() - 4.0);
+        assert!(badge.y > l.address.y && badge.bottom() < l.address.bottom());
+        assert_eq!(
+            hit(&l, badge.x + 5.0, badge.y + 5.0),
+            Hit::Element(ZoomReset)
+        );
+        assert_eq!(hit(&l, badge.x - 5.0, badge.y + 5.0), Hit::Element(Address));
+        // The text of the field stops before the badge.
+        let text = l.address_text();
+        assert_eq!(text.x, plain.address_text().x);
+        assert_eq!(text.right(), badge.x - 4.0);
+        // No room for it in a tiny field.
+        let l = ChromeLayout::new(200.0, 300.0, 1, 0, false).with_zoom_badge(true);
+        assert_eq!(l.zoom_badge, None);
+        assert!(l.address_text().width >= 0.0);
     }
 
     #[test]

@@ -26,8 +26,8 @@ pub use parser::{
     ComponentValue, CssRule, Declaration, StyleRule, Stylesheet,
 };
 pub use selector::{
-    parse_selector_list, AttrOperator, AttrSelector, Combinator, Compound, Element, PseudoClass,
-    PseudoElement, Selector, Specificity,
+    parse_selector_list, AttrOperator, AttrSelector, Combinator, Compound, Element, MatchCache,
+    PseudoClass, PseudoElement, Selector, Specificity,
 };
 pub use tokenizer::Token;
 pub use values::{Length, LengthUnit};

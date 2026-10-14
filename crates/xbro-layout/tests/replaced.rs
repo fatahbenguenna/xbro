@@ -447,3 +447,180 @@ fn empty_and_filled_text_fields_share_the_baseline() {
     let line = &l.box_id("p").lines[0];
     close(b.lines[0].baseline, line.baseline, 0.01);
 }
+
+// ------------------------------------------------- focused text controls
+
+fn text_frags(b: &xbro_layout::LayoutBox) -> Vec<&xbro_layout::TextFragment> {
+    b.lines
+        .iter()
+        .flat_map(|l| &l.fragments)
+        .filter_map(|f| match f {
+            Fragment::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lay_focus(body: &str, focus: Option<&str>) -> Option<Laid> {
+    Some(lay_with_focus(
+        &page(body),
+        xbro_layout::Size::new(800.0, 600.0),
+        fonts()?,
+        None,
+        focus,
+    ))
+}
+
+#[test]
+fn focused_text_field_shows_the_end_of_a_long_value() {
+    let html = "<input id=i size=5 value='the start of a value much wider than the field, the end'>\
+                <input id=s size=40 value=short><input id=p size=5 placeholder='a long placeholder text here'>";
+    let (Some(plain), Some(focused)) = (lay_focus(html, None), lay_focus(html, Some("i"))) else {
+        return;
+    };
+    let unfocused = plain.box_id("i");
+    let t = text_frags(unfocused)[0];
+    // Unfocused: the start of the value is visible.
+    assert_eq!(t.rect.x, unfocused.content.x);
+    assert!(t.rect.right() > unfocused.content.right());
+    // Focused: the end of the value (and the 1px caret after it) is at the
+    // right edge of the content box; the text moved left.
+    let b = focused.box_id("i");
+    let t = text_frags(b)[0];
+    assert!(t.rect.x < b.content.x);
+    close(t.rect.right() + 1.0, b.content.right(), 0.05);
+    assert_eq!(t.baseline, text_frags(unfocused)[0].baseline);
+    // A value that fits does not move; neither does a placeholder.
+    let short = |l: &Laid| text_frags(l.box_id("s"))[0].rect.x;
+    assert_eq!(short(&plain), short(&lay_focus(html, Some("s")).unwrap()));
+    let ph = |l: &Laid| text_frags(l.box_id("p"))[0].rect.x;
+    assert_eq!(ph(&plain), ph(&lay_focus(html, Some("p")).unwrap()));
+}
+
+#[test]
+fn focused_textarea_shows_its_last_line() {
+    let html = "<textarea id=t cols=20 rows=2>one\ntwo\nthree\nfour</textarea>\
+                <textarea id=n cols=20 rows=2>one\ntwo\n</textarea>\
+                <textarea id=f cols=20 rows=4>one\ntwo</textarea>";
+    let (Some(plain), Some(focused)) = (lay_focus(html, None), lay_focus(html, Some("t"))) else {
+        return;
+    };
+    let u = plain.box_id("t");
+    assert_eq!(u.lines[0].rect.y, u.content.y);
+    let b = focused.box_id("t");
+    let last = b.lines.last().unwrap();
+    close(last.rect.bottom(), b.content.bottom(), 0.05);
+    assert_eq!(line_text(last), "four");
+    assert!(b.lines[0].rect.y < b.content.y);
+    // A trailing newline: the empty line after the text is shown.
+    let n = lay_focus(html, Some("n")).unwrap();
+    let b = n.box_id("n");
+    let t = *text_frags(b).last().unwrap();
+    close(t.rect.bottom() + t.rect.height, b.content.bottom(), 0.05);
+    // Text that fits does not move.
+    let f = lay_focus(html, Some("f")).unwrap();
+    let b = f.box_id("f");
+    assert_eq!(b.lines[0].rect.y, b.content.y);
+}
+
+// ------------------------------------------------------ fieldset / legend
+
+#[test]
+fn legend_straddles_the_fieldset_top_border() {
+    let Some(l) = lay(
+        &page(
+            "<div id=before style='height:10px'></div>\
+             <fieldset id=f style='margin:0;border:2px solid;padding:5px 12px 8px'>\
+               <legend id=lg style='padding:0 2px'>Title</legend><p id=c>content</p>\
+             </fieldset>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    let f = l.box_id("f");
+    let fb = f.border_box();
+    let lg = l.rect("lg");
+    let c = l.rect("c");
+    // The legend line is 20px high, the border 2px: the border line moves
+    // down by 9px, centred on the legend; the fieldset's margin box stays.
+    assert_eq!(lg.y, 10.0);
+    assert_eq!(lg.height, 20.0);
+    assert_eq!(fb.y, 19.0);
+    assert_eq!(f.margin.top, 9.0);
+    assert_eq!(fb.y - f.margin.top, l.rect("before").bottom());
+    close(lg.y + lg.height / 2.0, fb.y + 1.0, 0.01);
+    // At the inline start of the content box, shrink-to-fit.
+    assert_eq!(lg.x, fb.x + 2.0 + 12.0);
+    assert!(lg.width < 100.0);
+    // Content below the legend and the padding.
+    assert_eq!(c.y, lg.bottom() + 5.0);
+    assert_eq!(f.content.y, c.y);
+    // The border is not painted behind the legend.
+    assert_eq!(f.border_top_gap, Some((lg.x, lg.right())));
+    // Unchanged bottom: content + padding + border.
+    assert_eq!(fb.bottom(), c.bottom() + 8.0 + 2.0);
+}
+
+#[test]
+fn legend_variants() {
+    let Some(l) = lay(
+        &page(
+            "<fieldset id=thick style='margin:0;border:30px solid;padding:0'><legend id=a style='padding:0'>A</legend><div id=ac>x</div></fieldset>\
+             <fieldset id=mid style='margin:0;border:2px solid;padding:0'><legend id=b style='margin:0 auto;padding:0'>B</legend></fieldset>\
+             <fieldset id=fl style='margin:0;border:2px solid;padding:0'><legend id=c style='float:left'>C</legend><div id=cc>y</div></fieldset>\
+             <div style='position:relative;left:7px'><fieldset id=rel style='margin:0;border:2px solid;padding:0'><legend id=d>D</legend></fieldset></div>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    // A legend thinner than the border is centred on it; content below the border.
+    let thick = l.box_id("thick").border_box();
+    let a = l.rect("a");
+    assert_eq!(thick.y, 0.0);
+    close(a.y + a.height / 2.0, 15.0, 0.01);
+    assert_eq!(l.rect("ac").y, 30.0);
+    // `margin: 0 auto` centres the legend.
+    let mid = l.box_id("mid");
+    let b = l.rect("b");
+    close(b.x - mid.content.x, mid.content.right() - b.right(), 0.01);
+    // A floated legend is an ordinary float inside the content box.
+    let fl = l.box_id("fl");
+    assert_eq!(fl.border_top_gap, None);
+    assert!(l.rect("c").y >= fl.content.y);
+    // Relative offsets move the gap with the fieldset.
+    let rel = l.box_id("rel");
+    let d = l.rect("d");
+    assert_eq!(rel.border_box().x, 7.0);
+    assert_eq!(rel.border_top_gap, Some((d.x, d.right())));
+}
+
+#[test]
+fn floated_first_legend_leaves_the_rendered_legend_to_the_next() {
+    // Browsers render the first legend child that is neither floated nor
+    // absolutely positioned in the border; earlier floated legends are
+    // ordinary floats.
+    let Some(l) = lay(
+        &page(
+            "<fieldset id=f style='margin:0;border:2px solid;padding:4px 10px'>\
+               <legend id=fl style='float:left'>A</legend><legend id=r>B</legend>content\
+             </fieldset>\
+             <fieldset id=g style='margin:0;border:2px solid;padding:4px 10px'>\
+               <legend id=ab style='position:absolute'>A</legend><legend id=r2>B</legend>content\
+             </fieldset>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    for (fid, rid) in [("f", "r"), ("g", "r2")] {
+        let f = l.box_id(fid);
+        let r = l.rect(rid);
+        assert_eq!(f.border_top_gap, Some((r.x, r.right())), "{fid}");
+        assert!(r.y < f.border_box().y, "{fid}");
+        assert!(f.content.y >= r.bottom(), "{fid}");
+    }
+    // The floated legend sits inside the content box.
+    assert!(l.rect("fl").y >= l.box_id("f").content.y);
+}

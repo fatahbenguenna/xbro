@@ -629,3 +629,42 @@ fn baseline_alignment_synthesizes_baselines_of_empty_items() {
     let icon = l.rect("icon");
     close(icon.bottom(), l.box_id("t").lines[0].baseline, 0.05);
 }
+
+#[test]
+fn legend_and_caption_room_counts_in_flex_items() {
+    let Some(l) = flex(
+        "<style>legend{font-size:30px;padding:0}fieldset{margin:0;border:2px solid;padding:0 4px}</style>
+         <div id=col style='display:flex;flex-direction:column'>
+           <fieldset id=f1><legend>Title</legend><div style='height:10px'></div></fieldset>
+           <div id=a1 class=i></div>
+           <table id=t1 style='border-spacing:0'><caption style='height:15px'>c</caption><tr><td style='height:10px'></td></tr></table>
+           <div id=a2 class=i></div>
+         </div>
+         <div id=row style='display:flex;align-items:flex-start'>
+           <fieldset id=f2><legend>Title</legend><div style='height:10px'></div></fieldset>
+         </div>
+         <div id=def style='display:flex;height:200px'>
+           <fieldset id=f3><legend>Title</legend></fieldset>
+           <table id=t3 style='border-spacing:0'><caption style='caption-side:bottom;height:15px'>c</caption><tr><td></td></tr></table>
+         </div>",
+        800.0,
+    ) else {
+        return;
+    };
+    // Column: each item follows the margin box of the previous one.
+    let f1 = l.box_id("f1");
+    assert_eq!(f1.margin_box().y, 0.0);
+    assert_eq!(l.rect("a1").y, f1.margin_box().bottom());
+    let t1 = l.box_id("t1");
+    assert_eq!(t1.border_box().y, l.rect("a1").bottom() + 15.0);
+    assert_eq!(l.rect("a2").y, t1.border_box().bottom());
+    // Row: the container is as tall as the fieldset's margin box.
+    let f2 = l.box_id("f2");
+    assert_eq!(l.rect("row").height, f2.margin_box().height);
+    assert!(f2.margin_box().height > f2.border_box().height);
+    // Stretched in a definite 200px line: margin boxes fill it exactly.
+    assert_eq!(l.box_id("f3").margin_box().height, 200.0);
+    let t3 = l.box_id("t3");
+    assert_eq!(t3.margin_box().height, 200.0);
+    assert_eq!(t3.border_box().height, 185.0);
+}

@@ -2,6 +2,8 @@
 //! px on a device-pixel pixmap, UI fonts, vector icons and the final pixel
 //! conversion for the window surface.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use xbro_engine::Rect;
@@ -28,12 +30,36 @@ impl Rgba {
     }
 }
 
+/// Caret stops of the most recently used texts kept by [`UiFonts`].
+const CARET_CACHE_SIZE: usize = 4;
+/// Longest piece of text (bytes) shaped at once for caret stops.
+const CARET_CHUNK: usize = 1024;
+
+/// Caret stops of one text at one size (see [`UiFonts::caret_stops`]).
+#[derive(Clone)]
+struct CachedStops {
+    text: String,
+    /// Font size in device px (`f32` bits).
+    size: u32,
+    stops: Rc<[(usize, f32)]>,
+}
+
 /// The UI fonts (sans-serif regular and bold) and text measurement.
+///
+/// The address bar and the find field shape their text for the caret, the
+/// selection and the scroll position several times per frame, and the
+/// text may be huge (a pasted `data:` URL): the caret stops of the last
+/// few texts are cached, so each text is shaped once while it does not
+/// change.
 #[derive(Clone)]
 pub struct UiFonts {
     pub system: Arc<FontSystem>,
     pub regular: FontId,
     pub bold: FontId,
+    /// Most recently used last.
+    caret_cache: RefCell<Vec<CachedStops>>,
+    /// Number of texts shaped for caret stops (cache misses), for tests.
+    shaped: Cell<usize>,
 }
 
 impl UiFonts {
@@ -50,6 +76,8 @@ impl UiFonts {
             system,
             regular,
             bold,
+            caret_cache: RefCell::new(Vec::new()),
+            shaped: Cell::new(0),
         }
     }
 
@@ -71,12 +99,60 @@ impl UiFonts {
 
     /// Caret stops of `text`: (byte offset, x in logical px) for the start
     /// of every char that produces a glyph, plus the end of the text.
-    pub fn caret_stops(&self, text: &str, size: f32, dpi: f32) -> Vec<(usize, f32)> {
-        let run = self.system.shape(self.regular, size * dpi, text, 0.0, 0.0);
-        let mut stops: Vec<(usize, f32)> =
-            run.glyphs.iter().map(|g| (g.cluster, g.x / dpi)).collect();
-        stops.push((text.len(), run.width / dpi));
+    /// Cached for the last few texts (see the type docs).
+    pub fn caret_stops(&self, text: &str, size: f32, dpi: f32) -> Rc<[(usize, f32)]> {
+        let size_px = size * dpi;
+        let key = size_px.to_bits();
+        if let Ok(mut cache) = self.caret_cache.try_borrow_mut() {
+            if let Some(i) = cache.iter().position(|c| c.size == key && c.text == text) {
+                let entry = cache.remove(i);
+                let stops = entry.stops.clone();
+                cache.push(entry);
+                return stops;
+            }
+        }
+        self.shaped.set(self.shaped.get() + 1);
+        // Shaped in pieces placed with `f64` offsets: the `f32` pen of one
+        // long run drifts by pixels after tens of thousands of glyphs, and
+        // the caret would no longer match the text drawn around it.
+        let mut stops: Vec<(usize, f32)> = Vec::new();
+        let mut offset = 0.0f64;
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + CARET_CHUNK).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            let Some(piece) = text.get(start..end) else {
+                break;
+            };
+            let run = self.system.shape(self.regular, size_px, piece, 0.0, 0.0);
+            stops.extend(run.glyphs.iter().map(|g| {
+                let x = (offset + f64::from(g.x)) / f64::from(dpi);
+                (start + g.cluster, x as f32)
+            }));
+            offset += f64::from(run.width);
+            start = end;
+        }
+        stops.push((text.len(), (offset / f64::from(dpi)) as f32));
+        let stops: Rc<[(usize, f32)]> = stops.into();
+        if let Ok(mut cache) = self.caret_cache.try_borrow_mut() {
+            if cache.len() >= CARET_CACHE_SIZE {
+                cache.remove(0);
+            }
+            cache.push(CachedStops {
+                text: text.to_string(),
+                size: key,
+                stops: stops.clone(),
+            });
+        }
         stops
+    }
+
+    /// How many texts were shaped for [`UiFonts::caret_stops`] (cache misses).
+    #[cfg(test)]
+    pub fn caret_shapes(&self) -> usize {
+        self.shaped.get()
     }
 
     /// The longest prefix of `text` that fits in `max_width` logical px,
@@ -111,6 +187,30 @@ pub fn caret_x(stops: &[(usize, f32)], pos: usize) -> f32 {
         .find(|&&(i, _)| i >= pos)
         .or(stops.last())
         .map_or(0.0, |&(_, x)| x)
+}
+
+/// Byte range of the part of a text drawn from `x0` (caret stops `stops`)
+/// that can show between `left` and `right` (logical px, relative to the
+/// start of the text), with a margin of `slack` px on both sides for glyph
+/// overhangs. Long texts are drawn from this slice only: shaping and
+/// drawing a huge text that is mostly scrolled out of a field would be
+/// wasted work.
+pub fn visible_range(
+    stops: &[(usize, f32)],
+    left: f32,
+    right: f32,
+    slack: f32,
+) -> std::ops::Range<usize> {
+    let end_of_text = stops.last().map_or(0, |s| s.0);
+    // Stops go left to right for the left-to-right text of the UI.
+    let first = stops.partition_point(|s| s.1 <= left - slack);
+    let start = first
+        .checked_sub(1)
+        .and_then(|i| stops.get(i))
+        .map_or(0, |s| s.0);
+    let last = stops.partition_point(|s| s.1 < right + slack);
+    let end = stops.get(last).map_or(end_of_text, |s| s.0);
+    start..end.max(start)
 }
 
 /// Byte offset of the caret stop closest to `x`.
@@ -510,6 +610,75 @@ mod tests {
         assert_eq!(caret_at(&stops, 500.0), 4);
         assert_eq!(caret_at(&[], 5.0), 0);
         assert_eq!(caret_x(&[], 5), 0.0);
+    }
+
+    #[test]
+    fn visible_ranges_of_long_texts() {
+        // Ten 10-px glyphs of one byte each.
+        let stops: Vec<(usize, f32)> = (0..=10).map(|i| (i, i as f32 * 10.0)).collect();
+        assert_eq!(visible_range(&stops, 0.0, 100.0, 0.0), 0..10);
+        // Glyphs partly in view are kept, plus the slack.
+        assert_eq!(visible_range(&stops, 35.0, 55.0, 0.0), 3..6);
+        assert_eq!(visible_range(&stops, 35.0, 55.0, 10.0), 2..7);
+        assert_eq!(visible_range(&stops, -50.0, 1000.0, 0.0), 0..10);
+        assert_eq!(visible_range(&stops, 500.0, 600.0, 0.0), 10..10);
+        assert_eq!(visible_range(&[], 0.0, 10.0, 1.0), 0..0);
+        assert_eq!(visible_range(&[(0, 0.0)], 0.0, 10.0, 1.0), 0..0);
+    }
+
+    #[test]
+    fn caret_stops_are_cached_per_text_and_size() {
+        let fonts = UiFonts::new(Arc::new(FontSystem::new()));
+        let long = "x".repeat(10_000);
+        let a = fonts.caret_stops(&long, 13.0, 1.0);
+        let b = fonts.caret_stops(&long, 13.0, 1.0);
+        assert!(Rc::ptr_eq(&a, &b), "shaped once");
+        assert_eq!(fonts.caret_shapes(), 1);
+        assert_eq!(a.len(), 10_001);
+        // Another size or another text is shaped again.
+        let c = fonts.caret_stops(&long, 13.0, 2.0);
+        assert!(!Rc::ptr_eq(&a, &c));
+        fonts.caret_stops("short", 13.0, 1.0);
+        assert_eq!(fonts.caret_shapes(), 3);
+        // The least recently used entry goes first.
+        for t in ["t1", "t2", "t3"] {
+            fonts.caret_stops(t, 13.0, 1.0);
+        }
+        assert_eq!(fonts.caret_shapes(), 6);
+        fonts.caret_stops("t1", 13.0, 1.0);
+        assert_eq!(fonts.caret_shapes(), 6, "still cached");
+        fonts.caret_stops(&long, 13.0, 1.0);
+        assert_eq!(fonts.caret_shapes(), 7, "evicted");
+    }
+
+    #[test]
+    fn caret_stops_of_huge_texts_do_not_drift() {
+        let fonts = UiFonts::new(Arc::new(FontSystem::new()));
+        if !fonts.system.has_fonts() {
+            return;
+        }
+        let one = fonts.measure("x", 13.0, false, 1.0);
+        let piece = fonts.measure(&"x".repeat(200), 13.0, false, 1.0);
+        let n = 500_000;
+        let stops = fonts.caret_stops(&"x".repeat(n), 13.0, 1.0);
+        assert_eq!(stops.len(), n + 1);
+        // The caret after the last 200 glyphs is where the drawn slice ends.
+        let span = stops[n].1 - stops[n - 200].1;
+        assert!((span - piece).abs() < 0.5, "{span} vs {piece}");
+        let end = stops[n].1;
+        assert!(
+            (end - one * n as f32).abs() < 2.0,
+            "{end} vs {}",
+            one * n as f32
+        );
+        // Multi-byte characters across piece boundaries keep their offsets.
+        let mixed = "é".repeat(3000);
+        let stops = fonts.caret_stops(&mixed, 13.0, 1.0);
+        assert_eq!(stops.len(), 3001);
+        assert!(stops.iter().all(|&(i, _)| mixed.is_char_boundary(i)));
+        assert!(stops
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
     }
 
     #[test]

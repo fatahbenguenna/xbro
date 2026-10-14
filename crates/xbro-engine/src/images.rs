@@ -12,7 +12,7 @@ use xbro_css::{MediaContext, MediaQueryList};
 use xbro_dom::{Document, NodeId};
 use xbro_layout::{ReplacedSizes, Size};
 use xbro_net::{resolve, Fetcher, Url};
-use xbro_paint::{Image, ImageProvider};
+use xbro_paint::{probe_image_size, Image, ImageProvider};
 use xbro_style::{BackgroundImage, ComputedStyle, Content, ContentItem, Display, StyleMap};
 
 use crate::fetch::{detached_map, scoped_map, Policy, MAX_WORKERS};
@@ -462,39 +462,89 @@ impl<'a> Collector<'a> {
 
 /// Fetches and decodes one image, charging its pixels to `budget` (bytes
 /// still available for decoded images of the page).
+///
+/// Raster images are charged from their header ([`probe_image_size`])
+/// *before* being decoded, and skipped when they do not fit: the workers
+/// loading images in parallel can never hold more decoded pixels at once
+/// than the budget (eight 100-megapixel images would otherwise be decoded
+/// at the same time before any of them is charged). Data whose size cannot
+/// be probed (SVG documents, which keep no pixel buffer, and unknown
+/// formats, which fail to decode) is charged after decoding.
 fn fetch_image(fetcher: &Fetcher, url: &Url, budget: &AtomicUsize) -> Result<Image, String> {
-    let exhausted = || {
-        format!(
-            "image memory budget exceeded ({} MiB per page)",
-            MAX_DECODED_BYTES >> 20
-        )
-    };
     if budget.load(Ordering::Relaxed) == 0 {
-        return Err(exhausted());
+        return Err(budget_exceeded());
     }
     let response = fetcher.fetch(url).map_err(|e| e.to_string())?;
     if !response.is_success() {
         return Err(format!("HTTP {}", response.status));
     }
-    // Do not spend time and memory decoding once the budget is spent.
-    if budget.load(Ordering::Relaxed) == 0 {
-        return Err(exhausted());
+    decode_charged(&response.body, response.content_type.as_deref(), budget)
+}
+
+/// The error reported for images that do not fit the page budget.
+fn budget_exceeded() -> String {
+    format!(
+        "image memory budget exceeded ({} MiB per page)",
+        MAX_DECODED_BYTES >> 20
+    )
+}
+
+/// Takes `bytes` from `budget`; false (nothing taken) when they do not fit.
+fn charge(budget: &AtomicUsize, bytes: usize) -> bool {
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            left.checked_sub(bytes)
+        })
+        .is_ok()
+}
+
+/// Gives `bytes` back to `budget`.
+fn refund(budget: &AtomicUsize, bytes: usize) {
+    if bytes > 0 {
+        budget.fetch_add(bytes, Ordering::Relaxed);
     }
-    let image =
-        Image::decode(&response.body, response.content_type.as_deref()).ok_or_else(|| {
-            format!(
-                "could not decode {} ({} bytes)",
-                response.content_type.as_deref().unwrap_or("data"),
-                response.body.len()
-            )
-        })?;
+}
+
+/// Decodes image data, charging its decoded pixels to `budget` (before
+/// decoding when the header gives the size, see [`fetch_image`]).
+fn decode_charged(
+    body: &[u8],
+    content_type: Option<&str>,
+    budget: &AtomicUsize,
+) -> Result<Image, String> {
+    // RGBA8: 4 bytes per pixel (an EXIF rotation keeps the pixel count).
+    let reserved = match probe_image_size(body, content_type) {
+        Some((w, h)) => {
+            let bytes = usize::try_from(u64::from(w) * u64::from(h) * 4).unwrap_or(usize::MAX);
+            if !charge(budget, bytes) {
+                return Err(budget_exceeded());
+            }
+            bytes
+        }
+        // Do not spend time and memory decoding once the budget is spent.
+        None if budget.load(Ordering::Relaxed) == 0 => return Err(budget_exceeded()),
+        None => 0,
+    };
+    let Some(image) = Image::decode(body, content_type) else {
+        refund(budget, reserved);
+        return Err(format!(
+            "could not decode {} ({} bytes)",
+            content_type.unwrap_or("data"),
+            body.len()
+        ));
+    };
+    // Settle the difference between the reservation and the decoded size
+    // (none for raster images; SVG data that looked like a raster image
+    // header is not expected but stays accounted for).
     let bytes = decoded_bytes(&image);
-    let charged = budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-        left.checked_sub(bytes)
-    });
-    match charged {
-        Ok(_) => Ok(image),
-        Err(_) => Err(exhausted()),
+    if bytes <= reserved {
+        refund(budget, reserved - bytes);
+        Ok(image)
+    } else if charge(budget, bytes - reserved) {
+        Ok(image)
+    } else {
+        refund(budget, reserved);
+        Err(budget_exceeded())
     }
 }
 
@@ -700,6 +750,95 @@ fn load_inline_svgs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LOGO: &[u8] = include_bytes!("../../../tests/fixtures/img/logo.png");
+    /// Decoded size of the 64×64 logo.
+    const LOGO_BYTES: usize = 64 * 64 * 4;
+    const ICON: &[u8] = include_bytes!("../../../tests/fixtures/img/icon.svg");
+
+    /// A PNG file with a valid `IHDR` of `w`×`h` and almost no pixel data.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8], data: &[u8]| {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IDAT", &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        chunk(b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn decoded_pixels_are_charged_before_decoding() {
+        let budget = AtomicUsize::new(LOGO_BYTES + 100);
+        let logo = decode_charged(LOGO, Some("image/png"), &budget).expect("fits");
+        assert_eq!(decoded_bytes(&logo), LOGO_BYTES);
+        assert_eq!(budget.load(Ordering::Relaxed), 100);
+        // Does not fit: refused, nothing taken.
+        let err = decode_charged(LOGO, None, &budget).unwrap_err();
+        assert_eq!(err, budget_exceeded());
+        assert_eq!(budget.load(Ordering::Relaxed), 100);
+        // SVG documents keep no pixels: nothing is charged.
+        assert!(decode_charged(ICON, Some("image/svg+xml"), &budget).is_ok());
+        assert_eq!(budget.load(Ordering::Relaxed), 100);
+        // A spent budget refuses everything.
+        let spent = AtomicUsize::new(0);
+        assert_eq!(
+            decode_charged(ICON, None, &spent).unwrap_err(),
+            budget_exceeded()
+        );
+
+        // A 1-gigabyte header is refused from the header alone (the data
+        // behind it is not even valid).
+        let page = AtomicUsize::new(MAX_DECODED_BYTES);
+        let err = decode_charged(&png_header(16_000, 16_000), None, &page).unwrap_err();
+        assert_eq!(err, budget_exceeded());
+        // A header that fits but data that cannot be decoded: the
+        // reservation is given back.
+        let err = decode_charged(&png_header(1_000, 1_000), None, &page).unwrap_err();
+        assert!(err.starts_with("could not decode"), "{err}");
+        assert_eq!(page.load(Ordering::Relaxed), MAX_DECODED_BYTES);
+    }
+
+    #[test]
+    fn parallel_decodes_share_the_budget() {
+        // Room for two logos: of eight workers decoding at once, two get one.
+        let budget = AtomicUsize::new(2 * LOGO_BYTES + 10);
+        let decoded = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| decode_charged(LOGO, None, &budget).is_ok()))
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|w| w.join().ok())
+                .filter(|&ok| ok)
+                .count()
+        });
+        assert_eq!(decoded, 2);
+        assert_eq!(budget.load(Ordering::Relaxed), 10);
+    }
 
     #[test]
     fn type_and_extension_checks() {

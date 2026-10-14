@@ -794,7 +794,7 @@ fn decorations_wrap_text() {
             .items
             .iter()
             .map(|i| match i {
-                DisplayItem::Rect { rect, color, .. } => {
+                DisplayItem::TextDecoration { rect, color } => {
                     assert_eq!(*color, RED);
                     assert_eq!(rect.x, 10.0);
                     assert!((rect.width - width).abs() < 1e-3);
@@ -814,7 +814,7 @@ fn decorations_wrap_text() {
             .items
             .iter()
             .filter_map(|i| match i {
-                DisplayItem::Rect { rect, .. } => Some(rect.y),
+                DisplayItem::TextDecoration { rect, .. } => Some(rect.y),
                 _ => None,
             })
             .collect();
@@ -1079,4 +1079,80 @@ fn hostile_values_do_not_panic() {
         }
     }
     let _ = render(&list, 50, 50);
+}
+
+#[test]
+fn border_top_gap_leaves_the_legend_area_unpainted() {
+    let mut b = bordered(
+        3,
+        r(10.0, 10.0, 100.0, 50.0),
+        style(|s| s.border = solid(4.0, RED)),
+    );
+    b.border_top_gap = Some((30.0, 70.0));
+    let list = build_display_list(&page(VIEW, vec![b.clone()]));
+    // The border is painted in three clipped parts.
+    let clips: Vec<Rect> = list
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            DisplayItem::PushClip { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        clips,
+        vec![
+            r(10.0, 10.0, 20.0, 50.0),
+            r(70.0, 10.0, 40.0, 50.0),
+            r(29.0, 15.0, 42.0, 45.0)
+        ]
+    );
+    assert_eq!(count(&list, |i| matches!(i, DisplayItem::Border { .. })), 3);
+    let p = render(&list, 200, 200);
+    // Top border left and right of the gap, not inside it.
+    assert_eq!(px(&p, 20, 11), (255, 0, 0, 255));
+    assert_eq!(px(&p, 90, 11), (255, 0, 0, 255));
+    assert_eq!(px(&p, 50, 11), (255, 255, 255, 255));
+    // The other sides are complete.
+    assert_eq!(px(&p, 50, 58), (255, 0, 0, 255));
+    assert_eq!(px(&p, 11, 30), (255, 0, 0, 255));
+    assert_eq!(px(&p, 108, 30), (255, 0, 0, 255));
+    // A gap outside the box or without a top border changes nothing.
+    b.border_top_gap = Some((500.0, 600.0));
+    let list = build_display_list(&page(VIEW, vec![b]));
+    assert_eq!(
+        count(&list, |i| matches!(i, DisplayItem::PushClip { .. })),
+        0
+    );
+    assert_eq!(count(&list, |i| matches!(i, DisplayItem::Border { .. })), 1);
+}
+
+#[test]
+fn border_top_gap_has_no_hairline_at_fractional_positions() {
+    // At a fractional device position the clip of the part below the top
+    // side used to share an anti-aliased pixel row with the top border's
+    // inner edge, leaving a faint line across the gap.
+    for (y, scale_top) in [(10.4, 3.0), (10.7, 2.0), (10.25, 1.5)] {
+        let mut b = bordered(
+            3,
+            r(10.3, y, 100.0, 50.0),
+            style(|s| s.border = solid(scale_top, RED)),
+        );
+        b.border_top_gap = Some((30.0, 70.0));
+        let list = build_display_list(&page(VIEW, vec![b]));
+        let p = render(&list, 200, 200);
+        for py in 8..16 {
+            for px_x in [40, 50, 60] {
+                assert_eq!(
+                    px(&p, px_x, py),
+                    (255, 255, 255, 255),
+                    "gap pixel ({px_x}, {py}) for y {y}"
+                );
+            }
+        }
+        // The border still runs left and right of the gap, and below.
+        assert_ne!(px(&p, 20, y as u32 + 1), (255, 255, 255, 255));
+        assert_ne!(px(&p, 90, y as u32 + 1), (255, 255, 255, 255));
+        assert_ne!(px(&p, 50, (y + 49.0) as u32), (255, 255, 255, 255));
+    }
 }

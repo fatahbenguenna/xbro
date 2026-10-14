@@ -10,8 +10,9 @@
 //! Subresources are fetched in parallel (at most 8 at a time): stylesheets
 //! on scoped threads (the cascade needs all of them; `@import`s of all the
 //! sheets level by level), images on detached workers with a per-page
-//! budget of 400 URLs, 20 s and 512 MiB of decoded pixels (what does not
-//! fit is reported in [`Page::console`], itself bounded to 1000 messages).
+//! budget of 400 URLs, 20 s and 512 MiB of decoded pixels, charged from the
+//! image header before decoding (what does not fit is skipped and reported
+//! in [`Page::console`], itself bounded to 1000 messages).
 //! Inline `<svg>` elements with identical trees share one parsed document,
 //! and the distinct ones are bounded to 8 MiB of SVG per page. As in
 //! browsers, only `file:` documents may load `file:` subresources. Pipeline
@@ -25,9 +26,12 @@
 //! only relayout for plain typing) and rebuild the display list, to which a
 //! focus ring and a text caret are appended. `:hover` restyles are skipped
 //! when no compound selector containing `:hover` can match an element whose
-//! hover state changed, and disabled for the page after one takes more than
-//! 100 ms. Hover and focus changes report a repaint when (and only when)
-//! they changed the display list.
+//! hover state changed. Each one costs about as much as the initial
+//! cascade + layout + display list, so hover styles are disabled for pages
+//! where those took more than 250 ms (1 s in debug builds), measured at
+//! load time; a hover restyle taking more than twice that disables them
+//! too. Hover and focus changes report a repaint when (and only when) they
+//! changed the display list.
 //!
 //! # Approximations
 //!
@@ -62,6 +66,7 @@ mod svg;
 
 use std::sync::Arc;
 
+pub use find::FindMatch;
 pub use images::PageImages;
 pub use page::{ClickAction, LoadTimings, Page};
 pub use xbro_layout::{Point, Rect, Size};

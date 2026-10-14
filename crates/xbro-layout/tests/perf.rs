@@ -47,6 +47,7 @@ fn fifteen_thousand_nodes_lay_out_quickly() {
             fonts,
             replaced: &NoImages,
             viewport,
+            focused: None,
         });
         best = best.min(t.elapsed());
         assert!(tree.document_size.height > 10_000.0);
@@ -74,6 +75,7 @@ fn best_layout_time(
             fonts,
             replaced: &NoImages,
             viewport,
+            focused: None,
         });
         best = best.min(t.elapsed());
         assert!(tree.root.is_some());

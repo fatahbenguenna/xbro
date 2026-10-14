@@ -707,6 +707,98 @@ fn svg_images_render() {
 }
 
 #[test]
+fn large_svg_images_render_their_visible_part() {
+    // Four coloured quadrants, drawn far larger than the drawing area:
+    // only the visible part is rendered (at full resolution), as images
+    // and as huge background tiles.
+    let quadrants = Image::from_svg_str(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <rect width="50" height="50" fill="red"/><rect x="50" width="50" height="50" fill="lime"/>
+            <rect y="50" width="50" height="50" fill="blue"/><rect x="50" y="50" width="50" height="50" fill="black"/></svg>"##,
+    )
+    .expect("svg");
+    // A filter is computed over the whole element at the rendering scale:
+    // such images are rendered whole at a bounded size instead.
+    let blurred = Image::from_svg_str(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><filter id="f">
+            <feGaussianBlur stdDeviation="1e6"/></filter><rect width="40" height="40" fill="lime" filter="url(#f)"/>
+            <rect width="40" height="40" fill="none" stroke="red"/></svg>"##,
+    )
+    .expect("svg");
+    let mut images = MapImages::default();
+    images.nodes.insert(1, quadrants.clone());
+    images.nodes.insert(2, blurred);
+    images.urls.insert("q.svg".into(), quadrants);
+    let start = std::time::Instant::now();
+    let image = list(
+        WHITE,
+        vec![DisplayItem::NodeImage {
+            rect: r(0.0, 0.0, 40_000.0, 40_000.0),
+            node: NodeId(1),
+        }],
+    );
+    for scale in [1.0, 2.0] {
+        let options = RasterOptions {
+            scroll: Point::new(19_900.0, 19_950.0),
+            scale,
+            ..RasterOptions::default()
+        };
+        for _ in 0..2 {
+            let p = render_with(&image, 400, 200, &options, &images);
+            let at = |x: f32, y: f32| ((x * scale) as u32, (y * scale) as u32);
+            let (x, y) = at(50.0, 25.0);
+            assert_px(&p, x, y, RED);
+            let (x, y) = at(150.0, 25.0);
+            assert_px(&p, x, y, LIME);
+            let (x, y) = at(50.0, 75.0);
+            assert_px(&p, x, y, BLUE);
+            let (x, y) = at(150.0, 75.0);
+            assert_px(&p, x, y, BLACK);
+            // Crisp at the boundary (not a 4096-px rendering scaled up 10×).
+            let (x, y) = at(98.0, 25.0);
+            assert_px(&p, x, y, RED);
+            let (x, y) = at(102.0, 25.0);
+            assert_px(&p, x, y, LIME);
+        }
+    }
+    let tiles = list(
+        WHITE,
+        vec![DisplayItem::BackgroundImage {
+            url: "q.svg".into(),
+            clip: r(0.0, 0.0, 10_000.0, 10_000.0),
+            origin: Point::ZERO,
+            tile: Size::new(3000.0, 3000.0),
+            repeat: BackgroundRepeat::Repeat,
+        }],
+    );
+    let options = RasterOptions {
+        scroll: Point::new(2950.0, 2950.0),
+        ..RasterOptions::default()
+    };
+    let p = render_with(&tiles, 100, 100, &options, &images);
+    assert_px(&p, 25, 25, BLACK);
+    assert_px(&p, 75, 75, RED);
+    assert_px(&p, 75, 25, BLUE);
+    assert_px(&p, 25, 75, LIME);
+    let blurred = list(
+        WHITE,
+        vec![DisplayItem::NodeImage {
+            rect: r(0.0, 0.0, 4000.0, 4000.0),
+            node: NodeId(2),
+        }],
+    );
+    let p = render_with(&blurred, 300, 200, &RasterOptions::default(), &images);
+    // The (unfiltered) frame is drawn.
+    assert_ne!(px(&p, 2, 100), rgb(WHITE));
+    // Seconds per rendering before (resvg's cost grew with the image).
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
 fn background_tiling_modes() {
     let mut images = MapImages::default();
     images.urls.insert("t.png".into(), solid_image(10, 10, RED));
@@ -1275,4 +1367,48 @@ fn deepest_accepted_svg_renders_on_small_stacks() {
         .expect("thread")
         .join()
         .expect("no stack overflow");
+}
+
+#[test]
+fn narrow_fractional_rects_spanning_two_pixel_columns() {
+    // Anti-aliased rects whose fractional edges fall in adjacent pixel
+    // columns tripped a debug assertion in tiny-skia, which aborted the
+    // whole rendering in debug builds (found by the pipeline fuzzer: an
+    // image 1.4 px wide at x = 11.1). Both columns get partial coverage.
+    let mut images = MapImages::default();
+    images.nodes.insert(1, solid_image(4, 4, RED));
+    let l = list(
+        WHITE,
+        vec![
+            DisplayItem::NodeImage {
+                rect: r(11.1, 2.0, 1.4, 30.0),
+                node: NodeId(1),
+            },
+            DisplayItem::LinearGradient {
+                rect: r(21.25, 2.0, 1.5, 30.0),
+                angle_deg: 90.0,
+                stops: vec![(BLUE, 0.0), (BLUE, 1.0)],
+                radii: [0.0; 4],
+            },
+            DisplayItem::PushClip {
+                rect: r(31.3, 0.0, 1.3, 40.0),
+                radii: [0.0; 4],
+            },
+            rect(25.0, 2.0, 20.0, 30.0, BLACK),
+            DisplayItem::PopClip,
+        ],
+    );
+    for scale in [1.0, 1.5] {
+        let options = RasterOptions {
+            scale,
+            ..RasterOptions::default()
+        };
+        let p = render_with(&l, 80, 60, &options, &images);
+        let column = |x: f32| px(&p, (x * scale) as u32, (10.0 * scale) as u32);
+        // Each partial column is tinted, neither is left white.
+        for x in [11.5, 12.2, 21.5, 22.5, 31.6, 32.3] {
+            assert_ne!(column(x), rgb(WHITE), "x = {x} at scale {scale}");
+        }
+        assert_eq!(column(14.0), rgb(WHITE));
+    }
 }

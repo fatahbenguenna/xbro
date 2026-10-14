@@ -151,6 +151,10 @@ pub(crate) struct BoxNode {
     /// and an auto width is its fit-content width even when block-level
     /// (HTML rendering, "button layout").
     pub button: bool,
+    /// Box of a `<fieldset>` element (a block container): it establishes a
+    /// formatting context and lays out its rendered legend in its top
+    /// border (see [`crate::fieldset`]).
+    pub fieldset: bool,
 }
 
 impl BoxNode {
@@ -174,6 +178,7 @@ impl BoxNode {
             intrinsic: Cell::new(None),
             cols: Vec::new(),
             button: false,
+            fieldset: false,
         }
     }
 
@@ -383,6 +388,7 @@ impl Builder<'_> {
                 b.cols = self.table_columns(el);
             }
             b.button = name == "button" && matches!(b.kind, Kind::Block | Kind::Flex);
+            b.fieldset = name == "fieldset" && matches!(b.kind, Kind::Block);
             out.push(b);
         }
     }

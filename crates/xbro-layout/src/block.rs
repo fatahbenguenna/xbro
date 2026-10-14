@@ -100,6 +100,17 @@ pub(crate) struct ContentLayout {
     /// the box's top margin, so its margin box still starts at the position
     /// the caller chose.
     pub offset_top: f32,
+    /// Added to the box's used top padding (the content box moves down,
+    /// the border box does not): the room a fieldset's legend takes.
+    pub extra_padding_top: f32,
+    /// [`LayoutBox::border_top_gap`] of the box (a fieldset's legend).
+    pub border_top_gap: Option<(f32, f32)>,
+    /// Space laid out below the box's border box (bottom table captions):
+    /// added to the box's bottom margin.
+    pub offset_bottom: f32,
+    /// The box does not paint its own border (a table whose collapsed
+    /// borders are painted by its cells); its used widths are kept.
+    pub hide_border: bool,
 }
 
 /// A float laid out but not yet placed.
@@ -150,6 +161,7 @@ pub(crate) fn establishes_bfc(b: &BoxNode) -> bool {
         || b.inline_level
         || b.flex_item
         || b.button
+        || b.fieldset
         || matches!(s.display, Display::TableCaption)
 }
 
@@ -387,8 +399,25 @@ impl<'t> LayoutCx<'t> {
         out: &mut Vec<LayoutBox>,
         top_unresolved: bool,
     ) -> Option<f32> {
+        self.layout_block_children_skipping(b, cb, flow, out, top_unresolved, None)
+    }
+
+    /// [`layout_block_children`](Self::layout_block_children) leaving out
+    /// the child at index `skip` (a fieldset's legend, laid out apart).
+    pub fn layout_block_children_skipping(
+        &mut self,
+        b: &'t BoxNode,
+        cb: Cb,
+        flow: &mut Flow<'_>,
+        out: &mut Vec<LayoutBox>,
+        top_unresolved: bool,
+        skip: Option<usize>,
+    ) -> Option<f32> {
         let mut first_top = None;
         for (i, c) in b.children.iter().enumerate() {
+            if Some(i) == skip {
+                continue;
+            }
             if c.is_float() {
                 let laid = self.prepare_float(c, cb);
                 let mut m = flow.margins;
@@ -563,7 +592,9 @@ impl<'t> LayoutCx<'t> {
         flow.y = y;
         flow.margins = Margins::default();
         let lb = self.layout_independent(b, x, y, content_w, &used, cb, forced_h);
-        flow.y = lb.border_box().bottom();
+        // Bottom table captions extend the used bottom margin: they are
+        // in-flow content below the border box, not a collapsible margin.
+        flow.y = lb.border_box().bottom() + sane_size(lb.margin.bottom - edges.margin.bottom);
         flow.margins.add(edges.margin.bottom);
         (lb, parent_top)
     }
@@ -639,12 +670,12 @@ impl<'t> LayoutCx<'t> {
             edges,
         );
         let h = match spec_h {
-            // The specified height of a table is a minimum; the one of a
-            // cell is applied by table layout (it heightens the row while
-            // the content is aligned with `vertical-align`).
-            Some(s) if forced_h.is_none() && matches!(b.kind, Kind::Table) => {
-                sane_size(s.max(content.height))
-            }
+            // Table layout distributes a specified (or forced) height and
+            // `min-height` to the rows (it is a minimum: the rows never
+            // shrink below their content); the height of a cell is applied
+            // by table layout (it heightens the row while the content is
+            // aligned with `vertical-align`).
+            _ if matches!(b.kind, Kind::Table) => sane_size(content.height),
             Some(_) if forced_h.is_none() && matches!(b.kind, Kind::TableCell) => {
                 sane_size(content.height)
             }
@@ -655,15 +686,31 @@ impl<'t> LayoutCx<'t> {
             },
         };
         let offset = sane_size(content.offset_top);
+        let extra = sane_size(content.extra_padding_top);
         let mut used = *edges;
         used.margin.top += offset;
+        used.margin.bottom += sane_size(content.offset_bottom);
+        used.padding.top += extra;
         let mut lb = self.new_box(
             b,
-            Rect::new(content_x, content_y + offset, content_w, h),
+            Rect::new(content_x, content_y + offset + extra, content_w, h),
             &used,
             content.children,
             content.lines,
         );
+        lb.border_top_gap = content.border_top_gap;
+        if content.hide_border {
+            let mut st = (*lb.style).clone();
+            for side in [
+                &mut st.border.top,
+                &mut st.border.right,
+                &mut st.border.bottom,
+                &mut st.border.left,
+            ] {
+                side.style = xbro_style::BorderStyle::None;
+            }
+            lb.style = std::sync::Arc::new(st);
+        }
         if let Kind::Replaced(Replaced::Control(c)) = &b.kind {
             if c.kind != crate::ControlKind::TextArea {
                 // Single-line controls center their text vertically.
@@ -672,6 +719,7 @@ impl<'t> LayoutCx<'t> {
                     crate::tree::translate_lines(&mut lb.lines, 0.0, dy);
                 }
             }
+            self.scroll_focused_control(b, &mut lb);
         } else if self.is_button(b) {
             // `<button>` centers its content vertically in a taller box
             // (its anonymous content box is centered, like browsers do).
@@ -737,7 +785,7 @@ impl<'t> LayoutCx<'t> {
         };
         match &b.kind {
             Kind::Flex => flex::layout_flex_contents(self, b, cb, y, limits),
-            Kind::Table => table::layout_table_contents(self, b, cb, y, edges),
+            Kind::Table => table::layout_table_contents(self, b, cb, y, edges, limits.0),
             Kind::Inline | Kind::Text(_) | Kind::LineBreak | Kind::WordBreak => {
                 ContentLayout::default()
             }
@@ -758,11 +806,15 @@ impl<'t> LayoutCx<'t> {
                         children: out.floats,
                         lines: out.lines,
                         height: sane_size(height),
-                        offset_top: 0.0,
+                        ..ContentLayout::default()
                     }
                 } else {
                     ContentLayout::default()
                 }
+            }
+            Kind::Block if self.rendered_legend(b).is_some() => {
+                let legend = self.rendered_legend(b).unwrap_or(0);
+                self.fieldset_contents(b, legend, cb, y, edges)
             }
             Kind::Block | Kind::TableCell | Kind::TableRowGroup | Kind::TableRow => {
                 let mut floats = FloatContext::new();
@@ -776,7 +828,7 @@ impl<'t> LayoutCx<'t> {
                         children: out.floats,
                         lines: out.lines,
                         height: sane_size(height),
-                        offset_top: 0.0,
+                        ..ContentLayout::default()
                     }
                 } else {
                     let mut flow = Flow {
@@ -795,7 +847,7 @@ impl<'t> LayoutCx<'t> {
                         children,
                         lines: Vec::new(),
                         height: sane_size(height),
-                        offset_top: 0.0,
+                        ..ContentLayout::default()
                     }
                 }
             }
@@ -1055,6 +1107,7 @@ impl<'t> LayoutCx<'t> {
             children,
             lines,
             marker: None,
+            border_top_gap: None,
         }
     }
 

@@ -938,4 +938,132 @@ mod tests {
         assert_eq!(form_owner(&d, by_id(&d, "b2")), Some(by_id(&d, "f1")));
         assert_eq!(form_owner(&d, by_id(&d, "b3")), None);
     }
+
+    #[test]
+    fn fuzz_form_documents() {
+        const PIECES: &[&str] = &[
+            "<form id=f action='?a=1#x' method=post>",
+            "<form action=javascript:x>",
+            "<form method=dialog>",
+            "<form action='%zz' method=GET>",
+            "<form>",
+            "</form>",
+            "<input name=q value='a&b=c d'>",
+            "<input type=checkbox name=c checked>",
+            "<input type=radio name=r value=1>",
+            "<input type=radio name=r checked>",
+            "<input type=submit name=s value=Go>",
+            "<input type=image name=i>",
+            "<input type=image>",
+            "<input type=reset>",
+            "<input type=hidden name=_charset_>",
+            "<input name='\u{e9}\u{65e5}' value='\u{1F600}\r\n'>",
+            "<input maxlength=2 name=m>",
+            "<input maxlength=-1 name=m2>",
+            "<input type=password name=p>",
+            "<button name=b value=v>",
+            "<button type=reset>",
+            "<button type=button>",
+            "</button>",
+            "<select name=s>",
+            "<select name=m multiple>",
+            "<option>o",
+            "<option selected value=2>",
+            "<option disabled selected>",
+            "<optgroup disabled>",
+            "</select>",
+            "<textarea name=t>a\nb",
+            "</textarea>",
+            "<fieldset disabled>",
+            "<legend>",
+            "</legend>",
+            "</fieldset>",
+            "<datalist><input name=dl></datalist>",
+            "<input form=f name=outside>",
+            "<button form=f formaction=other.html formmethod=get>",
+            "<input disabled name=d>",
+            "<label>",
+            "</label>",
+            "<table><tr><td>",
+            "</table>",
+            "<div>",
+            "</div>",
+            "text",
+        ];
+        let mut state = 0xfeed_f00d_dead_beefu64;
+        let mut below = |n: usize| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
+        };
+        let page = url("https://e.org/dir/page.html");
+        let (mut gets, mut posts) = (0, 0);
+        for _ in 0..600 {
+            let html: String = (0..below(40))
+                .map(|_| PIECES[below(PIECES.len())])
+                .collect();
+            let mut d = doc(&html);
+            let defaults = FormDefaults::snapshot(&d);
+            let nodes: Vec<NodeId> = d.descendants(d.root()).collect();
+            for &node in &nodes {
+                if !d.is_element_named(node, "form") {
+                    continue;
+                }
+                let submitters = std::iter::once(None).chain(
+                    nodes
+                        .iter()
+                        .filter(|&&n| is_submit_button(&d, n))
+                        .map(|&n| {
+                            Some(Submitter {
+                                node: n,
+                                coords: Some((below(100) as i32 - 50, 7)),
+                            })
+                        }),
+                );
+                for submitter in submitters.collect::<Vec<_>>() {
+                    match submit(&d, node, submitter, &page, &page) {
+                        Some(NavigationRequest::Get(u)) => {
+                            gets += 1;
+                            assert_eq!(u.fragment(), None, "{html:?}");
+                            assert_ne!(u.scheme(), "javascript");
+                        }
+                        Some(NavigationRequest::Post { url, fields }) => {
+                            posts += 1;
+                            assert_eq!(url.fragment(), None);
+                            for (name, _) in &fields {
+                                assert!(!name.is_empty(), "{html:?}: {fields:?}");
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            // Edit every control, then reset every form.
+            for &node in &nodes {
+                match below(5) {
+                    0 => toggle_checkbox(&mut d, node),
+                    1 => {
+                        let _ = check_radio(&mut d, node);
+                    }
+                    2 => {
+                        let _ = cycle_select(&mut d, node);
+                    }
+                    3 => {
+                        let _ = insert_text(&mut d, node, "x\ny\u{1F600}");
+                        let _ = implicit_submission(&d, node, &page, &page);
+                    }
+                    _ => {
+                        let _ = backspace(&mut d, node);
+                    }
+                }
+            }
+            for &node in &nodes {
+                if d.is_element_named(node, "form") {
+                    let _ = reset(&mut d, node, &defaults);
+                }
+            }
+        }
+        assert!(gets > 100 && posts > 100, "{gets} GET, {posts} POST");
+    }
 }

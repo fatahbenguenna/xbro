@@ -13,6 +13,7 @@ use super::input::{
 };
 use super::line_edit::{Clipboard, EditAction, EditOutcome};
 use super::paint::caret_at;
+use super::render::in_status_band;
 use super::tabs::NavKind;
 use super::viewport::{self, Axis};
 
@@ -264,14 +265,35 @@ impl Browser {
         }
         self.refresh_find();
         self.invalidate_page();
+        self.reveal_caret();
+    }
+
+    /// Scrolls the page so that the caret of the focused text field is in
+    /// view (typing into a field scrolled out of view brings it back).
+    fn reveal_caret(&mut self) {
+        let caret = self
+            .active()
+            .and_then(|t| t.page.as_ref())
+            .and_then(Page::caret_rect);
+        if let Some(rect) = caret {
+            self.reveal(rect, false);
+        }
     }
 
     // ---- mouse ------------------------------------------------------------
 
     /// The pointer moved to (`x`, `y`) device px.
     pub fn mouse_move(&mut self, x: f32, y: f32) {
-        self.mouse = Some((x, y));
         let dpi = self.metrics.dpi;
+        // The status bubble steps aside when the pointer comes over it.
+        if self.has_status() {
+            let page = self.layout().page;
+            let band = |(x, y): (f32, f32)| in_status_band(page, Point::new(x / dpi, y / dpi));
+            if band((x, y)) || self.mouse.is_some_and(band) {
+                self.invalidate();
+            }
+        }
+        self.mouse = Some((x, y));
         match self.drag {
             Some(Drag::Scrollbar { axis, grab }) => {
                 let Some(bar) = self.scrollbar(axis) else {
@@ -480,6 +502,7 @@ impl Browser {
             ChromeElement::FindClose => self.close_find(),
             ChromeElement::Tab(i) => self.select_tab(i),
             ChromeElement::Address => self.focus_address(),
+            ChromeElement::ZoomReset => self.set_zoom(1.0),
             ChromeElement::FindInput => self.open_find(),
         }
     }
@@ -941,6 +964,64 @@ mod tests {
     }
 
     #[test]
+    fn the_zoom_badge_shows_when_zoomed_and_resets_the_zoom() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        finish(&mut b, &jobs, "A", 30);
+        assert_eq!(b.layout().zoom_badge, None);
+        let ctrl = Mods { ctrl: true, ..NONE };
+        press(&mut b, Key::Character("+".into()), Some("+"), ctrl);
+        assert_eq!(b.zoom(), 1.1);
+        let badge = b.layout().zoom_badge.expect("a badge while zoomed");
+        // Its own text area: the address text stops before it.
+        assert!(b.layout().address_text().right() < badge.x);
+        b.mouse_move(badge.x + 10.0, badge.y + 5.0);
+        assert_eq!(b.hover, Some(ChromeElement::ZoomReset));
+        assert_eq!(b.cursor, Cursor::Pointer);
+        b.mouse_button(MouseButton::Left, true, NONE);
+        assert_eq!(b.zoom(), 1.1, "on release");
+        b.mouse_button(MouseButton::Left, false, NONE);
+        assert_eq!(b.zoom(), 1.0);
+        assert_eq!(b.layout().zoom_badge, None);
+        // The zoom is per tab, and so is the badge.
+        b.set_zoom(0.5);
+        b.new_tab(url("https://b.test/"), false);
+        assert_eq!(b.layout().zoom_badge, None);
+        b.select_tab(0);
+        assert!(b.layout().zoom_badge.is_some());
+    }
+
+    #[test]
+    fn the_status_bubble_is_redrawn_when_the_pointer_comes_over_it() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        let job = jobs.borrow_mut().pop().unwrap();
+        let html = "<style>a{display:block;height:2000px}</style><a href=/next>next</a>";
+        let page = super::super::browser::tests::engine().load_html(
+            html,
+            job.request.url().clone(),
+            job.viewport,
+        );
+        b.on_loaded(job.tab_id, job.nav_id, page);
+        b.mouse_move(400.0, 300.0);
+        assert!(b.status_text().is_some());
+        b.take_needs_redraw();
+        // Same link, away from the bubble: nothing to redraw.
+        b.mouse_move(420.0, 320.0);
+        assert!(!b.take_needs_redraw());
+        // Into the bottom band of the page (the 800×600 window's last rows).
+        b.mouse_move(30.0, 590.0);
+        assert!(b.take_needs_redraw(), "the bubble moves aside");
+        b.mouse_move(40.0, 590.0);
+        assert!(b.take_needs_redraw());
+        // And back out of it.
+        b.mouse_move(40.0, 300.0);
+        assert!(b.take_needs_redraw(), "the bubble comes back");
+        b.mouse_move(50.0, 300.0);
+        assert!(!b.take_needs_redraw());
+    }
+
+    #[test]
     fn clicking_links_navigates_or_opens_tabs() {
         let (mut b, jobs) = browser();
         b.open_initial(url("https://a.test/"));
@@ -966,5 +1047,58 @@ mod tests {
         let job = jobs.borrow().last().cloned().unwrap();
         assert_eq!(job.request.url().as_str(), "https://a.test/next");
         assert_eq!(job.tab_id, b.active().unwrap().id);
+    }
+
+    #[test]
+    fn typing_into_a_field_scrolled_out_of_view_brings_it_back() {
+        let (mut b, jobs) = browser();
+        b.open_initial(url("https://a.test/"));
+        let job = jobs.borrow_mut().pop().unwrap();
+        let html = "<body style='margin:0'><div style='height:1000px'></div>\
+                    <input id=q style='display:block;height:24px;width:200px'>\
+                    <div style='height:3000px'></div></body>";
+        let page = super::super::browser::tests::engine().load_html(
+            html,
+            job.request.url().clone(),
+            job.viewport,
+        );
+        b.on_loaded(job.tab_id, job.nav_id, page);
+        let field_y = 1000.0;
+        // Bring the field into view and click it (74 px of chrome above).
+        b.scroll_to(Point::new(0.0, 900.0));
+        b.mouse_move(20.0, 74.0 + (field_y - 900.0) + 10.0);
+        b.mouse_button(MouseButton::Left, true, NONE);
+        b.mouse_button(MouseButton::Left, false, NONE);
+        let focused = |b: &Browser| {
+            let page = b.active().unwrap().page.as_ref().unwrap();
+            page.has_text_focus()
+        };
+        assert!(focused(&b));
+        // Typing in view does not scroll.
+        type_text(&mut b, "ab");
+        assert_eq!(b.active().unwrap().scroll.y, 900.0);
+        // Scrolled away with the wheel, the field keeps the keyboard focus;
+        // typing scrolls back to it.
+        b.wheel(WheelDelta::Lines(0.0, -30.0), NONE);
+        let away = b.active().unwrap().scroll.y;
+        assert!(away > field_y + 500.0, "{away}");
+        type_text(&mut b, "c");
+        let scroll = b.active().unwrap().scroll.y;
+        let view = b.viewport_size().height;
+        assert!(
+            scroll <= field_y && scroll + view >= field_y + 24.0,
+            "{scroll}"
+        );
+        // Backspace too (from above the field this time).
+        b.scroll_to(Point::ZERO);
+        press(&mut b, Key::Named(NamedKey::Backspace), None, NONE);
+        let scroll = b.active().unwrap().scroll.y;
+        assert!(
+            scroll <= field_y && scroll + view >= field_y + 24.0,
+            "{scroll}"
+        );
+        let page = b.active().unwrap().page.as_ref().unwrap();
+        let q = page.document().get_element_by_id("q").unwrap();
+        assert_eq!(page.document().attr(q, "value"), Some("ab"));
     }
 }

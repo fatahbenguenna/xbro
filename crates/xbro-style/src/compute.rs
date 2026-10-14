@@ -16,8 +16,9 @@ use xbro_dom::ElementData;
 use crate::computed::*;
 use crate::properties::{
     CssWide, LonghandId, PropertyDeclaration, Spec, SpecBgSize, SpecContent, SpecContentItem,
-    SpecFontSize, SpecFontWeight, SpecImage, SpecLineHeight, SpecLpa, SpecMax, SpecTextAlign,
-    SpecVerticalAlign, UnparsedValue, WsCollapse, ALL_LONGHANDS, LONGHAND_COUNT,
+    SpecFontSize, SpecFontWeight, SpecGridTemplate, SpecImage, SpecLineHeight, SpecLpa, SpecMax,
+    SpecTextAlign, SpecVerticalAlign, SpecWordBreak, UnparsedValue, WsCollapse, ALL_LONGHANDS,
+    LONGHAND_COUNT,
 };
 use crate::values::{sane, MathExpr, Resolver, SpecColor};
 use crate::vars::{CustomMap, VarContext};
@@ -31,8 +32,67 @@ use fields::{
 pub(crate) struct Extra {
     pub ws_collapse: WsCollapse,
     pub nowrap: bool,
-    pub overflow_wrap: bool,
-    pub word_break: bool,
+    /// The element's own `overflow-wrap` (the computed field also reflects
+    /// `word-break: break-word`).
+    pub overflow_wrap: OverflowWrap,
+    pub word_break: SpecWordBreak,
+}
+
+/// Grid templates whose lengths depend on the element (`em`, `vw`, ...),
+/// memoized across the elements of a document so that a rule like
+/// `* { grid-template-columns: repeat(1000, 1em) }` does not allocate a
+/// thousand tracks per element; the tracks computed without sharing are
+/// also charged to a per-document budget (templates beyond it compute to
+/// `none`). Templates that only use px, `%`, `fr` and keywords are
+/// computed once at parse time and never reach this cache.
+pub(crate) struct GridCache {
+    entries: Vec<(Arc<SpecGridTemplate>, Resolver, Arc<GridTemplate>)>,
+    /// Tracks that may still be computed.
+    budget: usize,
+}
+
+/// Entries of the [`GridCache`].
+const GRID_CACHE_ENTRIES: usize = 32;
+
+/// Per-document budget of [`GridCache`] tracks.
+const GRID_TRACK_BUDGET: usize = 1_000_000;
+
+impl Default for GridCache {
+    fn default() -> Self {
+        Self::with_budget(GRID_TRACK_BUDGET)
+    }
+}
+
+impl GridCache {
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            budget,
+        }
+    }
+
+    /// The computed `spec` for an element whose units resolve with `r`.
+    fn get(&mut self, spec: &Arc<SpecGridTemplate>, r: &Resolver) -> Option<Arc<GridTemplate>> {
+        if let Some(shared) = &spec.computed {
+            return Some(shared.clone());
+        }
+        if let Some((_, _, t)) = self
+            .entries
+            .iter()
+            .find(|(s, key, _)| Arc::ptr_eq(s, spec) && key == r)
+        {
+            return Some(t.clone());
+        }
+        let cost = spec.track_count().max(1);
+        self.budget = self.budget.checked_sub(cost)?;
+        let t = Arc::new(spec.compute(r));
+        if self.entries.len() >= GRID_CACHE_ENTRIES {
+            self.entries.remove(0);
+        }
+        // Keeping `spec` alive guarantees its address is not reused.
+        self.entries.push((spec.clone(), *r, t.clone()));
+        Some(t)
+    }
 }
 
 /// Document-wide inputs.
@@ -106,6 +166,7 @@ pub(crate) fn compute(
     element: Option<&ElementData>,
     is_root: bool,
     vars: &mut VarContext,
+    grids: &mut GridCache,
 ) -> Computed {
     // Winning declaration of each longhand (and whether it is from the UA
     // origin), plus the winning UA declaration for `revert`.
@@ -128,7 +189,7 @@ pub(crate) fn compute(
     }
     let lists: Vec<&[PropertyDeclaration]> = blocks.iter().map(|b| b.customs).collect();
     let custom_map = vars.custom_properties(parent.customs, &lists);
-    let mut state = State::new(parent, env, element, &custom_map, vars);
+    let mut state = State::new(parent, env, element, &custom_map, vars, grids);
     let apply = |state: &mut State<'_>, id: LonghandId| {
         let Some((decl, from_ua)) = slots.get(id.index()).copied().flatten() else {
             return;
@@ -177,6 +238,8 @@ struct State<'a> {
     customs: &'a CustomMap,
     /// Memoized `var()` substitutions (shared across elements).
     vars: &'a mut VarContext,
+    /// Memoized element-dependent grid templates (shared across elements).
+    grids: &'a mut GridCache,
     /// Border widths before zeroing the sides whose style is `none`/`hidden`.
     border_width: [f32; 4],
     outline_width: f32,
@@ -194,6 +257,7 @@ impl<'a> State<'a> {
         element: Option<&'a ElementData>,
         customs: &'a CustomMap,
         vars: &'a mut VarContext,
+        grids: &'a mut GridCache,
     ) -> Self {
         let style = ComputedStyle::inherit_from(parent.style);
         let resolver = Resolver::new(
@@ -211,6 +275,7 @@ impl<'a> State<'a> {
             element,
             customs,
             vars,
+            grids,
             border_width: [3.0; 4],
             outline_width: 3.0,
             outline_style: BorderStyle::None,
@@ -492,12 +557,13 @@ impl<'a> State<'a> {
                 }
             }
             Spec::WsCollapse(c) => self.extra.ws_collapse = *c,
-            Spec::Bool(b) => match id {
-                L::TextWrapMode => self.extra.nowrap = *b,
-                L::OverflowWrap => self.extra.overflow_wrap = *b,
-                L::WordBreak => self.extra.word_break = *b,
-                _ => {}
-            },
+            Spec::Bool(b) => {
+                if id == L::TextWrapMode {
+                    self.extra.nowrap = *b;
+                }
+            }
+            Spec::OverflowWrap(w) => self.extra.overflow_wrap = *w,
+            Spec::WordBreak(w) => self.extra.word_break = *w,
             Spec::ListStyleType(t) => self.style.list_style_type = *t,
             Spec::ListStylePosition(p) => self.style.list_style_position = *p,
             Spec::ListStyleImage(i) => self.style.list_style_image = i.clone(),
@@ -505,6 +571,8 @@ impl<'a> State<'a> {
             Spec::BorderSpacing(h, v) => {
                 self.style.border_spacing = (self.lp(h, true).px, self.lp(v, true).px)
             }
+            Spec::CaptionSide(c) => self.style.caption_side = *c,
+            Spec::TableLayout(t) => self.style.table_layout = *t,
             Spec::DecorationLine(l) => self.style.text_decoration_line = *l,
             Spec::VerticalAlign(v) => {
                 self.style.vertical_align = match v {
@@ -538,11 +606,21 @@ impl<'a> State<'a> {
                     self.style.order = *i;
                 }
             }
-            Spec::Count(n) => {
-                if id == L::GridColumns {
-                    self.style.grid_columns = *n;
+            Spec::GridTemplate(t) => {
+                let value = t.as_ref().and_then(|t| self.grids.get(t, &self.resolver));
+                match id {
+                    L::GridTemplateColumns => self.style.grid_template_columns = value,
+                    L::GridTemplateRows => self.style.grid_template_rows = value,
+                    _ => {}
                 }
             }
+            Spec::GridLine(line) => match id {
+                L::GridColumnStart => self.style.grid_column.start = *line,
+                L::GridColumnEnd => self.style.grid_column.end = *line,
+                L::GridRowStart => self.style.grid_row.start = *line,
+                L::GridRowEnd => self.style.grid_row.end = *line,
+                _ => {}
+            },
             Spec::Content(c) => self.style.content = self.content(c),
         }
     }
@@ -672,7 +750,8 @@ impl<'a> State<'a> {
             }
         }
         s.white_space = white_space(self.extra.ws_collapse, self.extra.nowrap);
-        s.break_anywhere = self.extra.overflow_wrap || self.extra.word_break;
+        (s.overflow_wrap, s.word_break, s.break_anywhere) =
+            word_breaking(self.extra.overflow_wrap, self.extra.word_break);
 
         // overflow: visible/clip next to a scrolling axis become auto/hidden.
         let scrolls = |o: Overflow| !matches!(o, Overflow::Visible | Overflow::Clip);
@@ -701,9 +780,15 @@ impl<'a> State<'a> {
         {
             s.display = blockify(s.display, is_root);
         }
-        if !matches!(s.display, Display::Grid | Display::InlineGrid) {
-            s.grid_columns = 0;
-        }
+        s.grid_columns = match &s.grid_template_columns {
+            Some(t)
+                if t.auto_repeat.is_none()
+                    && matches!(s.display, Display::Grid | Display::InlineGrid) =>
+            {
+                u32::try_from(t.tracks.len()).unwrap_or(u32::MAX)
+            }
+            _ => 0,
+        };
 
         // Text decoration propagation.
         let own = s.text_decoration_line;
@@ -723,6 +808,33 @@ impl<'a> State<'a> {
         };
         (s, self.extra)
     }
+}
+
+/// Computed `overflow_wrap`, `word_break` and `break_anywhere` from the
+/// element's `overflow-wrap` and `word-break`. `word-break: break-word`
+/// behaves as `word-break: normal` plus (at least) `overflow-wrap:
+/// break-word` (the spec says `anywhere`; xbro keeps it from reducing
+/// min-content sizes). `break_anywhere` is true as soon as any of them
+/// allows breaking words.
+fn word_breaking(
+    overflow_wrap: OverflowWrap,
+    word_break: SpecWordBreak,
+) -> (OverflowWrap, WordBreak, bool) {
+    let wrap = match (overflow_wrap, word_break) {
+        (OverflowWrap::Normal, SpecWordBreak::BreakWord) => OverflowWrap::BreakWord,
+        (w, _) => w,
+    };
+    let brk = match word_break {
+        SpecWordBreak::BreakAll => WordBreak::BreakAll,
+        SpecWordBreak::KeepAll => WordBreak::KeepAll,
+        SpecWordBreak::Normal | SpecWordBreak::BreakWord => WordBreak::Normal,
+    };
+    let anywhere = overflow_wrap != OverflowWrap::Normal
+        || matches!(
+            word_break,
+            SpecWordBreak::BreakAll | SpecWordBreak::BreakWord
+        );
+    (wrap, brk, anywhere)
 }
 
 /// `white-space` from its two longhands.
@@ -875,6 +987,94 @@ mod tests {
             white_space(WsCollapse::BreakSpaces, false),
             WhiteSpace::BreakSpaces
         );
+    }
+
+    #[test]
+    fn word_breaking_combinations() {
+        use OverflowWrap as O;
+        use SpecWordBreak as W;
+        let cases = [
+            (O::Normal, W::Normal, (O::Normal, WordBreak::Normal, false)),
+            (
+                O::BreakWord,
+                W::Normal,
+                (O::BreakWord, WordBreak::Normal, true),
+            ),
+            (
+                O::Anywhere,
+                W::Normal,
+                (O::Anywhere, WordBreak::Normal, true),
+            ),
+            (
+                O::Normal,
+                W::BreakAll,
+                (O::Normal, WordBreak::BreakAll, true),
+            ),
+            (
+                O::Normal,
+                W::KeepAll,
+                (O::Normal, WordBreak::KeepAll, false),
+            ),
+            (
+                O::Normal,
+                W::BreakWord,
+                (O::BreakWord, WordBreak::Normal, true),
+            ),
+            (
+                O::Anywhere,
+                W::BreakWord,
+                (O::Anywhere, WordBreak::Normal, true),
+            ),
+            (
+                O::BreakWord,
+                W::KeepAll,
+                (O::BreakWord, WordBreak::KeepAll, true),
+            ),
+        ];
+        for (wrap, brk, expected) in cases {
+            assert_eq!(word_breaking(wrap, brk), expected, "{wrap:?} {brk:?}");
+        }
+    }
+
+    #[test]
+    fn grid_cache_shares_and_budgets() {
+        let parse = |css: &str| {
+            let block =
+                crate::properties::DeclBlock::parse(&xbro_css::parse_declaration_list(css), false);
+            match block.normal.longhands.first() {
+                Some(PropertyDeclaration::Value(_, Spec::GridTemplate(Some(t)))) => t.clone(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let em = parse("grid-template-columns: repeat(3, 1em)");
+        assert!(em.computed.is_none());
+        let r16 = Resolver::new(16.0, 16.0, false, (800.0, 600.0));
+        let r20 = Resolver::new(20.0, 16.0, false, (800.0, 600.0));
+        let mut cache = GridCache::with_budget(7);
+        let a = cache.get(&em, &r16).unwrap();
+        let b = cache.get(&em, &r16).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "same spec and units: shared");
+        assert_eq!(
+            a.tracks,
+            vec![GridTrack::Length(LengthPercentage::px(16.0)); 3]
+        );
+        let c = cache.get(&em, &r20).unwrap();
+        assert_eq!(c.tracks[0], GridTrack::Length(LengthPercentage::px(20.0)));
+        // 6 of the 7 tracks of the budget are spent: a new template is dropped,
+        // cached and context-free ones are still served.
+        let r24 = Resolver::new(24.0, 16.0, false, (800.0, 600.0));
+        assert!(cache.get(&em, &r24).is_none());
+        assert!(cache.get(&em, &r20).is_some());
+        let px = parse("grid-template-columns: repeat(500, 1px)");
+        let shared = cache.get(&px, &r24).unwrap();
+        assert!(Arc::ptr_eq(&shared, px.computed.as_ref().unwrap()));
+        // Bounded number of entries.
+        let mut cache = GridCache::default();
+        for i in 0..100 {
+            let r = Resolver::new(i as f32, 16.0, false, (800.0, 600.0));
+            assert!(cache.get(&em, &r).is_some());
+        }
+        assert!(cache.entries.len() <= GRID_CACHE_ENTRIES);
     }
 
     #[test]

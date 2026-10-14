@@ -284,21 +284,100 @@ fn viewport_changes_and_degenerate_inputs() {
 
 #[test]
 fn nested_imports_are_bounded() {
-    // a.css imports itself: the depth limit stops the recursion.
-    let css_url = temp_file("self.css", b"");
-    let css = format!("@import url('{css_url}'); p {{ color: rgb(1, 2, 3) }}");
-    std::fs::write(css_url.to_file_path().unwrap(), css).unwrap();
-    let html = format!("<link rel=stylesheet href='{css_url}'><p id=p>x</p>");
+    // A chain of distinct sheets: the depth limit stops the recursion.
+    let mut next = String::new();
+    for i in (0..6).rev() {
+        let url = temp_file(&format!("chain{i}.css"), b"");
+        let css = format!("{next} .c{i} {{ color: rgb(1, 2, {i}) }}");
+        std::fs::write(url.to_file_path().unwrap(), css).unwrap();
+        next = format!("@import url('{url}');");
+    }
+    let first = temp_file("chain.html.css", next.as_bytes());
+    let html = format!("<link rel=stylesheet href='{first}'><p id=p class=c1>x</p>");
     // A local document (web pages may not load `file:` stylesheets).
     let page = engine().load_html(&html, fixture_url("imports.html"), VIEWPORT);
     assert_eq!(
         page.styles().get(by_id(&page, "p")).unwrap().color,
-        Color::rgb(1, 2, 3)
+        Color::rgb(1, 2, 1)
     );
     assert!(page
         .console()
         .iter()
         .any(|m| m.contains("too deeply nested")));
+}
+
+/// Number of top-level style rules once `@media` wrappers are flattened.
+fn style_rule_count(rules: &[xbro_css::CssRule]) -> usize {
+    rules
+        .iter()
+        .map(|r| match r {
+            xbro_css::CssRule::Style(_) => 1,
+            xbro_css::CssRule::Media { rules, .. }
+            | xbro_css::CssRule::Supports { rules, .. }
+            | xbro_css::CssRule::Group { rules } => style_rule_count(rules),
+            xbro_css::CssRule::Import { .. } => 0,
+        })
+        .sum()
+}
+
+#[test]
+fn import_cycles_are_ignored() {
+    // a.css imports itself and b.css, which imports a.css back: every
+    // cyclic import is ignored, so each rule appears once (the fuzzer
+    // found pages whose rules were repeated 64 times, until the import
+    // budget ran out).
+    let a = temp_file("cycle-a.css", b"");
+    let b = temp_file("cycle-b.css", b"");
+    let same_as_a = a.as_str().replace("cycle-a.css", "./cycle-a.css");
+    let write = |url: &Url, css: String| std::fs::write(url.to_file_path().unwrap(), css).unwrap();
+    write(
+        &a,
+        format!("@import url('{a}'); @import url('{b}') screen; @import '{same_as_a}'; .a {{ color: rgb(1, 2, 3) }}"),
+    );
+    write(
+        &b,
+        format!("@import url('{a}'); @import url('{b}'); .b {{ color: rgb(4, 5, 6) }}"),
+    );
+    let html =
+        format!("<link rel=stylesheet href='{a}'><p id=a class=a>x</p><p id=b class=b>y</p>");
+    let page = engine().load_html(&html, fixture_url("imports.html"), VIEWPORT);
+    assert_eq!(
+        page.styles().get(by_id(&page, "a")).unwrap().color,
+        Color::rgb(1, 2, 3)
+    );
+    assert_eq!(
+        page.styles().get(by_id(&page, "b")).unwrap().color,
+        Color::rgb(4, 5, 6)
+    );
+    let rules: usize = page
+        .stylesheets()
+        .iter()
+        .map(|s| style_rule_count(&s.rules))
+        .sum();
+    assert_eq!(rules, 2, "{:#?}", page.stylesheets());
+    assert!(page.console().iter().any(|m| m.contains("@import cycle")));
+    // The same sheet imported twice without a cycle is applied twice (as
+    // in browsers): only the import chain matters.
+    let leaf = temp_file("diamond-leaf.css", b".d { color: rgb(7, 8, 9) }");
+    let left = temp_file(
+        "diamond-left.css",
+        format!("@import url('{leaf}');").as_bytes(),
+    );
+    let right = temp_file(
+        "diamond-right.css",
+        format!("@import url('{leaf}');").as_bytes(),
+    );
+    let html = format!(
+        "<style>@import url('{left}'); @import url('{right}');</style><p id=d class=d>z</p>"
+    );
+    let page = engine().load_html(&html, fixture_url("imports.html"), VIEWPORT);
+    let rules: usize = page
+        .stylesheets()
+        .iter()
+        .map(|s| style_rule_count(&s.rules))
+        .sum();
+    assert_eq!(rules, 2);
+    assert!(!page.console().iter().any(|m| m.contains("@import cycle")));
 }
 
 #[test]

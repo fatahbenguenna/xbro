@@ -146,6 +146,17 @@ pub fn lay_full(
     fonts: &FontSystem,
     images: Option<FakeImages>,
 ) -> Laid {
+    lay_with_focus(html, viewport, fonts, images, None)
+}
+
+/// Like [`lay_full`], with the keyboard focus on the element with id `focus`.
+pub fn lay_with_focus(
+    html: &str,
+    viewport: Size,
+    fonts: &FontSystem,
+    images: Option<FakeImages>,
+    focus: Option<&str>,
+) -> Laid {
     let doc = xbro_html::parse_document(html);
     let sheets = author_sheets(&doc);
     let ctx = StyleContext {
@@ -157,6 +168,7 @@ pub fn lay_full(
         ..StyleContext::default()
     };
     let styles = compute_styles(&doc, &sheets, &ctx);
+    let focused = focus.and_then(|id| doc.get_element_by_id(id));
     let tree = match images {
         Some(mut imgs) => {
             imgs.bind(&doc);
@@ -166,6 +178,7 @@ pub fn lay_full(
                 fonts,
                 replaced: &imgs,
                 viewport,
+                focused,
             })
         }
         None => layout(&LayoutContext {
@@ -174,6 +187,7 @@ pub fn lay_full(
             fonts,
             replaced: &NoImages,
             viewport,
+            focused,
         }),
     };
     Laid { doc, styles, tree }

@@ -1,6 +1,9 @@
 //! Author stylesheets of a document: `<style>` elements and `<link
 //! rel=stylesheet>` in tree order, external sheets fetched in parallel,
-//! `@import` rules inlined recursively, URLs made absolute.
+//! `@import` rules inlined recursively, URLs made absolute. As in browsers,
+//! an `@import` of a sheet that is already being imported (one of its
+//! importers, or itself) is ignored: cycles would otherwise repeat the
+//! sheets until the import budget is exhausted (64 copies of each rule).
 
 use std::collections::{HashMap, HashSet};
 
@@ -176,16 +179,22 @@ pub(crate) fn load_stylesheets(
         })
         .collect();
     let mut fetched = scoped_map(&urls, MAX_WORKERS, |u| fetcher.fetch(u)).into_iter();
-    let mut parsed: Vec<(Stylesheet, Option<String>)> = Vec::with_capacity(sources.len());
+    // Each sheet with its media list and the URLs it was loaded from (the
+    // requested one and the final one after redirects).
+    let mut parsed: Vec<(Stylesheet, Option<String>, Vec<String>)> =
+        Vec::with_capacity(sources.len());
     for source in sources {
         match source {
-            Source::Inline { css, media } => parsed.push((parse_with_base(&css, base), media)),
+            Source::Inline { css, media } => {
+                parsed.push((parse_with_base(&css, base), media, Vec::new()))
+            }
             Source::External { url, media } => match fetched.next().flatten() {
                 Some(Ok(response)) => match unusable(&response) {
                     Some(why) => console.push(format!("Failed to load stylesheet {url}: {why}")),
                     None => parsed.push((
                         parse_with_base(&decode_css(&response), &response.url),
                         media,
+                        vec![url.to_string(), response.url.to_string()],
                     )),
                 },
                 Some(Err(e)) => console.push(format!("Failed to load stylesheet {url}: {e}")),
@@ -195,7 +204,7 @@ pub(crate) fn load_stylesheets(
     }
     // Every sheet's imports, level by level, in parallel: one round trip
     // per nesting level instead of one per importing sheet.
-    let roots: Vec<&[CssRule]> = parsed.iter().map(|(s, _)| s.rules.as_slice()).collect();
+    let roots: Vec<&[CssRule]> = parsed.iter().map(|(s, ..)| s.rules.as_slice()).collect();
     let cache = prefetch_imports(fetcher, policy, &roots);
     let mut import_budget = MAX_IMPORTS;
     let mut imports = Imports {
@@ -206,8 +215,8 @@ pub(crate) fn load_stylesheets(
         console,
     };
     let mut sheets = Vec::with_capacity(parsed.len());
-    for (sheet, media) in parsed {
-        let rules = imports.resolve(sheet.rules, 1);
+    for (sheet, media, mut chain) in parsed {
+        let rules = imports.resolve(sheet.rules, 1, &mut chain);
         let rules = match media {
             Some(m) => vec![CssRule::Media {
                 query: MediaQueryList::parse_str(&m),
@@ -299,15 +308,28 @@ impl Imports<'_> {
     /// Replaces the top-level `@import` rules of a sheet by the rules of the
     /// imported sheets (wrapped in `@media` when the import has a media list).
     /// `depth` is the nesting level of the sheets being imported (1 for imports
-    /// of a document's own sheets).
-    fn resolve(&mut self, rules: Vec<CssRule>, depth: usize) -> Vec<CssRule> {
+    /// of a document's own sheets); `chain` holds the URLs of the sheet and
+    /// of the sheets importing it, whose imports are ignored (cycles).
+    fn resolve(
+        &mut self,
+        rules: Vec<CssRule>,
+        depth: usize,
+        chain: &mut Vec<String>,
+    ) -> Vec<CssRule> {
         if !rules.iter().any(|r| matches!(r, CssRule::Import { .. })) {
             return rules;
         }
         let mut targets: Vec<Option<Url>> = Vec::new();
         for rule in &rules {
             if let CssRule::Import { url, .. } = rule {
-                targets.push(self.target(url, depth));
+                let target = self.target(url, depth).filter(|t| {
+                    let cycle = chain.iter().any(|c| c == t.as_str());
+                    if cycle {
+                        self.console.push(format!("@import cycle, ignored: {t}"));
+                    }
+                    !cycle
+                });
+                targets.push(target);
             }
         }
         // Fetch what was not prefetched, in parallel.
@@ -347,7 +369,9 @@ impl Imports<'_> {
                     continue;
                 }
             };
-            let imported = self.resolve(sheet.rules, depth + 1);
+            chain.push(target.to_string());
+            let imported = self.resolve(sheet.rules, depth + 1, chain);
+            chain.pop();
             if media.values.iter().all(|v| v.is_whitespace()) {
                 out.extend(imported);
             } else {

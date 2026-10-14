@@ -1,5 +1,5 @@
 //! Flex containers (CSS Flexbox 1 §9, simplified) and the entry point of
-//! the grid approximation ([`crate::grid`]).
+//! grid layout ([`crate::grid`]).
 //!
 //! # Contract
 //!
@@ -59,7 +59,7 @@ use crate::cx::LayoutCx;
 use crate::intrinsic::Intrinsic;
 use crate::sizing::{box_edges, sane, sane_size};
 
-/// True for grid containers (laid out by the grid approximation).
+/// True for grid containers (laid out by [`crate::grid`]).
 pub(crate) fn is_grid(style: &ComputedStyle) -> bool {
     matches!(style.display, Display::Grid | Display::InlineGrid)
 }
@@ -73,7 +73,7 @@ pub(crate) fn layout_flex_contents<'t>(
     limits: (f32, f32),
 ) -> ContentLayout {
     if is_grid(&b.style) {
-        crate::grid::layout_grid_contents(cx, b, cb, y)
+        crate::grid::layout_grid_contents(cx, b, cb, y, limits)
     } else {
         algo::layout(cx, b, cb, y, limits)
     }

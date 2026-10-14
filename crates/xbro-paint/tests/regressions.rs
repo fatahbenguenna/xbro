@@ -80,6 +80,7 @@ fn render_html(html: &str, width: u32, height: u32) -> (DisplayList, tiny_skia::
         fonts,
         replaced: &NoImages,
         viewport,
+        focused: None,
     });
     let list = build_display_list_full(&tree, fonts, &NoImageProvider);
     let mut pixmap = tiny_skia::Pixmap::new(width, height).expect("pixmap");
@@ -869,4 +870,61 @@ fn default_display_list_has_a_white_canvas() {
             document_size: VIEW,
         })
     );
+}
+
+// ---------------------------------------------------------------------
+// Collapsed table borders at fractional scales
+// ---------------------------------------------------------------------
+
+/// Lengths of the runs of black pixels along a line of `pixmap`.
+fn black_runs(pixmap: &tiny_skia::Pixmap, points: impl Iterator<Item = (u32, u32)>) -> Vec<u32> {
+    let mut runs = Vec::new();
+    let mut cur = 0;
+    for (x, y) in points {
+        let black = pixmap
+            .pixel(x, y)
+            .is_some_and(|p| p.red() < 100 && p.green() < 100 && p.blue() < 100);
+        if black {
+            cur += 1;
+        } else if cur > 0 {
+            runs.push(cur);
+            cur = 0;
+        }
+    }
+    if cur > 0 {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// Collapsed borders are shared (each line drawn once, by one cell): at
+/// a fractional scale every 1px line is exactly one device pixel thick.
+#[test]
+fn collapsed_table_borders_stay_one_device_pixel_thick() {
+    // Widths and heights chosen so that cells overlapping by 1px (the
+    // old approximation) would put lines across a device pixel boundary
+    // (x = 26 or 42 CSS px, 2 mod 4) and draw them 2 device pixels thick.
+    let html = "<style>body{margin:0}table{border-collapse:collapse;border:1px solid #000}\
+                td{border:1px solid #000;padding:0;height:12px}</style>\
+                <table><tr><td style='width:24px'></td><td style='width:15px'></td><td style='width:30px'></td></tr>\
+                <tr><td></td><td></td><td></td></tr><tr><td></td><td></td><td></td></tr></table>";
+    let (list, _) = render_html(html, 200, 100);
+    let mut pixmap = tiny_skia::Pixmap::new(250, 125).expect("pixmap");
+    let options = RasterOptions {
+        scale: 1.25,
+        ..RasterOptions::default()
+    };
+    rasterize(
+        &list,
+        system_fonts(),
+        &NoImageProvider,
+        &mut pixmap,
+        &options,
+    );
+    // Through the middle of the second row: 4 vertical lines.
+    let across = black_runs(&pixmap, (0..250).map(|x| (x, 24)));
+    assert_eq!(across, vec![1, 1, 1, 1], "{across:?}");
+    // Down the middle of the second column: 4 horizontal lines.
+    let down = black_runs(&pixmap, (0..125).map(|y| (41, y)));
+    assert_eq!(down, vec![1, 1, 1, 1], "{down:?}");
 }

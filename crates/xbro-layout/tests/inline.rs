@@ -444,3 +444,89 @@ fn text_fragments_have_glyphs_relative_to_rect() {
     assert_eq!(t.font_size, 16.0);
     assert_eq!(t.node, l.doc.children(l.id("p"))[0]);
 }
+
+// ------------------------------------------- overflow-wrap and word-break
+
+const URL: &str = "https://example.com/a/very/long/path/that/never/ends/index.html";
+
+#[test]
+fn break_word_does_not_shrink_min_content_in_tables() {
+    let Some(l) = lay(
+        &page(&format!(
+            "<div style='width:200px'>\
+               <table id=bw style='border-spacing:0'><tr><td id=bwc style='overflow-wrap:break-word;padding:0'>{URL}</td></tr></table>\
+               <table id=any style='border-spacing:0'><tr><td id=anyc style='overflow-wrap:anywhere;padding:0'>{URL}</td></tr></table>\
+               <table id=ba style='border-spacing:0'><tr><td id=bac style='word-break:break-all;padding:0'>{URL}</td></tr></table>\
+               <table id=ww style='border-spacing:0'><tr><td id=wwc style='word-wrap:break-word;padding:0'>{URL}</td></tr></table>\
+             </div>"
+        )),
+        800.0,
+    ) else {
+        return;
+    };
+    // break-word: the column keeps the URL's width (the table overflows
+    // its 200px container) and the URL stays on one line.
+    let url_w = l.rect("bwc").width;
+    assert!(url_w > 300.0, "{url_w}");
+    assert_eq!(l.line_texts("bwc").len(), 1);
+    assert_eq!(l.rect("bw").width, url_w);
+    assert_eq!(l.rect("ww").width, url_w);
+    // anywhere / break-all: the table fits and the URL wraps.
+    for (t, c) in [("any", "anyc"), ("ba", "bac")] {
+        assert_eq!(l.rect(t).width, 200.0, "{t}");
+        let lines = l.line_texts(c);
+        assert!(lines.len() >= 2, "{t}: {lines:?}");
+        assert_eq!(lines.concat(), URL);
+    }
+}
+
+#[test]
+fn break_word_does_not_shrink_flex_items() {
+    let Some(l) = lay(
+        &page(&format!(
+            "<div style='display:flex;width:200px'><div id=bw style='overflow-wrap:break-word'>{URL}</div></div>\
+             <div style='display:flex;width:200px'><div id=any style='overflow-wrap:anywhere'>{URL}</div></div>\
+             <div style='width:200px;overflow-wrap:break-word'><p id=block style='margin:0'>{URL}</p></div>"
+        )),
+        800.0,
+    ) else {
+        return;
+    };
+    // The flex item's automatic minimum size is its min-content width:
+    // the whole URL with break-word (the item overflows), the widest
+    // character with anywhere (the item shrinks and the URL wraps).
+    let bw = l.rect("bw");
+    assert!(bw.width > 300.0, "{bw:?}");
+    assert_eq!(l.line_texts("bw").len(), 1);
+    let any = l.rect("any");
+    assert_eq!(any.width, 200.0);
+    assert!(l.line_texts("any").len() >= 2);
+    // In a block of definite width, break-word still breaks the URL.
+    let lines = l.line_texts("block");
+    assert!(lines.len() >= 2, "{lines:?}");
+    for line in &l.box_id("block").lines {
+        assert!(text_right(line) <= 200.01);
+    }
+}
+
+#[test]
+fn break_all_breaks_words_wherever_the_line_is_full() {
+    let Some(l) = lay(
+        &page(
+            "<p id=bw style='width:100px;overflow-wrap:break-word'>aaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbb</p>\
+             <p id=ba style='width:100px;word-break:break-all'>aaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbb</p>",
+        ),
+        400.0,
+    ) else {
+        return;
+    };
+    // break-word: the long word moves to its own line first.
+    assert_eq!(l.line_texts("bw")[0], "aaaa");
+    // break-all: the first line is filled with the start of the word.
+    let ba = l.line_texts("ba");
+    assert!(ba[0].starts_with("aaaa b"), "{ba:?}");
+    assert_eq!(
+        ba.concat().replace(' ', ""),
+        "aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+}

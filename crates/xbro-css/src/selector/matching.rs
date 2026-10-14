@@ -23,6 +23,11 @@
 //! `:has()` walks the descendants or following siblings of the anchor
 //! (bounded by [`HAS_BUDGET`] elements per evaluation) and matches each
 //! candidate right-to-left, with positions tracked relative to the anchor.
+//! Its result only depends on the anchor, so a [`MatchCache`] shared by
+//! the matches of a style pass keeps it per element (by
+//! [`Element::cache_key`]): without it, `:has()` in a compound left of a
+//! descendant combinator re-walks the anchor's subtree for every element
+//! below the anchor (quadratic, or cubic in a deep tree).
 
 use std::collections::HashMap;
 
@@ -74,22 +79,44 @@ impl Pos {
     }
 }
 
+/// Results shared by the matches of one style pass (see
+/// [`crate::Selector::matches_with_cache`]).
+#[derive(Debug, Default)]
+pub struct MatchCache {
+    /// `:has()` results: (argument list address, element key) → matched.
+    has: HashMap<(usize, usize), bool>,
+}
+
+impl MatchCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forgets every result (after a change of the document or of the selectors).
+    pub fn clear(&mut self) {
+        self.has.clear();
+    }
+}
+
 /// State of one top-level match.
-struct Ctx {
+struct Ctx<'c> {
     /// Remaining matching steps.
     budget: u32,
     /// Set when the budget ran out: the whole match then fails.
     exhausted: bool,
     /// Results of nested selector lists: (list address, position) → matched.
     memo: Option<HashMap<(usize, Pos), bool>>,
+    /// Results shared with other matches.
+    shared: Option<&'c mut MatchCache>,
 }
 
-impl Ctx {
-    fn new() -> Self {
+impl<'c> Ctx<'c> {
+    fn new(shared: Option<&'c mut MatchCache>) -> Self {
         Ctx {
             budget: MATCH_BUDGET,
             exhausted: false,
             memo: None,
+            shared,
         }
     }
 
@@ -108,7 +135,7 @@ impl Ctx {
     fn memoized(
         &mut self,
         key: Option<(usize, Pos)>,
-        compute: impl FnOnce(&mut Ctx) -> bool,
+        compute: impl FnOnce(&mut Ctx<'c>) -> bool,
     ) -> bool {
         let Some(key) = key else {
             return compute(self);
@@ -196,8 +223,12 @@ struct Place {
     pos: Option<Pos>,
 }
 
-pub(crate) fn matches_selector<E: Element>(selector: &Selector, element: &E) -> bool {
-    let mut ctx = Ctx::new();
+pub(crate) fn matches_selector<E: Element>(
+    selector: &Selector,
+    element: &E,
+    cache: Option<&mut MatchCache>,
+) -> bool {
+    let mut ctx = Ctx::new(cache);
     let place = Place {
         relative: None,
         pos: Some(Pos::SUBJECT),
@@ -331,14 +362,30 @@ fn matches_pseudo_class<E: Element>(
         PseudoClass::Not(list) => !matches_list(list, element, pos, ctx),
         PseudoClass::Is(list) | PseudoClass::Where(list) => matches_list(list, element, pos, ctx),
         PseudoClass::Has(list) => {
-            // A `:has()` evaluation walks a whole subtree: memoized like
-            // the other lists away from the subject.
+            // A `:has()` evaluation walks a whole subtree: its result is
+            // shared with the other matches of the style pass, and
+            // memoized like the other lists away from the subject.
+            let shared_key = element
+                .cache_key()
+                .filter(|_| ctx.shared.is_some() && !list.is_empty())
+                .map(|k| (list.as_ptr() as usize, k));
+            if let Some(&cached) =
+                shared_key.and_then(|k| ctx.shared.as_deref().and_then(|cache| cache.has.get(&k)))
+            {
+                return cached;
+            }
             let key = memo_key(list, pos, || true);
-            ctx.memoized(key, |ctx| {
+            let result = ctx.memoized(key, |ctx| {
                 list.iter().any(|(combinator, selector)| {
                     matches_relative(element, *combinator, selector, ctx)
                 })
-            })
+            });
+            if let (Some(k), false) = (shared_key, ctx.exhausted) {
+                if let Some(cache) = ctx.shared.as_deref_mut() {
+                    cache.has.insert(k, result);
+                }
+            }
+            result
         }
         simple => matches_simple_pseudo_class(simple, element),
     }

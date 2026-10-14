@@ -284,6 +284,17 @@ fn supports_rules() {
         ("display: flex", false),
         ("(display:)", false),
         ("not(display: flex)", false),
+        ("(grid-template-columns: subgrid)", false),
+        ("(grid-template-rows: subgrid [a])", false),
+        ("(grid-template-columns: masonry)", false),
+        ("(GRID-TEMPLATE: none / SUBGRID)", false),
+        ("not (grid-template-columns: subgrid)", true),
+        ("(grid-template-columns: repeat(2, 1fr))", true),
+        ("(grid-template-columns: inherit)", true),
+        ("(grid-area: 1 / 2)", true),
+        ("(table-layout: fixed)", true),
+        ("(caption-side: bottom)", true),
+        ("(overflow-wrap: anywhere)", true),
     ];
     for (condition, expected) in cases {
         let sheet = parse_stylesheet(&format!("@supports {condition} {{ a {{ x: y }} }}"));

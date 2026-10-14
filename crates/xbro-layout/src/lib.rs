@@ -5,7 +5,7 @@
 //! Supported formatting: block flow (with margin collapsing), inline flow
 //! (line breaking, `text-align`, `vertical-align`, `white-space`), floats and
 //! `clear`, relative/absolute/fixed positioning, list markers, flexbox, tables
-//! (auto layout, `colspan`/`rowspan`), a grid approximation, replaced elements
+//! (auto layout, `colspan`/`rowspan`), grid, replaced elements
 //! (images, inline SVG, form controls) and `::before`/`::after` content.
 //!
 //! # Pipeline
@@ -27,13 +27,13 @@
 //! * Flexbox follows CSS Flexbox 1 §9 with simplifications (see the
 //!   `flex` module): baseline alignment only in rows, no `visibility:
 //!   collapse`.
-//! * Grid containers are approximated by equal-width columns filled row
-//!   by row (see the `grid` module): track sizes and explicit placement are
-//!   ignored; with an unknown column count it is guessed from the items.
-//! * Tables (see the `table` module): `table-layout: fixed` is only read
-//!   from the inline `style` attribute (not in `ComputedStyle`),
-//!   `caption-side` is ignored (captions on top), collapsed borders are
-//!   approximated by overlapping cell borders.
+//! * Grid layout (see the `grid` module) sizes tracks and places items
+//!   by line numbers and spans with row-major auto-placement; named lines
+//!   and areas, `grid-auto-flow` and `grid-auto-rows/columns` are not
+//!   supported.
+//! * Tables (see the `table` module): collapsed borders are resolved
+//!   between cells and the table only (rows, row groups and columns
+//!   ignored); `empty-cells` and `visibility: collapse` are ignored.
 //! * An `<img>` without a natural size but with a non-empty `alt` is a
 //!   [`BoxKind::Image`] box sized like an inline-block around its alt text,
 //!   which is laid out as its `lines` (unless `width`/`height` are given).
@@ -64,6 +64,7 @@ mod block;
 mod box_tree;
 mod cx;
 mod dump;
+mod fieldset;
 mod flex;
 mod float;
 mod grid;
@@ -115,6 +116,10 @@ pub struct LayoutContext<'a> {
     pub replaced: &'a dyn ReplacedSizes,
     /// Size of the viewport (initial containing block) in CSS px.
     pub viewport: Size,
+    /// The element with keyboard focus, if any. A focused text field whose
+    /// value overflows it is laid out showing the end of its text (where
+    /// the caret is), a focused `<textarea>` its last line.
+    pub focused: Option<NodeId>,
 }
 
 /// Kind of form control, for painting control-specific decorations.
@@ -155,7 +160,7 @@ pub enum BoxKind {
     /// items, anonymous block boxes, block-level `::before`/`::after`. Its content is
     /// either `children` (block formatting) or `lines` (inline formatting).
     Block,
-    /// Flex container (also used for the grid approximation); items are `children`.
+    /// Flex or grid container; items are `children`.
     Flex,
     /// Table wrapper box: `children` are the caption (if any) and row groups / rows.
     Table,
@@ -205,6 +210,10 @@ pub struct LayoutBox {
     pub lines: Vec<LineBox>,
     /// List item marker, if this is a `list-item` with a marker.
     pub marker: Option<ListMarker>,
+    /// Absolute x-range `(start, end)` of the top border left unpainted
+    /// (the `<legend>` of a `<fieldset>` sits in this gap); `None` for a
+    /// continuous border.
+    pub border_top_gap: Option<(f32, f32)>,
 }
 
 impl LayoutBox {
@@ -382,6 +391,7 @@ pub fn layout(ctx: &LayoutContext<'_>) -> LayoutTree {
         };
     };
     let mut cx = cx::LayoutCx::new(ctx.document, ctx.fonts, ctx.replaced, viewport);
+    cx.focused = ctx.focused;
     let root = cx.layout_root(&root_node);
     let (_, overflow) = box_tree::viewport_overflow(ctx.document, ctx.styles);
     let document_size = query::document_size(&root, viewport, overflow);

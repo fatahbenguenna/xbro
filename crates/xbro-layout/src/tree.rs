@@ -9,6 +9,10 @@ pub(crate) fn translate_box(b: &mut LayoutBox, dx: f32, dy: f32) {
         return;
     }
     b.content = b.content.translate(dx, dy);
+    if let Some((a, e)) = &mut b.border_top_gap {
+        *a += dx;
+        *e += dx;
+    }
     translate_lines(&mut b.lines, dx, dy);
     if let Some(m) = &mut b.marker {
         m.rect = m.rect.translate(dx, dy);
@@ -52,6 +56,21 @@ pub(crate) fn is_out_of_flow_box(b: &LayoutBox) -> bool {
 /// out above the table box, which do not define the table's baseline).
 pub(crate) fn is_caption_box(b: &LayoutBox) -> bool {
     b.style.display == xbro_style::Display::TableCaption && b.kind == BoxKind::Block
+}
+
+/// How far the bottom captions of a table box reach below its border box
+/// (0 for other boxes).
+pub(crate) fn bottom_caption_extent(b: &LayoutBox) -> f32 {
+    if b.kind != BoxKind::Table {
+        return 0.0;
+    }
+    let bottom = b.border_box().bottom();
+    b.children
+        .iter()
+        .filter(|c| is_caption_box(c) && c.style.caption_side == xbro_style::CaptionSide::Bottom)
+        .map(|c| c.margin_box().bottom() - bottom)
+        .fold(0.0f32, f32::max)
+        .max(0.0)
 }
 
 /// Baseline (absolute y) of the first line box in the box's in-flow content.

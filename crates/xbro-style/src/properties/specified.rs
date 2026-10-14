@@ -69,6 +69,42 @@ pub(crate) enum WsCollapse {
     BreakSpaces,
 }
 
+/// `word-break` values (`break-word` is kept apart: it also affects
+/// the computed `overflow_wrap`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum SpecWordBreak {
+    #[default]
+    Normal,
+    BreakAll,
+    KeepAll,
+    BreakWord,
+}
+
+/// A specified grid track size (lengths not yet computed).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SpecTrack {
+    Length(MathExpr),
+    Fr(f32),
+    Auto,
+    MinContent,
+    MaxContent,
+    FitContent(MathExpr),
+    MinMax(Box<SpecTrack>, Box<SpecTrack>),
+}
+
+/// A specified `grid-template-columns` / `-rows` track list (see
+/// [`GridTemplate`] for the layout of the fields).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SpecGridTemplate {
+    pub tracks: Vec<SpecTrack>,
+    /// `(auto-fill?, tracks)`.
+    pub auto_repeat: Option<(bool, Vec<SpecTrack>)>,
+    pub auto_repeat_index: usize,
+    /// The computed template when no length depends on the element (fonts,
+    /// viewport): computed once at parse time and shared by every element.
+    pub computed: Option<Arc<GridTemplate>>,
+}
+
 /// One background image layer.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SpecImage {
@@ -144,13 +180,17 @@ pub(crate) enum Spec {
     /// `letter-spacing` / `word-spacing`: `None` = `normal`.
     Spacing(Option<MathExpr>),
     WsCollapse(WsCollapse),
-    /// `text-wrap-mode: nowrap`, `overflow-wrap` / `word-break` allowing breaks anywhere.
+    /// `text-wrap-mode: nowrap`.
     Bool(bool),
+    OverflowWrap(OverflowWrap),
+    WordBreak(SpecWordBreak),
     ListStyleType(ListStyleType),
     ListStylePosition(ListStylePosition),
     ListStyleImage(Option<std::sync::Arc<str>>),
     BorderCollapse(BorderCollapse),
     BorderSpacing(MathExpr, MathExpr),
+    CaptionSide(CaptionSide),
+    TableLayout(TableLayout),
     DecorationLine(TextDecorationLine),
     VerticalAlign(SpecVerticalAlign),
     FlexDirection(FlexDirection),
@@ -158,6 +198,8 @@ pub(crate) enum Spec {
     Justify(JustifyContent),
     Align(AlignItems),
     Integer(i32),
-    Count(u32),
+    /// `grid-template-columns` / `-rows`; `None` = `none`.
+    GridTemplate(Option<Arc<SpecGridTemplate>>),
+    GridLine(GridLine),
     Content(SpecContent),
 }

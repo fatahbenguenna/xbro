@@ -57,12 +57,15 @@ impl Laid {
         }
     }
 
-    /// Records the used margins `m` on the box (the top margin also covers
-    /// the captions of a table).
+    /// Records the used margins `m` on the box (the top and bottom margins
+    /// also cover the captions of a table, the top one the room taken by a
+    /// fieldset's legend).
     pub fn set_margins(&mut self, m: crate::geom::Edges) {
         let caption = sane_size(self.lb.border_box().y - self.y);
+        let below = sane_size(crate::tree::bottom_caption_extent(&self.lb));
         self.lb.margin = m;
         self.lb.margin.top += caption;
+        self.lb.margin.bottom += below;
     }
 
     /// Throws the box away, forgetting its pending descendants.
@@ -106,6 +109,21 @@ pub(crate) fn depends_on_cb_height(b: &BoxNode) -> bool {
     lpa(&s.height)
         || lpa(&s.min_height)
         || matches!(&s.max_height, xbro_style::MaxSize::Length(l) if l.has_percent())
+}
+
+/// Height that box `lb`, laid out with `edges`, takes besides its content
+/// height, padding, borders and margins: the captions of a table (above
+/// and below its border box) and the room a fieldset's legend adds above
+/// its content. Flex and grid layout add it to the item's outer size
+/// (the forced content height of a stretched item leaves it out).
+pub(crate) fn extra_height(lb: &LayoutBox, edges: &BoxEdges) -> f32 {
+    let usual = lb.content.height + edges.pb_v() + edges.margin.top + edges.margin.bottom;
+    let extra = sane_size(lb.margin_box().height - usual);
+    if extra > SAME_SIZE {
+        extra
+    } else {
+        0.0
+    }
 }
 
 /// Lays out item `b` with its border box at `(x, y)`, content width `w` and
@@ -171,6 +189,7 @@ pub(crate) fn measure<'t>(
     let m = Measured {
         height: sane_size(laid.lb.content.height),
         baseline: crate::tree::first_baseline(&laid.lb).map(|bl| bl - top),
+        extra: extra_height(&laid.lb, edges),
     };
     cx.measure_cache.insert(key, m);
     (m, Some(laid))

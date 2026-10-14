@@ -13,8 +13,8 @@ use std::collections::HashMap;
 
 use xbro_css::selector::Element;
 use xbro_css::{
-    Combinator, Compound, CssRule, MediaContext, PseudoClass, PseudoElement, Selector, Specificity,
-    StyleRule, Stylesheet,
+    Combinator, Compound, CssRule, MatchCache, MediaContext, PseudoClass, PseudoElement, Selector,
+    Specificity, StyleRule, Stylesheet,
 };
 
 use crate::bloom::{hash, AncestorFilter, KIND_CLASS, KIND_ID, KIND_TAG};
@@ -147,13 +147,16 @@ impl<'s> SelectorMap<'s> {
     }
 
     /// Calls `f` for every entry whose selector matches `el` (each entry at
-    /// most once; `seen` / `stamp` deduplicate entries found via several buckets).
+    /// most once; `seen` / `stamp` deduplicate entries found via several
+    /// buckets). `cache` keeps results shared between the elements of a
+    /// style pass.
     pub fn for_each_match(
         &self,
         el: &DomElement<'_>,
         filter: &AncestorFilter,
         seen: &mut [u32],
         stamp: u32,
+        cache: &mut MatchCache,
         mut f: impl FnMut(&RuleEntry<'s>),
     ) {
         let mut visit = |list: &[u32]| {
@@ -175,7 +178,7 @@ impl<'s> SelectorMap<'s> {
                 {
                     continue;
                 }
-                if entry.selector.matches(el) {
+                if entry.selector.matches_with_cache(el, cache) {
                     f(entry);
                 }
             }
@@ -332,7 +335,9 @@ mod tests {
         let mut seen = vec![0; set.main.entries.len()];
         let mut out = Vec::new();
         set.main
-            .for_each_match(&el, &filter, &mut seen, 1, |e| out.push(e.order));
+            .for_each_match(&el, &filter, &mut seen, 1, &mut MatchCache::new(), |e| {
+                out.push(e.order)
+            });
         out.sort();
         out
     }

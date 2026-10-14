@@ -11,11 +11,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use xbro_css::{MediaContext, Specificity, Stylesheet};
+use xbro_css::{MatchCache, MediaContext, Specificity, Stylesheet};
 use xbro_dom::{Document, ElementData, NodeData, NodeId};
 
 use crate::bloom::AncestorFilter;
-use crate::compute::{self as computing, initial_style, Block, Computed, Env, Extra, Parent};
+use crate::compute::{
+    self as computing, initial_style, Block, Computed, Env, Extra, GridCache, Parent,
+};
 use crate::computed::{ComputedStyle, Content, Display};
 use crate::dom::{DomElement, TreeInfo};
 use crate::hints::{self, HintContext};
@@ -116,6 +118,10 @@ struct Scratch<'a> {
     style_attrs: HashMap<&'a str, Arc<DeclBlock>>,
     /// Custom property / `var()` caches and work budget.
     vars: VarContext,
+    /// Element-dependent grid templates.
+    grids: GridCache,
+    /// Selector results shared by the matches of this pass (`:has()`).
+    match_cache: MatchCache,
 }
 
 /// Elements that never generate `::before` / `::after` boxes (replaced or void).
@@ -172,6 +178,7 @@ impl<'a> Scratch<'a> {
                 seen,
                 filter,
                 matched,
+                match_cache,
                 ..
             } = self;
             let Some(seen) = seen.get_mut(set_index * 3 + kind as usize) else {
@@ -188,7 +195,7 @@ impl<'a> Scratch<'a> {
             } else {
                 (UA_NORMAL, UA_IMPORTANT)
             };
-            map.for_each_match(el, filter, seen, stamp, |entry| {
+            map.for_each_match(el, filter, seen, stamp, match_cache, |entry| {
                 let Some(block) = set.block(entry.block) else {
                     return;
                 };
@@ -484,6 +491,7 @@ fn style_element<'a>(
         Some(e),
         is_root,
         &mut scratch.vars,
+        &mut scratch.grids,
     ))
 }
 
@@ -516,7 +524,15 @@ fn style_pseudo<'a>(
     if !declares_content {
         return None;
     }
-    let computed = computing::compute(&blocks, element, env, Some(e), false, &mut scratch.vars);
+    let computed = computing::compute(
+        &blocks,
+        element,
+        env,
+        Some(e),
+        false,
+        &mut scratch.vars,
+        &mut scratch.grids,
+    );
     let style = computed.style;
     if style.display == Display::None || matches!(style.content, Content::Normal) {
         return None;

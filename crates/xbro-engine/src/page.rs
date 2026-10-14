@@ -14,13 +14,33 @@ use xbro_text::FontSystem;
 
 use crate::dynamic::DynamicRules;
 use crate::error_pages::percent_decode;
+use crate::find::FindMatch;
 use crate::forms::{self, FormDefaults, Submitter};
 use crate::images::PageImages;
 use crate::loader::{media_context, sanitize_viewport};
 use crate::{boxes, find, focus, image_map, meta, NavigationRequest};
 
-/// A hover restyle slower than this disables hover restyling for the page.
-const HOVER_RESTYLE_BUDGET: Duration = Duration::from_millis(100);
+/// Longest a `:hover` restyle (cascade, layout and display list) should
+/// block the UI thread. Debug builds are a few times slower: their budget is
+/// larger, so that the same pages keep their hover effects.
+pub(crate) const HOVER_RESTYLE_BUDGET: Duration = if cfg!(debug_assertions) {
+    Duration::from_millis(1000)
+} else {
+    Duration::from_millis(250)
+};
+
+/// Whether a page whose initial cascade, layout and display list took
+/// `cost` can afford `:hover` restyles (each one costs about as much).
+fn hover_affordable(cost: Duration) -> bool {
+    cost <= HOVER_RESTYLE_BUDGET
+}
+
+/// Whether a `:hover` restyle that took `elapsed` shows that the load-time
+/// estimate was wrong (twice the budget: timing noise around the budget
+/// does not count).
+fn hover_restyle_too_slow(elapsed: Duration) -> bool {
+    elapsed > HOVER_RESTYLE_BUDGET * 2
+}
 
 /// How many following nodes [`Page::fragment_offset`] inspects to place an
 /// anchor that generates no box of its own.
@@ -271,6 +291,7 @@ impl Page {
             fonts: &self.fonts,
             replaced: &self.images,
             viewport,
+            focused: self.focus,
         };
         guarded(
             "layout",
@@ -298,6 +319,25 @@ impl Page {
         self.rebuild_display_list();
         self.timings.layout = mid - start;
         self.timings.display_list = mid.elapsed();
+    }
+
+    /// Decides, once the page is loaded, whether `:hover` restyles are
+    /// affordable: they are disabled for the page when its initial cascade,
+    /// layout and display list took longer than [`HOVER_RESTYLE_BUDGET`],
+    /// since every hover change would block the UI that long.
+    pub(crate) fn check_hover_cost(&mut self) {
+        let t = &self.timings;
+        let cost = t.style + t.layout + t.display_list;
+        if self.dynamic.has_hover() && !hover_affordable(cost) {
+            self.hover_enabled = false;
+            log(
+                &mut self.console,
+                format!(
+                    ":hover styles disabled for this page (style and layout take {} ms)",
+                    cost.as_millis()
+                ),
+            );
+        }
     }
 
     /// Rebuilds the display list from the current layout, with the focus indication.
@@ -332,11 +372,17 @@ impl Page {
         let generation = self.generation;
         let was_painted = self.focus_painted();
         let changed = self.focus != node;
+        let previous = self.focus;
         self.focus = node;
         self.focus_visible = visible && node.is_some();
         let painted = self.focus_painted();
+        // Layout scrolls the text of a focused text field to its end.
+        let text_field =
+            |n: Option<NodeId>| n.is_some_and(|n| forms::is_text_field(&self.document, n));
         if changed && self.dynamic.focus {
             self.restyle();
+        } else if changed && (text_field(previous) || text_field(node)) {
+            self.relayout();
         } else if (changed && (was_painted || painted)) || was_painted != painted {
             self.rebuild_display_list();
         }
@@ -488,7 +534,8 @@ impl Page {
 
     /// Updates the `:hover` element; returns true when the page must be
     /// repainted (styles changed). Implementations may skip restyling when no
-    /// stylesheet uses `:hover`.
+    /// stylesheet uses `:hover`. Pages too slow to restyle (see the crate
+    /// docs) keep tracking the hovered element without restyling.
     pub fn set_hover(&mut self, point: Option<(Point, Point)>) -> bool {
         let new = point
             .and_then(|(p, s)| self.node_at(p, s))
@@ -504,7 +551,9 @@ impl Page {
         let start = Instant::now();
         self.restyle();
         let elapsed = start.elapsed();
-        if elapsed > HOVER_RESTYLE_BUDGET {
+        // Safety net: the load-time estimate (see `check_hover_cost`) was
+        // wrong. Dropping the hover styles costs one more restyle, once.
+        if hover_restyle_too_slow(elapsed) {
             self.hover_enabled = false;
             log(
                 &mut self.console,
@@ -549,6 +598,18 @@ impl Page {
     pub fn has_text_focus(&self) -> bool {
         self.focus
             .is_some_and(|f| forms::is_text_field(&self.document, f))
+    }
+
+    /// Caret rect (document coordinates) of the focused text field or
+    /// textarea, for the UI to keep it in view while typing. `None` without
+    /// a focused text field, when it generates no box, or when it is in a
+    /// `position: fixed` subtree (always in view, in viewport coordinates).
+    pub fn caret_rect(&self) -> Option<Rect> {
+        let field = self
+            .focus
+            .filter(|&f| forms::is_text_field(&self.document, f))?;
+        let (rect, fixed) = focus::caret_of(&self.layout, &self.document, field)?;
+        (!fixed).then_some(rect)
     }
 
     /// The focused text field, if it can be edited.
@@ -672,6 +733,15 @@ impl Page {
 
     /// Document y (CSS px) to scroll to for a URL fragment (`#id` or `<a name>`); `None` if absent.
     /// The empty fragment and `top` scroll to 0.
+    ///
+    /// A target that generates no box of its own (an empty `<a name>`
+    /// between blocks, `display: contents`) is placed at the next node in
+    /// document order that has one (its own content first), else just after
+    /// the previous one (the bottom of its box, or the top of an ancestor's).
+    /// Boxes in `position: fixed` subtrees are always in view and have no
+    /// document position: a fixed target gives `None` (nothing to scroll
+    /// to), and they are skipped when looking for a neighbour. A target
+    /// that is not rendered at all (`display: none`) gives `None` too.
     pub fn fragment_offset(&self, fragment: &str) -> Option<f32> {
         let raw = fragment.strip_prefix('#').unwrap_or(fragment);
         if raw.is_empty() || raw.eq_ignore_ascii_case("top") {
@@ -688,24 +758,109 @@ impl Page {
             .or_else(|| (decoded != raw).then(|| by_id(raw)).flatten())
             .or_else(|| by_name(&decoded))
             .or_else(|| (decoded != raw).then(|| by_name(raw)).flatten())?;
-        if let Some(r) = self.layout.node_rect(target) {
-            return Some(r.y.max(0.0));
+        if let Some((r, fixed)) = boxes::node_rect_fixed(&self.layout, target) {
+            return (!fixed).then(|| r.y.max(0.0));
         }
         // Not rendered (display: none): no position.
         self.styles.get(target)?;
-        // An empty anchor: use the position of the content that follows it.
-        doc.descendants(doc.root())
-            .skip_while(|&n| n != target)
-            .skip(1)
-            .take(ANCHOR_SEARCH_LIMIT)
-            .find_map(|n| self.layout.node_rect(n))
-            .map(|r| r.y.max(0.0))
+        self.boxless_anchor_offset(target)
     }
 
-    /// Case-insensitive find-in-page: rects (document coordinates) of every match,
-    /// in document order. Matches spanning fragments of the same text node are supported.
-    pub fn find(&self, query: &str) -> Vec<Rect> {
+    /// Position of a rendered element that generates no box: see
+    /// [`Page::fragment_offset`]. At most [`ANCHOR_SEARCH_LIMIT`] nodes are
+    /// inspected on each side.
+    fn boxless_anchor_offset(&self, target: NodeId) -> Option<f32> {
+        let doc = &self.document;
+        let rects = boxes::node_rects(&self.layout);
+        let in_flow = |n: NodeId| rects.get(&n).filter(|r| !r.fixed);
+        let later_siblings = |n: NodeId| -> &[NodeId] {
+            let Some(parent) = doc.parent(n) else {
+                return &[];
+            };
+            let children = doc.children(parent);
+            let pos = children.iter().position(|&c| c == n);
+            children
+                .get(pos.map_or(children.len(), |p| p + 1)..)
+                .unwrap_or(&[])
+        };
+        // The next rendered node in tree order: the target's own content
+        // first (`display: contents`), then what follows its subtree.
+        let following = std::iter::once(target)
+            .chain(doc.ancestors(target))
+            .flat_map(|a| later_siblings(a).iter().flat_map(|&s| doc.descendants(s)));
+        let next = doc
+            .descendants(target)
+            .skip(1)
+            .chain(following)
+            .take(ANCHOR_SEARCH_LIMIT)
+            .find_map(in_flow);
+        if let Some(r) = next {
+            return Some(r.first.y.max(0.0));
+        }
+        // Nothing rendered after it (an anchor ending the document): just
+        // after the previous sibling subtree with boxes, else at the top of
+        // the nearest rendered ancestor.
+        let mut inspected = 0usize;
+        for a in std::iter::once(target).chain(doc.ancestors(target)) {
+            let parent = doc.parent(a)?;
+            let children = doc.children(parent);
+            let pos = children.iter().position(|&c| c == a).unwrap_or(0);
+            for &sibling in children.get(..pos).unwrap_or(&[]).iter().rev() {
+                // The sibling's own box encloses its content; without one
+                // (`display: contents`), the lowest box of its subtree.
+                let mut end: Option<f32> = None;
+                for d in doc.descendants(sibling) {
+                    inspected += 1;
+                    if inspected > ANCHOR_SEARCH_LIMIT {
+                        return None;
+                    }
+                    if let Some(r) = in_flow(d) {
+                        // An inline predecessor shares the anchor's line.
+                        let y = if r.inline { r.last.y } else { r.last.bottom() };
+                        end = Some(end.map_or(y, |e| e.max(y)));
+                        if d == sibling {
+                            break;
+                        }
+                    }
+                }
+                if let Some(y) = end {
+                    return Some(y.max(0.0));
+                }
+            }
+            if let Some(r) = in_flow(parent) {
+                return Some(r.first.y.max(0.0));
+            }
+        }
+        None
+    }
+
+    /// Case-insensitive find-in-page: every match, in document order, with
+    /// whether it lies in a `position: fixed` subtree (whose rects are in
+    /// viewport coordinates, see [`FindMatch`]). A match spanning several
+    /// fragments of the same text node (line breaks) gives one entry per
+    /// fragment. At most 10 000 entries are returned.
+    pub fn find_matches(&self, query: &str) -> Vec<FindMatch> {
         find::find(&self.layout, &self.document, query)
+    }
+
+    /// Rects (viewport coordinates, CSS px) of the `position: fixed` boxes
+    /// that paint a background (headers, toolbars…): document content that
+    /// scrolls under them is hidden. The UI uses them to hide the find
+    /// highlights of matches covered by such a box. At most 64 rects.
+    pub fn fixed_backdrops(&self) -> Vec<Rect> {
+        boxes::fixed_backdrops(&self.layout)
+    }
+
+    /// [`Page::find_matches`] as rects in document coordinates. Matches in
+    /// `position: fixed` content are placed as for the unscrolled page
+    /// (scroll offset 0, 0, where viewport and document coordinates
+    /// coincide); use [`Page::find_matches`] and
+    /// [`FindMatch::document_rect`] for another scroll offset.
+    pub fn find(&self, query: &str) -> Vec<Rect> {
+        self.find_matches(query)
+            .iter()
+            .map(|m| m.document_rect(Point::ZERO))
+            .collect()
     }
 
     /// `<meta http-equiv="refresh" content="N; url=…">`: delay in seconds and target URL
@@ -957,4 +1112,71 @@ impl Page {
 fn assert_page_is_send() {
     fn is_send<T: Send>() {}
     is_send::<Page>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Engine;
+
+    #[test]
+    fn hover_budget_thresholds() {
+        assert!(hover_affordable(Duration::ZERO));
+        assert!(hover_affordable(HOVER_RESTYLE_BUDGET));
+        assert!(!hover_affordable(
+            HOVER_RESTYLE_BUDGET + Duration::from_millis(1)
+        ));
+        // Noise around the budget does not disable hover after the fact.
+        assert!(!hover_restyle_too_slow(HOVER_RESTYLE_BUDGET));
+        assert!(!hover_restyle_too_slow(HOVER_RESTYLE_BUDGET * 2));
+        assert!(hover_restyle_too_slow(
+            HOVER_RESTYLE_BUDGET * 2 + Duration::from_millis(1)
+        ));
+        if !cfg!(debug_assertions) {
+            assert_eq!(HOVER_RESTYLE_BUDGET, Duration::from_millis(250));
+        }
+    }
+
+    #[test]
+    fn hover_is_disabled_up_front_on_slow_pages() {
+        let engine = Engine::new();
+        let load = |html: &str| {
+            engine.load_html(
+                html,
+                Url::parse("https://e.test/").unwrap(),
+                Size::new(400.0, 300.0),
+            )
+        };
+        let html = "<style>a:hover { color: rgb(255, 0, 0) }</style>\
+                    <a id=a href=#>a link</a>";
+        let mut page = load(html);
+        // A small page: affordable, the first hover restyles.
+        assert!(page.hover_enabled);
+        let a = page.document().get_element_by_id("a").unwrap();
+        let r = page.layout_tree().node_rect(a).unwrap();
+        let on_link = Point::new(r.x + 2.0, r.y + 2.0);
+        assert!(page.set_hover(Some((on_link, Point::ZERO))));
+        assert!(page.hover_enabled);
+
+        // The same page with slow initial style and layout: hover styles
+        // are off before any hover could block the UI.
+        let mut slow = load(html);
+        slow.timings.style = HOVER_RESTYLE_BUDGET / 2;
+        slow.timings.layout = HOVER_RESTYLE_BUDGET / 2 + Duration::from_millis(1);
+        slow.check_hover_cost();
+        assert!(!slow.hover_enabled);
+        assert!(slow
+            .console()
+            .iter()
+            .any(|m| m.starts_with(":hover styles disabled")));
+        assert!(!slow.set_hover(Some((on_link, Point::ZERO))), "no restyle");
+        assert_eq!(slow.hovered(), Some(a), "the hovered element is tracked");
+
+        // Without `:hover` rules there is nothing to disable.
+        let mut plain = load("<a href=#>plain</a>");
+        plain.timings.layout = HOVER_RESTYLE_BUDGET * 4;
+        plain.check_hover_cost();
+        assert!(plain.hover_enabled);
+        assert!(plain.console().is_empty());
+    }
 }

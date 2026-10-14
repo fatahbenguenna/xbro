@@ -139,6 +139,75 @@ fn decorations_propagate() {
     assert_eq!(s.get("a").decoration_color, Color::rgb(0, 0, 0xee));
 }
 
+/// CSS Text Decoration 3: a decoration is drawn in the color of the box
+/// that declares it, not in the color of the descendants it propagates to
+/// (tests/fixtures/text.html, `.nested-deco`).
+#[test]
+fn decoration_color_comes_from_the_decorating_box() {
+    let s = style(
+        "<p id=p>souligné <em id=em>dans les enfants</em> et \
+         <span id=ib style=\"display:inline-block\">pas ici</span>\
+         <span id=c style=\"display: contents; color: green\"><b id=cb>x</b></span>\
+         <i id=tdc>y</i><a id=link href=x>z</a></p>\
+         <div id=d><p id=inner>w <u id=u>v</u></p></div>",
+        ".nested { } p#p { text-decoration: underline }
+         #em { color: #1971c2 }
+         #ib { color: red }
+         #tdc { color: red; text-decoration-color: blue }
+         #d { color: purple; text-decoration: line-through }
+         #inner { color: orange }
+         #u { color: teal }",
+    );
+    let line = TextDecorationLine {
+        underline: true,
+        ..TextDecorationLine::NONE
+    };
+    assert_eq!(s.get("p").decoration_color, Color::BLACK);
+    let em = s.get("em");
+    assert_eq!(em.color, Color::rgb(0x19, 0x71, 0xc2));
+    assert_eq!(em.decorations_in_effect, line);
+    assert_eq!(
+        em.decoration_color,
+        Color::BLACK,
+        "the <p>'s color, not the <em>'s"
+    );
+    // Atomic inlines do not get the decoration at all.
+    assert_eq!(s.get("ib").decorations_in_effect, TextDecorationLine::NONE);
+    // `display: contents` and its children: still the <p>'s color.
+    assert_eq!(s.get("c").decoration_color, Color::BLACK);
+    assert_eq!(s.get("cb").decoration_color, Color::BLACK);
+    // `text-decoration-color` only colors the element's own decorations.
+    assert_eq!(s.get("tdc").decoration_color, Color::BLACK);
+    // A link adds its own underline: one color (the link's) for all lines.
+    let link = s.get("link");
+    assert_eq!(link.decorations_in_effect, line);
+    assert_eq!(link.decoration_color, Color::rgb(0, 0, 0xee));
+    // Propagation into block descendants keeps the ancestor's color.
+    let inner = s.get("inner");
+    assert_eq!(inner.color, Color::rgb(255, 165, 0));
+    assert_eq!(inner.decoration_color, Color::rgb(128, 0, 128));
+    // A box adding a line uses its own color for all its lines (approximation).
+    let u = s.get("u");
+    assert_eq!(
+        u.decorations_in_effect,
+        TextDecorationLine {
+            underline: true,
+            line_through: true,
+            ..TextDecorationLine::NONE
+        }
+    );
+    assert_eq!(u.decoration_color, Color::rgb(0, 128, 128));
+    // Text runs share their parent's style, hence its decoration color.
+    let em_node = s.node("em");
+    let text = s.doc.children(em_node)[0];
+    assert_eq!(s.map.get(text).unwrap().decoration_color, Color::BLACK);
+    // Anonymous boxes / text runs built by layout inherit it too.
+    assert_eq!(
+        ComputedStyle::inherit_from(&em).decoration_color,
+        Color::BLACK
+    );
+}
+
 #[test]
 fn before_and_after() {
     let s = style(

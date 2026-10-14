@@ -6,14 +6,105 @@ use xbro_engine::Url;
 
 use super::line_edit::LineEdit;
 
-/// Text shown for a URL when the address bar is not being edited. The new
+/// Longest URL whose escapes are decoded for display (longer ones, such as
+/// big `data:` URLs, are shown as they are: they are drawn every frame).
+const MAX_DECODED_URL: usize = 8 * 1024;
+
+/// Text shown for a URL in the address bar (see [`readable_url`]). The new
 /// tab page shows an empty field (with a placeholder).
 pub fn display_text(url: Option<&Url>) -> String {
     match url {
         Some(url) if url.as_str() == "about:home" => String::new(),
-        Some(url) => url.as_str().to_string(),
+        Some(url) => readable_url(url),
         None => String::new(),
     }
+}
+
+/// A URL as people read it: percent-escapes of non-ASCII characters are
+/// shown as the characters (`…/wiki/Fran%C3%A7ais` reads `…/wiki/Français`),
+/// as other browsers do. ASCII escapes stay escaped (they may stand for
+/// delimiters: `%2F`, `%23`, `%25`…), and so do invisible or misleading
+/// characters (spaces, controls, zero-width and bidi marks, slash
+/// look-alikes). Parsing the result gives back the same URL.
+pub fn readable_url(url: &Url) -> String {
+    let s = url.as_str();
+    if s.len() > MAX_DECODED_URL || !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            if let Some((c, len)) = escaped_char(&bytes[i..]).filter(|&(c, _)| readable(c)) {
+                let mut buf = [0; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                i += len;
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    // Only whole characters were added to the (ASCII) serialization.
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// The non-ASCII character escaped as UTF-8 at the start of `bytes`
+/// (`%C3%A7` → `ç`) and the length of its escapes.
+fn escaped_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let byte = |k: usize| -> Option<u8> {
+        let escape = bytes.get(3 * k..3 * k + 3)?;
+        if escape.first() != Some(&b'%') {
+            return None;
+        }
+        let hex = std::str::from_utf8(escape.get(1..)?).ok()?;
+        u8::from_str_radix(hex, 16).ok()
+    };
+    let first = byte(0)?;
+    let len = match first {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    let mut utf8 = [first, 0, 0, 0];
+    for (k, slot) in utf8.iter_mut().enumerate().take(len).skip(1) {
+        *slot = byte(k)?;
+    }
+    let c = std::str::from_utf8(utf8.get(..len)?).ok()?.chars().next()?;
+    Some((c, 3 * len))
+}
+
+/// Whether a decoded character can be shown without misleading the reader.
+fn readable(c: char) -> bool {
+    !c.is_control()
+        && !c.is_whitespace()
+        && !matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202F}'
+                | '\u{2044}'
+                | '\u{205F}'..='\u{206F}'
+                | '\u{2215}'
+                | '\u{2571}'
+                | '\u{29F8}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FF0F}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFF}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
 }
 
 /// Splits a displayed URL into runs drawn normally (`false`) or dimmed
@@ -97,6 +188,60 @@ mod tests {
         assert_eq!(display_text(None), "");
         let url = Url::parse("https://example.com/a?b=c").unwrap();
         assert_eq!(display_text(Some(&url)), "https://example.com/a?b=c");
+    }
+
+    #[test]
+    fn non_ascii_escapes_are_shown_as_characters() {
+        let shown = |s: &str| readable_url(&Url::parse(s).unwrap());
+        assert_eq!(
+            shown("https://fr.wikipedia.org/wiki/Fran%C3%A7ais"),
+            "https://fr.wikipedia.org/wiki/Français"
+        );
+        // Typed non-ASCII text is escaped by the parser, then shown again.
+        assert_eq!(
+            shown("http://a.test/r?q=héllo wörld €#ç"),
+            "http://a.test/r?q=héllo%20wörld%20€#ç"
+        );
+        assert_eq!(shown("https://a.test/%F0%9F%A6%80"), "https://a.test/🦀");
+        // ASCII escapes, spaces, invisible and misleading characters stay escaped.
+        for kept in [
+            "https://a.test/a%2Fb%25c%23d%20e",
+            "https://a.test/%C2%A0x",
+            "https://a.test/%E2%80%AEevil",
+            "https://a.test/%E2%80%8B",
+            "https://a.test/%E2%88%95etc",
+            "https://a.test/%C2%85",
+        ] {
+            assert_eq!(shown(kept), kept);
+        }
+        // Broken sequences are left alone, the rest is decoded.
+        assert_eq!(
+            shown("https://a.test/%C3%28%C3%A9"),
+            "https://a.test/%C3%28é"
+        );
+        assert_eq!(shown("https://a.test/%E2%82"), "https://a.test/%E2%82");
+        assert_eq!(shown("https://a.test/%C3"), "https://a.test/%C3");
+        assert_eq!(
+            shown("https://a.test/%ED%A0%80"),
+            "https://a.test/%ED%A0%80"
+        );
+        assert_eq!(shown("https://a.test/%c3%a9"), "https://a.test/é");
+        // What is shown parses back to the same URL.
+        for s in [
+            "https://fr.wikipedia.org/wiki/Fran%C3%A7ais",
+            "http://a.test/r?q=h%C3%A9llo+w%C3%B6rld&x=%E2%82%AC#%C3%A7",
+            "https://a.test/a%2Fb%E2%80%AE%C3%A9",
+        ] {
+            let url = Url::parse(s).unwrap();
+            assert_eq!(xbro_net::parse_user_input(&readable_url(&url)), url);
+        }
+        // Huge URLs are shown as they are.
+        let long = format!("data:text/plain,%C3%A9{}", "a".repeat(MAX_DECODED_URL));
+        assert_eq!(shown(&long), long);
+        assert_eq!(
+            display_text(Some(&Url::parse("https://a.test/%C3%A9").unwrap())),
+            "https://a.test/é"
+        );
     }
 
     #[test]

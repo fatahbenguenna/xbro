@@ -2,15 +2,17 @@
 //! and vertical alignment.
 //!
 //! * Captions are laid out as blocks as wide as the table's border box,
-//!   above it ([`ContentLayout::offset_top`]).
+//!   above it (`caption-side: top`, [`ContentLayout::offset_top`]) or
+//!   below it (`bottom`, [`ContentLayout::offset_bottom`]).
 //! * Rows are processed top to bottom; each cell is laid out once, as a
 //!   block container at the width of the columns it spans, at the top of
 //!   its first row. A row is as tall as its tallest single-row cell (after
 //!   baseline alignment), its specified height and the specified heights
-//!   of its cells; a cell spanning rows adds what it lacks to the last row
-//!   it spans.
-//! * A specified table height larger than the rows distributes the extra
-//!   height to the rows in proportion to their heights.
+//!   of its cells; what a cell spanning rows lacks is spread over the rows
+//!   it spans in proportion to their heights.
+//! * A specified (or minimum) table height larger than the rows
+//!   distributes the extra height to the rows in proportion to their
+//!   heights.
 //! * Each cell box is then stretched to the full height of its rows (so
 //!   backgrounds fill them) and its content is moved per `vertical-align`:
 //!   `top`, `middle`, `bottom`, or `baseline` (other values) aligning the
@@ -20,18 +22,20 @@
 //!   its final height and position (cells are never laid out twice, so
 //!   nested tables stay linear).
 //! * Separated borders: `border-spacing` around and between cells.
-//!   Collapsed borders (approximation): adjacent cells overlap by the
-//!   width of their shared borders (so a 1px grid stays 1px), the outer
-//!   cells overlap the table's own border and padding is ignored.
+//!   Collapsed borders ([`collapse`]): cells abut, each shared border is
+//!   the used border of one cell only (so a 1px grid stays one device
+//!   pixel at any scale), the outer cells cover the table's border and
+//!   padding and paint the outer edges instead of the table box.
 
-use xbro_style::{BorderCollapse, ComputedStyle, VerticalAlign};
+use xbro_style::{BorderCollapse, CaptionSide, ComputedStyle, TableLayout, VerticalAlign};
 
+use super::collapse::{self, Collapsed};
 use super::structure::{self, Grid};
 use super::widths;
 use crate::block::{Cb, ContentLayout};
 use crate::box_tree::BoxNode;
 use crate::cx::{translate_deferred, LayoutCx, PendingAbs};
-use crate::geom::Rect;
+use crate::geom::{Edges, Rect};
 use crate::intrinsic::Intrinsic;
 use crate::sizing::{box_edges, height_limits, sane, sane_size, specified_height, BoxEdges};
 use crate::LayoutBox;
@@ -64,23 +68,20 @@ impl Spacing {
                 bottom: v,
             };
         }
-        // Collapsed borders: shared borders overlap.
-        let mut ov_h = 0.0f32;
-        let mut ov_v = 0.0f32;
-        for c in &grid.cells {
-            let b = c.b.style.border_widths();
-            ov_h = ov_h.max(sane_size(b.left.min(b.right)));
-            ov_v = ov_v.max(sane_size(b.top.min(b.bottom)));
+        // Collapsed borders: cells abut and cover the table's border and
+        // padding (see [`collapse`]). An empty table keeps its own border.
+        if grid.cells.is_empty() {
+            return Spacing::default();
         }
         let p = &edges.padding;
         let b = &edges.border;
         Spacing {
-            inner_h: -ov_h,
-            inner_v: -ov_v,
-            left: -(p.left + b.left.min(ov_h)),
-            right: -(p.right + b.right.min(ov_h)),
-            top: -(p.top + b.top.min(ov_v)),
-            bottom: -(p.bottom + b.bottom.min(ov_v)),
+            inner_h: 0.0,
+            inner_v: 0.0,
+            left: -(p.left + b.left),
+            right: -(p.right + b.right),
+            top: -(p.top + b.top),
+            bottom: -(p.bottom + b.bottom),
         }
     }
 
@@ -103,41 +104,49 @@ impl Spacing {
     }
 }
 
-/// True when `table-layout: fixed` applies (the table has a specified
-/// width). `ComputedStyle` has no `table-layout` field yet: the inline
-/// `style` attribute of the table element is read instead.
-pub(crate) fn is_fixed_layout(cx: &LayoutCx<'_>, b: &BoxNode) -> bool {
-    if b.style.width.is_auto() || b.pseudo.is_some() {
-        return false;
-    }
-    let Some(node) = b.node.filter(|n| n.index() < cx.doc.len()) else {
-        return false;
-    };
-    let Some(css) = cx.doc.attr(node, "style") else {
-        return false;
-    };
-    if !css.to_ascii_lowercase().contains("table-layout") {
-        return false;
-    }
-    xbro_css::parse_declaration_list(css)
-        .iter()
-        .rev()
-        .find(|d| d.name == "table-layout")
-        .is_some_and(|d| d.value.iter().any(|v| v.is_ident("fixed")))
+/// True when `table-layout: fixed` applies: the table has a specified
+/// width (CSS 2.1 §17.5.2).
+pub(crate) fn is_fixed_layout(b: &BoxNode) -> bool {
+    b.style.table_layout == TableLayout::Fixed && !b.style.width.is_auto()
 }
 
-/// Column widths of the grid for a grid width `target`.
+/// Collapsed borders of the cells, when the table collapses them.
+fn collapsed_borders(grid: &Grid<'_>, style: &ComputedStyle) -> Option<Collapsed> {
+    (style.border_collapse == BorderCollapse::Collapse && !grid.cells.is_empty())
+        .then(|| collapse::resolve(grid, style))
+}
+
+/// Used edges of every cell (indexed like `grid.cells`): no margins,
+/// padding percentages against `width`, collapsed borders when resolved.
+fn cell_edges(grid: &Grid<'_>, collapsed: Option<&Collapsed>, width: f32) -> Vec<BoxEdges> {
+    grid.cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut e = box_edges(&c.b.style, width);
+            e.margin = Edges::ZERO;
+            if let Some(b) = collapsed.and_then(|col| col.edges.get(i)) {
+                e.border = *b;
+            }
+            e
+        })
+        .collect()
+}
+
+/// Column widths of the grid for a grid width `target` (`pb`: horizontal
+/// padding and borders of each cell).
 fn column_widths<'t>(
     cx: &mut LayoutCx<'t>,
     grid: &Grid<'t>,
     b: &'t BoxNode,
     sp: &Spacing,
     target: f32,
+    pb: &[f32],
 ) -> Vec<f32> {
-    if is_fixed_layout(cx, b) {
-        widths::fixed_widths(grid, b, target, sp.inner_h)
+    if is_fixed_layout(b) {
+        widths::fixed_widths(grid, b, target, sp.inner_h, pb)
     } else {
-        let cols = widths::columns(cx, grid, b, sp.inner_h);
+        let cols = widths::columns(cx, grid, b, sp.inner_h, pb);
         widths::distribute(&cols, target)
     }
 }
@@ -148,11 +157,18 @@ pub(crate) fn table_intrinsic<'t>(cx: &mut LayoutCx<'t>, b: &'t BoxNode) -> Intr
     let edges = box_edges(&b.style, 0.0);
     let sp = Spacing::new(&b.style, &grid, &edges);
     let spacing = sp.total_h(grid.ncols);
-    let (min, max) = if is_fixed_layout(cx, b) {
-        let w: f32 = widths::fixed_widths(&grid, b, 0.0, sp.inner_h).iter().sum();
+    let collapsed = collapsed_borders(&grid, &b.style);
+    let pb: Vec<f32> = cell_edges(&grid, collapsed.as_ref(), 0.0)
+        .iter()
+        .map(BoxEdges::pb_h)
+        .collect();
+    let (min, max) = if is_fixed_layout(b) {
+        let w: f32 = widths::fixed_widths(&grid, b, 0.0, sp.inner_h, &pb)
+            .iter()
+            .sum();
         (w, w)
     } else {
-        let cols = widths::columns(cx, &grid, b, sp.inner_h);
+        let cols = widths::columns(cx, &grid, b, sp.inner_h, &pb);
         widths::grid_min_max(&cols)
     };
     let mut min = min + spacing;
@@ -319,12 +335,18 @@ pub(crate) fn layout_table_contents<'t>(
     cb: Cb,
     y: f32,
     edges: &BoxEdges,
+    min_height: f32,
 ) -> ContentLayout {
     let grid = structure::build(cx.doc, b);
     let sp = Spacing::new(&b.style, &grid, edges);
-    let mut out = ContentLayout::default();
+    let collapsed = collapsed_borders(&grid, &b.style);
+    let cell_edges = cell_edges(&grid, collapsed.as_ref(), cb.width);
+    let mut out = ContentLayout {
+        hide_border: collapsed.as_ref().is_some_and(|c| c.covers_edges),
+        ..ContentLayout::default()
+    };
 
-    // ---- captions, above the table box ----
+    // ---- top captions, above the table box ----
     let bx = cb.x - edges.padding.left - edges.border.left;
     let border_top = y - edges.padding.top - edges.border.top;
     let caption_cb = Cb {
@@ -332,8 +354,12 @@ pub(crate) fn layout_table_contents<'t>(
         width: sane_size(cb.width + edges.pb_h()),
         height: None,
     };
+    let (bottom_captions, top_captions): (Vec<&'t BoxNode>, Vec<&'t BoxNode>) = grid
+        .captions
+        .iter()
+        .partition(|c| c.style.caption_side == CaptionSide::Bottom);
     let mut cy = border_top;
-    for &cap in &grid.captions {
+    for cap in top_captions {
         let mark = cx.pending_mark();
         let mut lb = cx.layout_box_at(cap, bx, cy, None, None, caption_cb);
         cy = cy.max(lb.margin_box().bottom());
@@ -347,7 +373,8 @@ pub(crate) fn layout_table_contents<'t>(
     // ---- columns ----
     let n = grid.ncols;
     let grid_w = sane_size(cb.width - sp.total_h(n));
-    let widths = column_widths(cx, &grid, b, &sp, grid_w);
+    let pb: Vec<f32> = cell_edges.iter().map(BoxEdges::pb_h).collect();
+    let widths = column_widths(cx, &grid, b, &sp, grid_w, &pb);
     let mut col_x = Vec::with_capacity(n);
     let mut x = cb.x + sp.left;
     for w in &widths {
@@ -404,16 +431,32 @@ pub(crate) fn layout_table_contents<'t>(
         }
         let mut h = specified_height(&row.b.style, None, 0.0).unwrap_or(0.0);
         let first = laid.len();
-        for c in grid.cells.get(row.cells.clone()).unwrap_or(&[]) {
+        for (ci, c) in grid
+            .cells
+            .iter()
+            .enumerate()
+            .skip(row.cells.start)
+            .take(row.cells.len())
+        {
             let x = col_x.get(c.col).copied().unwrap_or(grid_left);
-            let mut e = box_edges(&c.b.style, cb.width);
             // Cells have no margins.
-            e.margin = crate::geom::Edges::ZERO;
+            let e = cell_edges
+                .get(ci)
+                .copied()
+                .unwrap_or_else(|| box_edges(&c.b.style, cb.width));
             let w = sane_size(span_width(c.col, c.colspan) - e.pb_h());
             let start = cx.pending_mark();
-            let (lb, deferred) =
+            let (mut lb, deferred) =
                 cx.layout_independent_deferring(c.b, x, ry, w, &e, cell_cb, None, true);
             let end = cx.pending_mark();
+            // Collapsed borders: paint the winning sides.
+            if let Some(st) = collapsed
+                .as_ref()
+                .and_then(|col| col.styles.get(ci))
+                .and_then(Option::as_ref)
+            {
+                lb.style = st.clone();
+            }
             let align = cell_align(&c.b.style);
             let bb = lb.border_box();
             let baseline = crate::tree::first_baseline(&lb)
@@ -456,7 +499,9 @@ pub(crate) fn layout_table_contents<'t>(
                 h = h.max((c.shift + c.h).max(c.need));
             }
         }
-        // Cells spanning down to this row.
+        // Cells spanning down to this row: what they lack is spread over
+        // the rows they span in proportion to the rows' heights (equally
+        // when those are all zero).
         for &i in ends_at.get(r).map_or(&[][..], |v| v.as_slice()) {
             let (Some(g), Some(c)) = (grid.cells.get(i), laid.get(i)) else {
                 continue;
@@ -464,8 +509,23 @@ pub(crate) fn layout_table_contents<'t>(
             let above: f32 = heights.get(g.row..r).map_or(0.0, |hs| hs.iter().sum());
             let spanned = above + h + sp.inner_v * (r - g.row) as f32;
             let need = (c.shift + c.h).max(c.need);
-            if need > spanned {
-                h += need - spanned;
+            let extra = need - spanned;
+            if extra > 0.0 {
+                let total = above + h;
+                let count = (r - g.row + 1) as f32;
+                let share = |row_h: f32| {
+                    if total > 0.0 {
+                        extra * row_h / total
+                    } else {
+                        extra / count
+                    }
+                };
+                if let Some(hs) = heights.get_mut(g.row..r) {
+                    for rh in hs {
+                        *rh = sane_size(*rh + share(*rh));
+                    }
+                }
+                h += share(h);
             }
         }
         let h = sane_size(h);
@@ -475,9 +535,13 @@ pub(crate) fn layout_table_contents<'t>(
         ry += h + sp.inner_v;
     }
 
-    // ---- specified table height ----
+    // ---- specified (or minimum) table height ----
     let rows_total = heights.iter().sum::<f32>() + sp.total_v(nrows);
-    if let Some(th) = cb.height {
+    let target = match cb.height {
+        Some(h) => Some(h.max(min_height)),
+        None => (min_height > 0.0).then_some(min_height),
+    };
+    if let Some(th) = target {
         let extra = th - rows_total;
         if extra > 0.0 && nrows > 0 {
             let sum: f32 = heights.iter().sum();
@@ -562,6 +626,18 @@ pub(crate) fn layout_table_contents<'t>(
             .push(cx.new_box(group.b, rect, &BoxEdges::default(), rows, Vec::new()));
     }
     out.height = sane_size(heights.iter().sum::<f32>() + sp.total_v(nrows));
+
+    // ---- bottom captions, below the table box ----
+    let border_bottom = top + out.height + edges.padding.bottom + edges.border.bottom;
+    let mut cy = border_bottom;
+    for cap in bottom_captions {
+        let mark = cx.pending_mark();
+        let mut lb = cx.layout_box_at(cap, bx, cy, None, None, caption_cb);
+        cy = cy.max(lb.margin_box().bottom());
+        cx.apply_relative(&mut lb, caption_cb, mark);
+        out.children.push(lb);
+    }
+    out.offset_bottom = sane_size(cy - border_bottom);
     out
 }
 

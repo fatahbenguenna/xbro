@@ -179,6 +179,10 @@ pub(crate) struct Measured {
     /// First baseline, relative to the top of the border box as it was laid
     /// out (a table's captions push its border box further down).
     pub baseline: Option<f32>,
+    /// Height the box takes besides its content height, padding, borders
+    /// and margins: a table's captions, the room of a fieldset's legend
+    /// (see [`crate::flex::item::extra_height`]).
+    pub extra: f32,
 }
 
 /// Layout state for one pass.
@@ -187,6 +191,8 @@ pub(crate) struct LayoutCx<'t> {
     pub fonts: &'t FontSystem,
     pub replaced: &'t dyn ReplacedSizes,
     pub viewport: Size,
+    /// The element with keyboard focus (see [`crate::LayoutContext::focused`]).
+    pub focused: Option<xbro_dom::NodeId>,
     font_ids: FxHashMap<FontKey, FontId>,
     /// Keeps the family lists used as `FontKey`s alive (their addresses are keys).
     font_family_owners: Vec<Arc<Vec<String>>>,
@@ -216,6 +222,7 @@ impl<'t> LayoutCx<'t> {
             fonts,
             replaced,
             viewport: Size::new(sane_size(viewport.width), sane_size(viewport.height)),
+            focused: None,
             font_ids: FxHashMap::default(),
             font_family_owners: Vec::new(),
             metrics: FxHashMap::default(),

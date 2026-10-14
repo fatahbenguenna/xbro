@@ -253,6 +253,14 @@ const DISPLAY_KEYWORDS: &[&str] = &[
     "table-caption",
 ];
 
+/// Properties taking grid track lists (`subgrid` / `masonry` are unsupported).
+const GRID_TEMPLATE_PROPERTIES: &[&str] = &[
+    "grid-template-columns",
+    "grid-template-rows",
+    "grid-template",
+    "grid",
+];
+
 const CSS_WIDE_KEYWORDS: &[&str] = &["inherit", "initial", "unset", "revert", "revert-layer"];
 
 /// True for properties xbro's style system understands (ASCII
@@ -308,6 +316,13 @@ fn is_supported_declaration(name: &str, value: &[CV]) -> bool {
             v.ident()
                 .is_some_and(|k| DISPLAY_KEYWORDS.iter().any(|d| d.eq_ignore_ascii_case(k)))
         });
+    }
+    if GRID_TEMPLATE_PROPERTIES.contains(&lower.as_str()) {
+        // Parsed by the style system but computed as `none`: pages testing
+        // for them should take their fallback path.
+        return !value
+            .iter()
+            .any(|v| v.is_ident("subgrid") || v.is_ident("masonry"));
     }
     true
 }

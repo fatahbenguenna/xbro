@@ -13,10 +13,11 @@ const MAX_GLYPH_ENTRIES: usize = 1 << 18;
 /// How one character of one requested font is rendered.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct CharEntry {
-    /// Face providing the glyph (the requested face or a fallback).
+    /// Face providing the glyph (the requested face or a fallback), with
+    /// the synthetic styles to draw it with.
     pub font: FontId,
     pub glyph: u16,
-    /// Advance as a fraction of the em.
+    /// Advance as a fraction of the em (synthetic bold included).
     pub advance_em: f32,
     /// The face has a `kern` table.
     pub kern: bool,
@@ -32,6 +33,14 @@ const DEGRADED_ENTRY: CharEntry = CharEntry {
 
 /// Cache: (requested font, char) → entry.
 pub(crate) type GlyphMap = FastMap<(FontId, char), CharEntry>;
+
+/// Maximum number of cached kerning pairs before a reset.
+const MAX_KERN_ENTRIES: usize = 1 << 16;
+
+/// Cache: (face, first glyph, second glyph) → kerning as a fraction of the
+/// em. Looking a pair up in a large `kern` table (a binary search per
+/// subtable) cost two thirds of the shaping time of ordinary text.
+pub(crate) type KernMap = FastMap<(FontId, u16, u16), f32>;
 
 /// A glyph waiting for the next one (its advance may still get kerning).
 struct Pending {
@@ -66,6 +75,9 @@ impl FontSystem {
 
         let mut pen = 0.0f32;
         let mut pending: Option<Pending> = None;
+        // Lock order: kerning cache, then glyph cache (never the reverse).
+        let kerns = read(&self.kern_cache);
+        let mut new_kerns: Vec<((FontId, u16, u16), f32)> = Vec::new();
         let mut cache = read(&self.glyph_cache);
         for (cluster, c) in text.char_indices() {
             let key = match classify(c) {
@@ -89,12 +101,21 @@ impl FontSystem {
 
             if let Some(mut prev) = pending.take() {
                 if entry.kern && prev.entry.font == entry.font {
-                    if let Some(face) = self
-                        .collection
-                        .face(entry.font)
-                        .and_then(|face| face.loaded_if_ready())
-                    {
-                        prev.glyph.advance += face.kern_em(prev.entry.glyph, entry.glyph) * size;
+                    let key = (entry.font, prev.entry.glyph, entry.glyph);
+                    let kern = match kerns.get(&key) {
+                        Some(&kern) => Some(kern),
+                        None => self
+                            .collection
+                            .face(entry.font)
+                            .and_then(|face| face.loaded_if_ready())
+                            .map(|face| {
+                                let kern = face.kern_em(prev.entry.glyph, entry.glyph);
+                                new_kerns.push((key, kern));
+                                kern
+                            }),
+                    };
+                    if let Some(kern) = kern {
+                        prev.glyph.advance += kern * size;
                     }
                 }
                 pen += prev.glyph.advance;
@@ -117,6 +138,14 @@ impl FontSystem {
             });
         }
         drop(cache);
+        drop(kerns);
+        if !new_kerns.is_empty() {
+            let mut map = write(&self.kern_cache);
+            if map.len() + new_kerns.len() > MAX_KERN_ENTRIES {
+                map.clear();
+            }
+            map.extend(new_kerns.into_iter().take(MAX_KERN_ENTRIES));
+        }
         if let Some(last) = pending {
             pen += last.glyph.advance;
             emit(last.glyph);
@@ -180,12 +209,17 @@ impl FontSystem {
     }
 }
 
-/// Entry for `glyph` of the loaded `face` (id `font`).
+/// Entry for `glyph` of the loaded `face` (id `font`, which may carry
+/// synthetic styles: synthetic bold widens every non-zero advance).
 fn entry_for(font: FontId, face: &crate::face::LoadedFace, glyph: u16) -> CharEntry {
+    let mut advance_em = face.advance_em(glyph);
+    if font.synthesis().bold && advance_em > 0.0 {
+        advance_em += crate::synthesis::BOLD_EM;
+    }
     CharEntry {
         font,
         glyph,
-        advance_em: face.advance_em(glyph),
+        advance_em,
         kern: face.has_kern,
     }
 }
